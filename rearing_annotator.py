@@ -3,7 +3,7 @@ from pathlib import Path
 
 import napari
 from napari.utils.notifications import show_info
-from qtpy.QtWidgets import QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView, QLabel, QApplication
+from qtpy.QtWidgets import QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView, QLabel, QApplication, QPushButton
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtGui import QColor, QBrush
 
@@ -24,6 +24,12 @@ open_rearing = False
 
 # CSV file path (will be set when video is loaded)
 CSV_OUT = None
+
+# Navigation speed (step size in frames)
+nav_step_size = 1
+
+# Playback fps
+playback_fps = 60
 
 def get_csv_path():
     """Get CSV path based on current video file."""
@@ -115,6 +121,76 @@ class EventsWidget(QWidget):
         self.status_label = QLabel("No events yet")
         self.status_label.setStyleSheet("color: white; padding: 5px;")
         self.layout().addWidget(self.status_label)
+        
+        # Navigation controls
+        nav_label = QLabel("Navigation Speed")
+        nav_label.setStyleSheet("color: white; padding: 5px; font-weight: bold;")
+        self.layout().addWidget(nav_label)
+        
+        self.nav_speed_label = QLabel(f"Step: {nav_step_size} frames")
+        self.nav_speed_label.setStyleSheet("color: white; padding: 2px;")
+        self.layout().addWidget(self.nav_speed_label)
+        
+        # Buttons for speed control
+        btn_layout = QVBoxLayout()
+        btn_faster = QPushButton("Faster [+]")
+        btn_faster.setStyleSheet("padding: 5px;")
+        btn_faster.clicked.connect(self.increase_speed)
+        btn_layout.addWidget(btn_faster)
+        
+        btn_slower = QPushButton("Slower [-]")
+        btn_slower.setStyleSheet("padding: 5px;")
+        btn_slower.clicked.connect(self.decrease_speed)
+        btn_layout.addWidget(btn_slower)
+        
+        btn_widget = QWidget()
+        btn_widget.setLayout(btn_layout)
+        self.layout().addWidget(btn_widget)
+        
+        # 60fps playback button
+        self.fps_btn = QPushButton(f"Set Playback: {playback_fps} fps")
+        self.fps_btn.setStyleSheet("padding: 5px; margin-top: 10px;")
+        self.fps_btn.clicked.connect(self.set_60fps)
+        self.layout().addWidget(self.fps_btn)
+    
+    def increase_speed(self):
+        """Increase navigation step size."""
+        global nav_step_size
+        nav_step_size = min(nav_step_size * 2, 1000)
+        self.nav_speed_label.setText(f"Step: {nav_step_size} frames")
+        show_info(f"Navigation speed: {nav_step_size} frames")
+    
+    def decrease_speed(self):
+        """Decrease navigation step size."""
+        global nav_step_size
+        nav_step_size = max(nav_step_size // 2, 1)
+        self.nav_speed_label.setText(f"Step: {nav_step_size} frames")
+        show_info(f"Navigation speed: {nav_step_size} frames")
+    
+    def set_60fps(self):
+        """Set playback to 60fps."""
+        global playback_fps
+        playback_fps = 60
+        self.fps_btn.setText(f"Set Playback: {playback_fps} fps")
+        # Set fps using napari's dims play rate
+        # Rate is in fps - convert to frames per second
+        try:
+            # napari uses rate parameter - 60 fps means 60 frames per second
+            # If playback is running, update it
+            if viewer.dims.is_playing:
+                viewer.dims.play(axis=0, fps=playback_fps)
+            # Also set on video layers if available
+            for layer in viewer.layers:
+                # Try different attributes napari might use
+                if hasattr(layer, 'fps'):
+                    layer.fps = playback_fps
+                elif hasattr(layer, 'play'):
+                    # Some layers use play rate
+                    if hasattr(layer, 'play_rate'):
+                        layer.play_rate = playback_fps / 30.0  # Normalize if needed
+        except:
+            pass
+        show_info(f"Playback set to {playback_fps} fps")
         
     def update_table(self, events_coords, events_actions):
         """Update the table with current events."""
@@ -266,7 +342,86 @@ def make_callback(key):
         on_keypress(key, viewer)
     return _cb
 
+def nav_left(viewer):
+    """Navigate left using current step size."""
+    global nav_step_size
+    current = viewer.dims.current_step[0]
+    new_frame = max(0, current - nav_step_size)
+    viewer.dims.current_step = (new_frame, *viewer.dims.current_step[1:])
+
+def nav_right(viewer):
+    """Navigate right using current step size."""
+    global nav_step_size
+    current = viewer.dims.current_step[0]
+    max_frame = viewer.dims.range[0][1] - 1
+    new_frame = min(max_frame, current + nav_step_size)
+    viewer.dims.current_step = (new_frame, *viewer.dims.current_step[1:])
+
+def increase_nav_speed(viewer):
+    """Increase navigation step size."""
+    global nav_step_size
+    nav_step_size = min(nav_step_size * 2, 1000)
+    events_widget.nav_speed_label.setText(f"Step: {nav_step_size} frames")
+    show_info(f"Navigation speed: {nav_step_size} frames")
+
+def decrease_nav_speed(viewer):
+    """Decrease navigation step size."""
+    global nav_step_size
+    nav_step_size = max(nav_step_size // 2, 1)
+    events_widget.nav_speed_label.setText(f"Step: {nav_step_size} frames")
+    show_info(f"Navigation speed: {nav_step_size} frames")
+
+def set_playback_fps(viewer):
+    """Set playback fps to 60."""
+    global playback_fps
+    playback_fps = 60
+    events_widget.fps_btn.setText(f"Set Playback: {playback_fps} fps")
+    
+    # Set fps using napari's dims play
+    try:
+        # If playback is running, restart with new fps
+        if viewer.dims.is_playing:
+            # Get current axis
+            axis = viewer.dims.current_step[0] if hasattr(viewer.dims, 'current_step') else 0
+            viewer.dims.stop()
+            viewer.dims.play(axis=0, fps=playback_fps)
+        # Also set on video layers if available
+        for layer in viewer.layers:
+            if hasattr(layer, 'fps'):
+                layer.fps = playback_fps
+            elif hasattr(layer, 'play_rate'):
+                layer.play_rate = playback_fps / 30.0  # Normalize if needed
+        show_info(f"Playback set to {playback_fps} fps")
+    except Exception as e:
+        show_info(f"Setting {playback_fps} fps for next playback")
+        # Store fps for when playback starts
+        pass
+
+# Bind annotation keys
 for key in KEYMAP:
     viewer.bind_key(key, make_callback(key))
+
+# Bind navigation keys
+viewer.bind_key('Left', nav_left, overwrite=True)
+viewer.bind_key('Right', nav_right, overwrite=True)
+
+# Bind speed control keys
+viewer.bind_key('+', increase_nav_speed, overwrite=True)
+viewer.bind_key('=', increase_nav_speed, overwrite=True)  # + key (shift-=)
+viewer.bind_key('-', decrease_nav_speed, overwrite=True)
+
+# Bind fps key
+viewer.bind_key('f', set_playback_fps, overwrite=True)
+
+# Override Space key to start playback with set fps
+def play_with_fps(viewer):
+    """Start playback with configured fps."""
+    global playback_fps
+    if viewer.dims.is_playing:
+        viewer.dims.stop()
+    else:
+        viewer.dims.play(axis=0, fps=playback_fps)
+
+viewer.bind_key('Space', play_with_fps, overwrite=True)
 
 napari.run()
