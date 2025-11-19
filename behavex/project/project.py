@@ -78,6 +78,22 @@ class Project:
         # Store in memory
         self.config = default_config
 
+    def set_config_value(self, key_path: str, value, save: bool = True):
+        """Changes one value in the config file:"""
+        if not hasattr(self, "config") or self.config is None:
+            raise RuntimeError("Config not loaded. call load_config() first.")
+        keys = key_path.split(".")
+        cfg = self.config
+        for key in keys[:-1]:
+            if key not in cfg or not isinstance(cfg[key], dict):
+                cfg[key] = {}
+            cfg = cfg[key]
+        cfg[keys[-1]] = value
+
+        if save:
+            with open(self.config_path, "w") as stream:
+                yaml.safe_dump(self.config, stream, sort_keys=True)
+
     def add_session(
         self,
     ):
@@ -93,3 +109,4 @@ if __name__ == "__main__":
     # simple test of the Project class
     project_dir_root = Path("/users/thomasbush/Downloads") / "project_dir_rear"
     project = Project(project_dir=str(project_dir_root), project_name="Test Project")
+    project.set_config_value("data.window_size", 40)
