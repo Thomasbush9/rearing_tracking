@@ -4,6 +4,16 @@ from typing import List, Optional
 import yaml
 
 
+def _deep_update(base: dict, updates: dict) -> dict:
+    """Recursively update dict 'base' with values from 'updates'"""
+    for k, v in updates.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_update(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
 class Project:
     def __init__(
         self,
@@ -94,6 +104,17 @@ class Project:
             with open(self.config_path, "w") as stream:
                 yaml.safe_dump(self.config, stream, sort_keys=True)
 
+    def edit_config(self, updates: dict, save: bool = True):
+        """Recursively update the existing config with 'updates' dict.
+        Only specified keys are changed"""
+        if not hasattr(self, "config") or self.config is None:
+            raise RuntimeError("Config not loaded. call load_config first")
+        _deep_update(self.config, updates)
+
+        if save:
+            with open(self.config_path, "w") as stream:
+                yaml.safe_dump(self.config, stream, sort_keys=True)
+
     def add_session(
         self,
     ):
@@ -110,3 +131,16 @@ if __name__ == "__main__":
     project_dir_root = Path("/users/thomasbush/Downloads") / "project_dir_rear"
     project = Project(project_dir=str(project_dir_root), project_name="Test Project")
     project.set_config_value("data.window_size", 40)
+    updates = {
+        "data": {
+            "window_size": 40,
+            "fps": 60,
+        },
+        "model_defaults": {
+            "training": {
+                "epochs": 30,
+                "batch_size": 64,
+            }
+        },
+    }
+    project.edit_config(updates)
