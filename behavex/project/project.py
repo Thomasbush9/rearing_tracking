@@ -1,3 +1,95 @@
 from pathlib import Path
 from typing import List, Optional
 
+import yaml
+
+
+class Project:
+    def __init__(
+        self,
+        project_dir: str,
+        project_name: str,
+    ):
+        # init the project directory
+        self.project_dir = Path(project_dir)
+        self.project_name = project_name
+        if not self.project_dir.exists():
+            self.project_dir.mkdir(parents=True)
+
+        # load or create config file
+        self.load_config()
+
+    def load_config(
+        self,
+    ):
+        """load config file from the project directory"""
+        # check exist:
+        self.config_path = self.project_dir / "config.yaml"
+        if self.config_path.exists():
+            with open(self.config_path) as stream:
+                try:
+                    self.config = yaml.safe_load(stream)
+                except yaml.YAMLError as exc:
+                    raise ValueError(f"Error loading config file: {exc}")
+            return
+            # Otherwise → create default config skeleton
+        default_config = {
+            "project": {
+                "name": self.project_name,
+                "version": "1.0",
+                "description": "",
+            },
+            "paths": {
+                "video_root": "",
+                "keypoints_root": "",
+            },
+            "data": {
+                "fps": 60,
+                "window_size": 30,
+                "feature_set": [],
+            },
+            "annotation": {
+                "behavior": "rearing",
+                "annotator": "",
+                "output_format": "csv",
+            },
+            "model_defaults": {
+                "model_name": "gru_v1",
+                "training": {
+                    "epochs": 20,
+                    "batch_size": 32,
+                    "lr": 1e-3,
+                },
+                "inference": {
+                    "smoothing": True,
+                    "smoothing_window": 5,
+                },
+            },
+            "debug": {
+                "verbose": False,
+                "save_intermediate": False,
+            },
+        }
+
+        # Save skeleton to disk
+        with open(self.config_path, "w") as f:
+            yaml.safe_dump(default_config, f, sort_keys=False)
+
+        # Store in memory
+        self.config = default_config
+
+    def add_session(
+        self,
+    ):
+        pass
+
+    def get_session(
+        self,
+    ):
+        pass
+
+
+if __name__ == "__main__":
+    # simple test of the Project class
+    project_dir_root = Path("/users/thomasbush/Downloads") / "project_dir_rear"
+    project = Project(project_dir=str(project_dir_root), project_name="Test Project")
