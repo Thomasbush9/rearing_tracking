@@ -23,11 +23,13 @@ class Project:
         # init the project directory
         self.project_dir = Path(project_dir)
         self.project_name = project_name
+        self.sessions_path = self.project_dir / "sessions.yaml"
         if not self.project_dir.exists():
             self.project_dir.mkdir(parents=True)
 
         # load or create config file
         self.load_config()
+        self.load_sessions()
 
     def load_config(
         self,
@@ -88,6 +90,36 @@ class Project:
         # Store in memory
         self.config = default_config
 
+    def load_sessions(
+        self,
+    ):
+        """Load the session yaml, if not found it init it"""
+        if self.sessions_path.exists():
+            with open(self.sessions_path) as stream:
+                data = yaml.safe_load(stream)
+            if data is None:
+                data = {"sessions": []}
+            # validate the structure
+            if not isinstance(data, dict):
+                raise ValueError("Sessions.yaml must contain a dict at top level")
+            if "sessions" not in data:
+                data["sessions"] = []
+            if not isinstance(data["sessions"], list):
+                raise ValueError("'sessions' must be a list inside sessions.yaml.")
+
+            # Store metadata + create Session objects
+            self.sessions_data = data["sessions"]
+            self.sessions = [
+                Session(metadata=s, project=self) for s in self.sessions_data
+            ]
+
+            return
+        default_data = {"sessions": []}
+        with open(self.sessions_path, "w") as stream:
+            yaml.safe_dump(default_data, stream, sort_keys=False)
+        self.sessions_data = []
+        self.sessions = []
+
     def set_config_value(self, key_path: str, value, save: bool = True):
         """Changes one value in the config file:"""
         if not hasattr(self, "config") or self.config is None:
@@ -114,6 +146,9 @@ class Project:
         if save:
             with open(self.config_path, "w") as stream:
                 yaml.safe_dump(self.config, stream, sort_keys=True)
+
+    def show_config(self):
+        print(yaml.safe_dump(self.config, sort_keys=True))
 
     def add_session(
         self,
@@ -144,3 +179,4 @@ if __name__ == "__main__":
         },
     }
     project.edit_config(updates)
+    project.show_config()
