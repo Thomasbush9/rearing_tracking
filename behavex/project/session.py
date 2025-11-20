@@ -271,3 +271,19 @@ class Session:
         ).copy()
 
         self.windows = X_windows
+
+    def subsample_session(self, ratio_positive: float = 0.5):
+        """Subsample the session to a given number of frames."""
+        if self.windows is None:
+            raise ValueError("Windows not loaded. Call build_windows() first.")
+        if self.labels is None:
+            raise ValueError("Labels not loaded. Call build_labels() first.")
+        P = np.argwhere(self.labels==1).squeeze()
+        N = np.argwhere(self.labels==0).squeeze()
+        factor = N.shape[0] / P.shape[0] * ratio_positive
+        N = N[::factor] # subsample negative events
+        idx = np.concatenate([P, N])
+        np.random.shuffle(idx)
+        self.windows = self.windows[idx]
+        self.labels = self.labels[idx]
+        return self.windows, self.labels
