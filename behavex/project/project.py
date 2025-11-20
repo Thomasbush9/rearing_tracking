@@ -3,7 +3,6 @@ from typing import List, Optional
 
 import yaml
 from behavex.project.session import Session
-import napari
 
 
 def _deep_update(base: dict, updates: dict) -> dict:
@@ -221,6 +220,85 @@ class Project:
     ):
         pass
 
+    def annotate_sessions(self):
+        """Open GUI to select and annotate a session."""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget, QListWidgetItem, QApplication
+        from PyQt5.QtCore import Qt
+        import sys
+        from behavex.annotation.pavs import start_app
+        
+        if len(self.sessions) == 0:
+            print("No sessions found in project. Add sessions first using add_session().")
+            return
+        
+        # Ensure QApplication exists
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
+        
+        # Create session selection dialog
+        dialog = QDialog()
+        dialog.setWindowTitle("Select Session to Annotate")
+        dialog.setMinimumSize(600, 400)
+        
+        layout = QVBoxLayout()
+        dialog.setLayout(layout)
+        
+        label = QLabel(f"Select a session from {self.project_name}:")
+        layout.addWidget(label)
+        
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QListWidget.SingleSelection)
+        
+        # Add sessions to list
+        for session in self.sessions:
+            item_text = f"{session.id} - {session.annotation_view} view"
+            if hasattr(session, 'video_dir') and session.video_dir:
+                # Show shorter path
+                video_dir = str(session.video_dir)
+                if len(video_dir) > 50:
+                    video_dir = "..." + video_dir[-47:]
+                item_text += f"\n  {video_dir}"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, session)
+            list_widget.addItem(item)
+        
+        # Select first item by default
+        if list_widget.count() > 0:
+            list_widget.setCurrentRow(0)
+        
+        layout.addWidget(list_widget)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_button)
+        
+        annotate_button = QPushButton("Annotate Selected Session")
+        annotate_button.setDefault(True)
+        annotate_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(annotate_button)
+        
+        layout.addLayout(button_layout)
+        
+        # Show dialog and get selection
+        if dialog.exec_() == QDialog.Accepted:
+            selected_items = list_widget.selectedItems()
+            if selected_items:
+                selected_session = selected_items[0].data(Qt.UserRole)
+                # Get annotation view path and start annotator
+                try:
+                    annotation_view_path = selected_session.path_to_view(selected_session.annotation_view)
+                    print(f"Starting annotation for session {selected_session.id} ({selected_session.annotation_view} view)...")
+                    # Pass project and sessions for session switching capability
+                    start_app(annotation_view_path, project=self, sessions=self.sessions)
+                except Exception as e:
+                    print(f"Error starting annotation: {e}")
+            else:
+                print("No session selected.")
+
 
 if __name__ == "__main__":
     # simple test of the Project class
@@ -268,8 +346,8 @@ if __name__ == "__main__":
     for sess in project.sessions:
         print(" -", sess.id, "at", sess.video_dir)
 
-    from behavex.annotation.pavs import start_app
-    # get session annotaiton view file path 
-    annotation_view_path = session.path_to_view(session.annotation_view)
-    start_app(annotation_view_path)
-    
+    # from behavex.annotation.pavs import start_app
+    # # get session annotaiton view file path 
+    # annotation_view_path = session.path_to_view(session.annotation_view)
+    # start_app(annotation_view_path)
+    project.annotate_sessions()

@@ -1,4 +1,4 @@
-from PyQt5.QtWidgets import QMainWindow, QApplication, QPushButton, QFileDialog, QHBoxLayout, QLabel, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QShortcut, QLineEdit, QSpinBox
+from PyQt5.QtWidgets import QMainWindow, QApplication, QPushButton, QFileDialog, QHBoxLayout, QLabel, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QShortcut, QLineEdit, QSpinBox, QDialog, QListWidget, QListWidgetItem
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 from PyQt5 import QtCore
@@ -19,10 +19,12 @@ video_extensions = [".avi", ".mp4", ".mkv"]
 
 class Window(QMainWindow):
 
-    def __init__(self, video_path: Path | None = None):
+    def __init__(self, video_path: Path | None = None, project=None, sessions=None):
         super().__init__()
         self.title = "Rearing Event Annotator"
         self.video_path = video_path
+        self.project = project  # Store project reference for session switching
+        self.sessions = sessions  # Store sessions list for switching
         self.video_fps = 60.0  # Default FPS, will be estimated if available
         self.frame_count = 0
         self.open_rearing = False
@@ -296,6 +298,12 @@ class Window(QMainWindow):
 
         self.importButton = QPushButton("Import")
         self.importButton.clicked.connect(self.importCSV)
+        
+        # Add switch session button if project/sessions available
+        self.switchSessionButton = None
+        if self.project is not None and self.sessions is not None:
+            self.switchSessionButton = QPushButton("Switch Session")
+            self.switchSessionButton.clicked.connect(self.switch_session)
 
         self.positionSlider = QSlider(Qt.Horizontal)
         self.positionSlider.setRange(0, 100)
@@ -381,6 +389,8 @@ class Window(QMainWindow):
         feats.addWidget(self.delButton)
         feats.addWidget(self.exportButton)
         feats.addWidget(self.importButton)
+        if self.switchSessionButton is not None:
+            feats.addWidget(self.switchSessionButton)
 
         layout2 = QVBoxLayout()
         layout2.addWidget(self.tableWidget)
@@ -588,9 +598,15 @@ class Window(QMainWindow):
         
         self.ax.set_xlim(x_min, x_max)
         
-        # Draw current frame indicator (vertical line)
+        # Draw current frame indicator (vertical line) - always show if in view
         if x_min <= current_frame <= x_max:
             self.ax.axvline(x=current_frame, color='blue', linestyle='--', linewidth=2, alpha=0.7, label='Current frame')
+        elif self.plot_zoom_factor == 1.0:
+            # If full view and current frame is outside, still show it at the edge
+            if current_frame < x_min:
+                self.ax.axvline(x=x_min, color='blue', linestyle='--', linewidth=2, alpha=0.3, label='Current frame (before view)')
+            elif current_frame > x_max:
+                self.ax.axvline(x=x_max, color='blue', linestyle='--', linewidth=2, alpha=0.3, label='Current frame (after view)')
         
         # Draw zoom center indicator if zoomed
         if self.plot_zoom_factor != 1.0 and x_min <= self.plot_center_frame <= x_max:
@@ -749,6 +765,19 @@ class Window(QMainWindow):
 
     def positionChanged(self, position):
         self.positionSlider.setValue(position)
+        # Update plot when position changes (for current frame indicator)
+        # This handles automatic position changes (playback, etc.)
+        if hasattr(self, 'canvas'):
+            current_frame = self.get_current_frame()
+            # Throttle updates: every 5 frames when zoomed, every 30 frames when not zoomed
+            update_threshold = 5 if self.plot_zoom_factor != 1.0 else 30
+            if hasattr(self, '_last_plot_update_frame'):
+                if abs(current_frame - self._last_plot_update_frame) > update_threshold:
+                    self.update_plot()
+                    self._last_plot_update_frame = current_frame
+            else:
+                self._last_plot_update_frame = current_frame
+                self.update_plot()
 
     def durationChanged(self, duration):
         """Update slider range and estimate FPS if possible."""
@@ -769,6 +798,19 @@ class Window(QMainWindow):
 
     def setPosition(self, position):
         self.mediaPlayer.setPosition(position)
+        # Update plot when slider moves (for current frame indicator)
+        if hasattr(self, 'canvas'):
+            current_frame = self.get_current_frame()
+            # Update plot to show current frame indicator
+            # Throttle updates: every 5 frames when zoomed, every 30 frames when not zoomed
+            update_threshold = 5 if self.plot_zoom_factor != 1.0 else 30
+            if hasattr(self, '_last_plot_update_frame'):
+                if abs(current_frame - self._last_plot_update_frame) > update_threshold:
+                    self.update_plot()
+                    self._last_plot_update_frame = current_frame
+            else:
+                self._last_plot_update_frame = current_frame
+                self.update_plot()
 
     def handleError(self):
         self.playButton.setEnabled(False)
@@ -833,22 +875,112 @@ class Window(QMainWindow):
     def dropEvent(self, event):
         f = str(event.mimeData().urls()[0].toLocalFile())
         self.load_video_from_path(Path(f))
+    
+    def closeEvent(self, event):
+        """Handle window close event - save annotations before closing."""
+        # Save any open events and write CSV
+        if len(self.events_coords) > 0:
+            self.write_csv()
+            print("Annotations saved before closing.")
+        # Don't call sys.exit here - just close the window
+        event.accept()
+    
+    def switch_session(self):
+        """Switch to a different session for annotation."""
+        if self.project is None or self.sessions is None:
+            return
+        
+        # Save current annotations before switching
+        if len(self.events_coords) > 0:
+            self.write_csv()
+            print("Saved annotations before switching session.")
+        
+        # Show session selection dialog
+        from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+        from PyQt5.QtCore import Qt
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Switch to Another Session")
+        dialog.setMinimumSize(600, 400)
+        
+        layout = QVBoxLayout()
+        dialog.setLayout(layout)
+        
+        label = QLabel(f"Select a session to annotate:")
+        layout.addWidget(label)
+        
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QListWidget.SingleSelection)
+        
+        # Add sessions to list
+        for session in self.sessions:
+            item_text = f"{session.id} - {session.annotation_view} view"
+            if hasattr(session, 'video_dir') and session.video_dir:
+                video_dir = str(session.video_dir)
+                if len(video_dir) > 50:
+                    video_dir = "..." + video_dir[-47:]
+                item_text += f"\n  {video_dir}"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, session)
+            list_widget.addItem(item)
+        
+        if list_widget.count() > 0:
+            list_widget.setCurrentRow(0)
+        
+        layout.addWidget(list_widget)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_button)
+        
+        switch_button = QPushButton("Switch to Selected Session")
+        switch_button.setDefault(True)
+        switch_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(switch_button)
+        
+        layout.addLayout(button_layout)
+        
+        # Show dialog and switch if accepted
+        if dialog.exec_() == QDialog.Accepted:
+            selected_items = list_widget.selectedItems()
+            if selected_items:
+                selected_session = selected_items[0].data(Qt.UserRole)
+                try:
+                    annotation_view_path = selected_session.path_to_view(selected_session.annotation_view)
+                    # Load new video
+                    self.load_video_from_path(annotation_view_path)
+                    print(f"Switched to session {selected_session.id} ({selected_session.annotation_view} view)")
+                except Exception as e:
+                    self.errorLabel.setText(f"Error switching session: {e}")
+                    self.errorLabel.setStyleSheet('color: red')
 
 
-def start_app(video_path: Path | None = None):
+def start_app(video_path: Path | None = None, project=None, sessions=None):
     """
     Create and run the rearing event annotator.
     
     Args:
         video_path: Optional path to video file to auto-load
+        project: Optional Project instance for session switching
+        sessions: Optional list of sessions for session switching
     
     Usage:
         from behavex.annotation.pavs import start_app
         start_app(Path("/path/to/video.mp4"))
     """
-    app = QApplication(sys.argv)
-    window = Window(video_path=video_path)
-    sys.exit(app.exec_())
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    
+    window = Window(video_path=video_path, project=project, sessions=sessions)
+    window.show()
+    
+    # Only run event loop if no app is already running
+    if QApplication.instance() == app:
+        app.exec_()
 
 
 if __name__ == "__main__":
