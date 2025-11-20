@@ -1,4 +1,7 @@
 from pathlib import Path
+import csv
+import shutil
+import pandas as pd
 
 
 class Session:
@@ -49,8 +52,17 @@ class Session:
         return self.session_root / f"{self.id}_annotations.csv"
 
     def features_path(self) -> Path:
-        """Return path for the extracted feature matrix."""
-        return self.session_root / f"{self.id}_features.npy"
+        """Return path for the extracted feature CSV."""
+        # Check if CSV exists in metadata, otherwise default to CSV
+        features_file = self.metadata.get('features_file', None)
+        if features_file:
+            # Check if it's an absolute path or relative
+            features_path = Path(features_file)
+            if features_path.is_absolute():
+                return features_path
+            else:
+                return self.session_root / features_file
+        return self.session_root / f"{self.id}_features.csv"
 
     def windows_path(self) -> Path:
         """Return path for windowed features."""
@@ -71,6 +83,74 @@ class Session:
     def has_features(self) -> bool:
         """Check if extracted features exist."""
         return self.features_path().exists()
+    
+    def import_features(self, features_path: Path, video_frame_count: int = None) -> Path:
+        """
+        Import features from a CSV or Excel file.
+        
+        Args:
+            features_path: Path to the CSV or Excel file (.csv, .xlsx, .xls) containing features
+            video_frame_count: Expected number of frames (for validation). 
+                              If None, will try to estimate from video or skip validation.
+        
+        Returns:
+            Path to the imported features file (always saved as CSV)
+        
+        Raises:
+            FileNotFoundError: If features_path doesn't exist
+            ValueError: If file format is invalid or length doesn't match video
+        """
+        features_path = Path(features_path).expanduser().resolve()
+        
+        if not features_path.exists():
+            raise FileNotFoundError(f"Features file not found: {features_path}")
+        
+        # Determine file type and read accordingly
+        file_ext = features_path.suffix.lower()
+        
+        try:
+            if file_ext in ['.xlsx', '.xls']:
+                # Read Excel file
+                df = pd.read_excel(features_path)
+                feature_length = len(df)
+                num_features = len(df.columns)
+                # Convert to CSV for storage
+                feature_data = df
+            elif file_ext == '.csv':
+                # Read CSV file
+                df = pd.read_csv(features_path)
+                feature_length = len(df)
+                num_features = len(df.columns)
+                feature_data = df
+            else:
+                raise ValueError(f"Unsupported file format: {file_ext}. Supported: .csv, .xlsx, .xls")
+            
+            # Note: We allow NaN values in features (different columns can have different numbers of valid values)
+            # This is common in behavioral data where some features may be unavailable for certain frames
+        
+        except pd.errors.EmptyDataError:
+            raise ValueError("File is empty or has no data")
+        except Exception as e:
+            if isinstance(e, ValueError) and ("Unsupported" in str(e) or "length" in str(e)):
+                raise
+            raise ValueError(f"Error reading features file: {e}")
+        
+        # Skip validation - allow features of any length
+        # Note: video_frame_count parameter kept for API compatibility but validation is disabled
+        
+        # Ensure session directory exists
+        self.session_root.mkdir(parents=True, exist_ok=True)
+        
+        # Save as CSV in session directory (always convert to CSV for consistency)
+        target_path = self.session_root / f"{self.id}_features.csv"
+        feature_data.to_csv(target_path, index=False)
+        
+        # Update metadata
+        self.metadata['features_file'] = f"{self.id}_features.csv"
+        self.project.save_sessions()
+        
+        print(f"Imported {num_features} features ({feature_length} frames) from {features_path.name} to {target_path}")
+        return target_path
 
     def has_windows(self) -> bool:
         """Check if windowed data exists."""

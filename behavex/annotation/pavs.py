@@ -1,4 +1,4 @@
-from PyQt5.QtWidgets import QMainWindow, QApplication, QPushButton, QFileDialog, QHBoxLayout, QLabel, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QShortcut, QLineEdit, QSpinBox, QDialog, QListWidget, QListWidgetItem
+from PyQt5.QtWidgets import QMainWindow, QApplication, QPushButton, QFileDialog, QHBoxLayout, QLabel, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QShortcut, QLineEdit, QSpinBox, QDialog, QListWidget, QListWidgetItem, QCheckBox, QScrollArea, QMenu, QAction
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 from PyQt5 import QtCore
@@ -8,9 +8,11 @@ from pathlib import Path
 import csv
 import sys
 import yaml
+import pandas as pd
+import numpy as np
 import matplotlib
 matplotlib.use('Qt5Agg')
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas, FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
@@ -37,6 +39,31 @@ class Window(QMainWindow):
         self.plot_zoom_factor = 1.0  # Zoom factor (1.0 = full view)
         self.plot_center_frame = 0  # Center frame for zoom
         self.zoom_n_frames = 100  # Default zoom window (N frames)
+        
+        # Persistent plot objects (for efficient updates without clearing)
+        self.event_rectangles = []  # List of Rectangle patches for events
+        self.frame_indicator_line = None  # Line2D for current frame indicator
+        self.zoom_indicator_line = None  # Line2D for zoom center indicator
+        
+        # Feature data
+        self.features_df = None  # DataFrame with features
+        self.selected_features = []  # List of selected feature names to plot
+        self.current_session = None  # Current session object for feature import
+        self.feature_checkboxes = {}  # Dictionary of feature checkboxes
+        
+        # Feature plot (separate window)
+        self.feature_plot_window = None  # Separate window for feature plots
+        self.feature_fig = None  # Matplotlib figure for features
+        self.feature_canvas = None  # Canvas for feature plot
+        self.feature_ax = None  # Axis for feature plot
+        self._last_feature_plot_update_frame = None  # Track last feature plot update
+        # Persistent plot objects for efficient updates
+        self.feature_frame_indicators = []  # Persistent Line2D objects for frame indicators (one per subplot)
+        self.feature_lines = []  # Persistent Line2D objects for feature data lines
+        self.feature_event_rectangles = []  # List of Rectangle patches per subplot
+        self.feature_axes = []  # Store axes references
+        self._last_drawn_events_hash = None  # Hash of last drawn events to detect changes
+        self._feature_plot_background = None  # Background for blitting
         
         self.InitWindow()
 
@@ -244,8 +271,20 @@ class Window(QMainWindow):
         self.errorLabel.setText(self.fileNameExist)
         self.errorLabel.setStyleSheet('color: black')
         
+        # Find current session if project is available
+        if self.project is not None and self.sessions is not None:
+            video_path_str = str(video_path.resolve())
+            for session in self.sessions:
+                views = session.views
+                if video_path_str in views.values():
+                    self.current_session = session
+                    break
+        
         # Check for existing CSV and load it, or initialize new one
         self.check_and_load_csv()
+        
+        # Try to load features for this session
+        self.load_features_for_session()
 
     def UiComponents(self):
 
@@ -299,6 +338,13 @@ class Window(QMainWindow):
         self.importButton = QPushButton("Import")
         self.importButton.clicked.connect(self.importCSV)
         
+        # Feature import button with context menu
+        self.importFeaturesButton = QPushButton("Import Features")
+        self.importFeaturesButton.clicked.connect(self.import_features)
+        self.importFeaturesButton.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.importFeaturesButton.customContextMenuRequested.connect(self.show_feature_menu)
+        
+        
         # Add switch session button if project/sessions available
         self.switchSessionButton = None
         if self.project is not None and self.sessions is not None:
@@ -321,14 +367,39 @@ class Window(QMainWindow):
         self.statusLabel.setStyleSheet("color: blue; font-weight: bold; padding: 5px;")
 
         # Matplotlib widget for event visualization
-        self.fig = Figure(figsize=(8, 2), facecolor='white')
+        self.fig = Figure(figsize=(8, 6), facecolor='white')
         self.canvas = FigureCanvas(self.fig)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_xlabel('Frame')
-        self.ax.set_ylabel('Events')
-        self.ax.set_ylim(0, 1)
-        self.canvas.setMinimumHeight(150)
+        self.axes = []  # List of axes (will be created in update_plot)
+        self.ax = None  # Main axis for click handling
+        self.canvas.setMinimumHeight(200)
         self.canvas.mpl_connect('button_press_event', self.on_plot_click)
+        
+        # Feature selection widget
+        self.featureSelectionWidget = QWidget()
+        featureSelectionLayout = QVBoxLayout()
+        featureSelectionLayout.setContentsMargins(5, 5, 5, 5)
+        
+        featureLabel = QLabel("Features to Plot:")
+        featureLabel.setStyleSheet("font-weight: bold;")
+        featureSelectionLayout.addWidget(featureLabel)
+        
+        # Scroll area for feature checkboxes
+        self.featureScrollArea = QScrollArea()
+        self.featureScrollArea.setWidgetResizable(True)
+        self.featureScrollArea.setMaximumHeight(150)
+        self.featureCheckboxWidget = QWidget()
+        self.featureCheckboxLayout = QVBoxLayout()
+        self.featureCheckboxWidget.setLayout(self.featureCheckboxLayout)
+        self.featureScrollArea.setWidget(self.featureCheckboxWidget)
+        featureSelectionLayout.addWidget(self.featureScrollArea)
+        
+        # Button to open feature plot window
+        self.viewFeaturesButton = QPushButton("Open Feature Plot")
+        self.viewFeaturesButton.clicked.connect(self.open_feature_plot_window)
+        self.viewFeaturesButton.setVisible(False)  # Hidden until features are loaded
+        featureSelectionLayout.addWidget(self.viewFeaturesButton)
+        
+        self.featureSelectionWidget.setLayout(featureSelectionLayout)
         
         # Zoom controls
         zoomLabel = QLabel("Zoom:")
@@ -389,12 +460,16 @@ class Window(QMainWindow):
         feats.addWidget(self.delButton)
         feats.addWidget(self.exportButton)
         feats.addWidget(self.importButton)
+        feats.addWidget(self.importFeaturesButton)
         if self.switchSessionButton is not None:
             feats.addWidget(self.switchSessionButton)
 
         layout2 = QVBoxLayout()
         layout2.addWidget(self.tableWidget)
         layout2.addLayout(feats, 1)
+        
+        # Add feature selection widget
+        layout2.addWidget(self.featureSelectionWidget)
 
         plotBox.addLayout(layout2, 2)
 
@@ -432,8 +507,14 @@ class Window(QMainWindow):
         self.mediaPlayer.durationChanged.connect(self.durationChanged)
         self.mediaPlayer.error.connect(self.handleError)
         
-        # Initialize plot
-        self.update_plot()
+        # Initialize plot (will create empty plot initially)
+        # Initialize with empty axes
+        self.ax = self.fig.add_subplot(111)
+        self.axes = [self.ax]
+        self.ax.set_xlabel('Frame')
+        self.ax.set_ylabel('Events')
+        self.ax.set_ylim(0, 1)
+        self.canvas.draw()
 
     def add_rearing_start(self):
         """Mark rearing start event at current frame."""
@@ -544,16 +625,15 @@ class Window(QMainWindow):
                     if item:
                         item.setBackground(QBrush(QColor(255, 255, 0, 100)))
         
-        # Update plot after table update
+        # Update plots after table update
         self.update_plot()
+        # Update feature plot window if open
+        if self.feature_plot_window is not None and self.feature_plot_window.isVisible():
+            self._last_feature_plot_update_frame = None  # Force full redraw when events change
+            self.update_feature_plot()
 
     def update_plot(self):
-        """Update the matplotlib plot with current events."""
-        self.ax.clear()
-        self.ax.set_xlabel('Frame')
-        self.ax.set_ylabel('Events')
-        self.ax.set_ylim(0, 1)
-        
+        """Update the matplotlib plot with current events (no features here)."""
         # Get complete events (start/end pairs)
         events = []
         i = 0
@@ -571,12 +651,6 @@ class Window(QMainWindow):
             else:
                 i += 1
         
-        # Draw event bars (red with alpha 0.3)
-        for start, end in events:
-            width = end - start
-            rect = Rectangle((start, 0), width, 1, facecolor='red', alpha=0.3, edgecolor='darkred', linewidth=0.5)
-            self.ax.add_patch(rect)
-        
         # Get current frame for indicator
         current_frame = self.get_current_frame()
         
@@ -588,6 +662,8 @@ class Window(QMainWindow):
             elif events:
                 max_frame = max(end for _, end in events)
                 x_min, x_max = 0, max(max_frame + 100, 100)
+            elif self.features_df is not None and len(self.features_df) > 0:
+                x_min, x_max = 0, len(self.features_df)
             else:
                 x_min, x_max = 0, max(current_frame + 100, 100)
         else:
@@ -596,30 +672,71 @@ class Window(QMainWindow):
             x_min = max(0, self.plot_center_frame - half_window)
             x_max = self.plot_center_frame + half_window
         
-        self.ax.set_xlim(x_min, x_max)
+        # Initialize plot if needed (first time)
+        if not hasattr(self, 'ax') or self.ax is None:
+            self.fig.set_size_inches(8, 2)
+            self.canvas.setMinimumHeight(150)
+            self.ax = self.fig.add_subplot(111)
+            self.axes = [self.ax]
+            self.ax.set_xlabel('Frame')
+            self.ax.set_ylabel('Events')
+            self.ax.set_ylim(0, 1)
+            self.ax.grid(True, alpha=0.3)
+            self.event_rectangles = []
+            self.frame_indicator_line = None
+            self.zoom_indicator_line = None
         
-        # Draw current frame indicator (vertical line) - always show if in view
+        # Remove old event rectangles
+        for rect in self.event_rectangles:
+            rect.remove()
+        self.event_rectangles.clear()
+        
+        # Draw new event bars (red with alpha 0.3)
+        for start, end in events:
+            width = end - start
+            rect = Rectangle((start, 0), width, 1, facecolor='red', alpha=0.3, 
+                           edgecolor='darkred', linewidth=0.5)
+            self.ax.add_patch(rect)
+            self.event_rectangles.append(rect)
+        
+        # Update or create current frame indicator
+        if self.frame_indicator_line is not None:
+            self.frame_indicator_line.remove()
+            self.frame_indicator_line = None
+        
         if x_min <= current_frame <= x_max:
-            self.ax.axvline(x=current_frame, color='blue', linestyle='--', linewidth=2, alpha=0.7, label='Current frame')
-        elif self.plot_zoom_factor == 1.0:
-            # If full view and current frame is outside, still show it at the edge
-            if current_frame < x_min:
-                self.ax.axvline(x=x_min, color='blue', linestyle='--', linewidth=2, alpha=0.3, label='Current frame (before view)')
-            elif current_frame > x_max:
-                self.ax.axvline(x=x_max, color='blue', linestyle='--', linewidth=2, alpha=0.3, label='Current frame (after view)')
+            self.frame_indicator_line = self.ax.axvline(x=current_frame, color='blue', linestyle='--', linewidth=2, alpha=0.7)
         
-        # Draw zoom center indicator if zoomed
+        # Update or create zoom center indicator
+        if self.zoom_indicator_line is not None:
+            self.zoom_indicator_line.remove()
+            self.zoom_indicator_line = None
+        
         if self.plot_zoom_factor != 1.0 and x_min <= self.plot_center_frame <= x_max:
-            self.ax.axvline(x=self.plot_center_frame, color='green', linestyle=':', linewidth=1, alpha=0.5)
+            self.zoom_indicator_line = self.ax.axvline(x=self.plot_center_frame, color='green', linestyle=':', linewidth=1, alpha=0.5)
         
-        self.ax.grid(True, alpha=0.3)
+        # Update x-axis limits and title
+        self.ax.set_xlim(x_min, x_max)
         self.ax.set_title(f'Rearing Events (Zoom: {self.zoom_n_frames} frames, Center: {self.plot_center_frame})')
-        self.canvas.draw()
+        
+        # Use draw_idle for smoother updates
+        self.canvas.draw_idle()
 
     def on_plot_click(self, event):
         """Handle clicks on the plot to jump to frame."""
-        if event.inaxes != self.ax:
+        # Check if click is in any of the axes
+        clicked_ax = None
+        if hasattr(self, 'axes') and self.axes:
+            for ax in self.axes:
+                if event.inaxes == ax:
+                    clicked_ax = ax
+                    break
+        elif event.inaxes == self.ax:
+            clicked_ax = self.ax
+        
+        if clicked_ax is None:
             return
+        
         if event.button == 1:  # Left click
             clicked_frame = int(event.xdata)
             # Convert frame to position in milliseconds
@@ -679,8 +796,14 @@ class Window(QMainWindow):
             self.videopath = QUrl.fromLocalFile(fileName)
             self.errorLabel.setText(fileName)
             self.errorLabel.setStyleSheet('color: black')
+            # Reset session and features when opening new video
+            self.current_session = None
+            self.features_df = None
+            self.selected_features = []
+            self.update_feature_selection_ui()
             # Check for existing CSV and load it, or initialize new one
             self.check_and_load_csv()
+            self.update_plot()
 
     def play(self):
         if self.mediaPlayer.state() == QMediaPlayer.PlayingState:
@@ -736,6 +859,560 @@ class Window(QMainWindow):
                             continue
                 self.update_table()
 
+    def import_features(self):
+        """Import features CSV or Excel file for current session."""
+        if self.current_session is None:
+            self.errorLabel.setText("No session found. Import features from project session.")
+            self.errorLabel.setStyleSheet('color: red')
+            return
+        
+        # Open file dialog (support both CSV and Excel)
+        fileName, _ = QFileDialog.getOpenFileName(
+            self, 
+            "Import Features", 
+            QDir.homePath(), 
+            "All Supported (*.csv *.xlsx *.xls);;CSV Files(*.csv);;Excel Files(*.xlsx *.xls)"
+        )
+        
+        if fileName:
+            try:
+                # Validate and import features
+                features_path = Path(fileName)
+                video_frame_count = self.frame_count if self.frame_count > 0 else None
+                
+                imported_path = self.current_session.import_features(features_path, video_frame_count)
+                
+                # Load the imported features
+                self.load_features_from_path(imported_path)
+                
+                self.statusLabel.setText(f"Imported features: {features_path.name}. Right-click button to select features.")
+                self.statusLabel.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
+            except Exception as e:
+                self.errorLabel.setText(f"Error importing features: {e}")
+                self.errorLabel.setStyleSheet('color: red')
+    
+    def load_features_for_session(self):
+        """Load features if they exist for current session."""
+        if self.current_session is None:
+            return
+        
+        features_path = self.current_session.features_path()
+        if features_path.exists():
+            self.load_features_from_path(features_path)
+    
+    def load_features_from_path(self, features_path: Path):
+        """Load features from CSV or Excel file."""
+        try:
+            file_ext = features_path.suffix.lower()
+            if file_ext in ['.xlsx', '.xls']:
+                self.features_df = pd.read_excel(features_path)
+            elif file_ext == '.csv':
+                self.features_df = pd.read_csv(features_path)
+            else:
+                raise ValueError(f"Unsupported file format: {file_ext}")
+            # Skip validation - allow features of any length
+            
+            # Update feature selection UI
+            self.update_feature_selection_ui()
+            
+            # Update plots
+            self.update_plot()
+            
+            # Show button to open feature plot window
+            self.viewFeaturesButton.setVisible(True)
+            
+            # If feature plot window is open, update it
+            if self.feature_plot_window is not None and self.feature_plot_window.isVisible():
+                self.update_feature_plot()
+            
+            # Show message
+            num_features = len(self.features_df.columns)
+            self.statusLabel.setText(f"Loaded {num_features} features ({len(self.features_df)} frames)")
+            self.statusLabel.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
+            
+        except Exception as e:
+            self.errorLabel.setText(f"Error loading features: {e}")
+            self.errorLabel.setStyleSheet('color: red')
+            self.features_df = None
+    
+    def update_feature_selection_ui(self):
+        """Update the feature selection checkboxes."""
+        # Clear existing checkboxes
+        while self.featureCheckboxLayout.count():
+            child = self.featureCheckboxLayout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        
+        if self.features_df is None:
+            self.feature_checkboxes = {}
+            return
+        
+        # Create checkbox for each feature column
+        self.feature_checkboxes = {}
+        for col in self.features_df.columns:
+            checkbox = QCheckBox(col)
+            checkbox.setChecked(False)
+            checkbox.stateChanged.connect(self.on_feature_selection_changed)
+            self.featureCheckboxLayout.addWidget(checkbox)
+            self.feature_checkboxes[col] = checkbox
+    
+    def on_feature_selection_changed(self):
+        """Handle feature selection checkbox changes."""
+        if hasattr(self, 'feature_checkboxes'):
+            self.selected_features = [
+                name for name, checkbox in self.feature_checkboxes.items()
+                if checkbox.isChecked()
+            ]
+            # Update feature plot window if open
+            if self.feature_plot_window is not None and self.feature_plot_window.isVisible():
+                self._last_feature_plot_update_frame = None  # Force full redraw
+                self.update_feature_plot()
+    
+    def show_feature_menu(self, position):
+        """Show context menu for feature selection."""
+        if self.features_df is None:
+            return
+        
+        menu = QMenu(self)
+        
+        # Add "Select Features..." action
+        select_action = QAction("Select Features...", self)
+        select_action.triggered.connect(self.open_feature_selection_dialog)
+        menu.addAction(select_action)
+        
+        # Add separator
+        menu.addSeparator()
+        
+        # Add each feature as a checkable action
+        for col in self.features_df.columns:
+            action = QAction(col, self)
+            action.setCheckable(True)
+            action.setChecked(col in self.selected_features)
+            action.triggered.connect(lambda checked, c=col: self.toggle_feature(c, checked))
+            menu.addAction(action)
+        
+        # Show menu at button position
+        button_pos = self.importFeaturesButton.mapToGlobal(position)
+        menu.exec_(button_pos)
+    
+    def toggle_feature(self, feature_name: str, checked: bool):
+        """Toggle a feature in the selected list."""
+        if checked and feature_name not in self.selected_features:
+            self.selected_features.append(feature_name)
+        elif not checked and feature_name in self.selected_features:
+            self.selected_features.remove(feature_name)
+        
+        # Update feature plot window if open
+        if self.feature_plot_window is not None and self.feature_plot_window.isVisible():
+            self._last_feature_plot_update_frame = None  # Force full redraw
+            self.update_feature_plot()
+    
+    def open_feature_selection_dialog(self):
+        """Open a dialog to select features."""
+        if self.features_df is None:
+            return
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select Features to Plot")
+        dialog.setMinimumWidth(400)
+        layout = QVBoxLayout()
+        
+        # Create scroll area with checkboxes
+        scroll = QScrollArea()
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout()
+        
+        for col in self.features_df.columns:
+            checkbox = QCheckBox(col)
+            checkbox.setChecked(col in self.selected_features)
+            checkbox.stateChanged.connect(lambda state, c=col: self.toggle_feature(c, state == Qt.Checked))
+            scroll_layout.addWidget(checkbox)
+        
+        scroll_widget.setLayout(scroll_layout)
+        scroll.setWidget(scroll_widget)
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        select_all_btn.clicked.connect(lambda: self.select_all_features(True, scroll_widget))
+        deselect_all_btn = QPushButton("Deselect All")
+        deselect_all_btn.clicked.connect(lambda: self.select_all_features(False, scroll_widget))
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(dialog.accept)
+        button_layout.addWidget(select_all_btn)
+        button_layout.addWidget(deselect_all_btn)
+        button_layout.addWidget(ok_btn)
+        layout.addLayout(button_layout)
+        
+        dialog.setLayout(layout)
+        dialog.exec_()
+        
+        # Update feature plot window if open
+        if self.feature_plot_window is not None and self.feature_plot_window.isVisible():
+            self._last_feature_plot_update_frame = None  # Force full redraw
+            self.update_feature_plot()
+    
+    def select_all_features(self, select: bool, widget: QWidget):
+        """Select or deselect all features in the dialog."""
+        for child in widget.findChildren(QCheckBox):
+            child.setChecked(select)
+    
+    def open_feature_plot_window(self):
+        """Open separate window for feature plots."""
+        if self.features_df is None or len(self.selected_features) == 0:
+            self.errorLabel.setText("No features selected. Select features from checkboxes first.")
+            self.errorLabel.setStyleSheet('color: orange')
+            return
+        
+        # Create feature plot window if it doesn't exist
+        if self.feature_plot_window is None:
+            self.feature_plot_window = QWidget()
+            self.feature_plot_window.setWindowTitle("Feature Plot Viewer")
+            self.feature_plot_window.setMinimumSize(800, 600)
+            
+            # Layout
+            main_layout = QVBoxLayout()
+            
+            # Matplotlib figure for features
+            self.feature_fig = Figure(figsize=(10, 6))
+            self.feature_canvas = FigureCanvas(self.feature_fig)
+            self.feature_ax = None
+            
+            main_layout.addWidget(self.feature_canvas)
+            self.feature_plot_window.setLayout(main_layout)
+        
+        # Reset state to force full redraw on first open
+        if hasattr(self, '_last_feature_plot_update_frame'):
+            self._last_feature_plot_update_frame = None
+        if hasattr(self, 'feature_lines'):
+            # Clear existing lines to force recreation
+            for line in self.feature_lines:
+                if line is not None:
+                    try:
+                        line.remove()
+                    except:
+                        pass
+            self.feature_lines.clear()
+            self.feature_event_rectangles.clear()
+            self.feature_frame_indicators.clear()
+        
+        # Update and show
+        self.feature_plot_window.show()
+        # Force immediate update then another after window is shown
+        self.update_feature_plot()
+        QtCore.QTimer.singleShot(100, self.update_feature_plot)
+    
+    def update_feature_plot(self):
+        """Update the feature plot in separate window."""
+        if self.feature_plot_window is None or self.feature_canvas is None or self.features_df is None:
+            return
+        
+        if len(self.selected_features) == 0:
+            return
+        
+        # Check if we can do a lightweight update (only frame indicator)
+        current_frame = self.get_current_frame()
+        
+        # Initialize attributes if not exists
+        if not hasattr(self, 'feature_lines'):
+            self.feature_lines = []
+            self.feature_event_rectangles = []
+            self.feature_frame_indicators = []
+            self.feature_axes = []
+        
+        # Check if structure exists and is valid
+        structure_exists = (
+            hasattr(self, 'feature_fig') and
+            self.feature_fig is not None and
+            hasattr(self, 'feature_axes') and
+            len(self.feature_axes) == len(self.selected_features) and
+            len(self.feature_fig.axes) == len(self.selected_features) and
+            len(self.selected_features) > 0 and
+            len(self.feature_lines) == len(self.selected_features)  # All lines must exist
+        )
+        
+        # Use lightweight update only when structure exists AND we're just updating frame position
+        # Don't use lightweight if features/lines don't exist yet
+        can_update_lightweight = (
+            structure_exists and
+            hasattr(self, '_last_feature_plot_update_frame') and
+            self._last_feature_plot_update_frame is not None and
+            all(line is not None for line in self.feature_lines if len(self.feature_lines) > 0)
+        )
+        
+        if can_update_lightweight:
+            # Lightweight update: only update frame indicator position using set_xdata()
+            # This avoids remove/add operations and enables smooth updates
+            
+            # Check if events changed
+            current_events = self._get_complete_events()
+            events_hash = hash(tuple(current_events)) if current_events else 0
+            events_changed = events_hash != self._last_drawn_events_hash
+            
+            # Update frame indicators using set_data() instead of remove/add
+            for idx, ax in enumerate(self.feature_axes):
+                if idx < len(self.feature_frame_indicators) and self.feature_frame_indicators[idx] is not None:
+                    # Update existing line position
+                    line = self.feature_frame_indicators[idx]
+                    feature_data = self.features_df[self.selected_features[idx]].values
+                    if 0 <= current_frame < len(feature_data):
+                        y_min, y_max = ax.get_ylim()
+                        # Update line position using set_data() - this is much faster
+                        line.set_xdata([current_frame, current_frame])
+                        line.set_ydata([y_min, y_max])
+                elif idx < len(self.selected_features):
+                    # Create frame indicator line if it doesn't exist
+                    feature_name = self.selected_features[idx]
+                    feature_data = self.features_df[feature_name].values
+                    if 0 <= current_frame < len(feature_data):
+                        y_min, y_max = ax.get_ylim()
+                        line = ax.axvline(x=current_frame, color='blue', linestyle='--', linewidth=2, alpha=0.7)
+                        if idx >= len(self.feature_frame_indicators):
+                            self.feature_frame_indicators.append(line)
+                        else:
+                            self.feature_frame_indicators[idx] = line
+            
+            # If events changed, update rectangles (but still reuse axes)
+            if events_changed and len(current_events) > 0:
+                # Remove old event rectangles
+                for rect_list in self.feature_event_rectangles:
+                    for rect in rect_list:
+                        if rect is not None:
+                            rect.remove()
+                self.feature_event_rectangles.clear()
+                
+                # Redraw event rectangles
+                for idx, ax in enumerate(self.feature_axes):
+                    if idx < len(self.selected_features):
+                        rects_for_subplot = []
+                        y_min, y_max = ax.get_ylim()
+                        for start, end in current_events:
+                            width = end - start
+                            rect = Rectangle((start, y_min), width, y_max - y_min,
+                                           facecolor='red', alpha=0.3, edgecolor='darkred', linewidth=0.5)
+                            ax.add_patch(rect)
+                            rects_for_subplot.append(rect)
+                        self.feature_event_rectangles.append(rects_for_subplot)
+                self._last_drawn_events_hash = events_hash
+            
+            # Use draw_idle() for efficient updates - matplotlib will optimize the redraw
+            # Since we only updated positions with set_data(), it should be fast
+            self.feature_canvas.draw_idle()
+            
+            # Update background for future blitting if needed
+            if self._feature_plot_background is None or events_changed:
+                # Store background after draw (for future blitting attempts)
+                QtCore.QTimer.singleShot(100, self._store_feature_background)
+            
+            self._last_feature_plot_update_frame = current_frame
+            return
+        
+        # Full redraw path - always execute if lightweight path wasn't taken
+        # Initialize attributes if not exists
+        if not hasattr(self, 'feature_lines'):
+            self.feature_lines = []
+            self.feature_event_rectangles = []
+            self.feature_frame_indicators = []
+            self.feature_axes = []  # Store axes references
+        
+        current_frame = self.get_current_frame()
+        events = self._get_complete_events()
+        num_features = len(self.selected_features)
+        events_hash = hash(tuple(events)) if events else 0
+        
+        # Check if we need to recreate the figure structure (number of features changed)
+        needs_structure_rebuild = (
+            not hasattr(self, 'feature_axes') or
+            len(self.feature_axes) != num_features or
+            self.feature_fig is None or
+            not hasattr(self.feature_fig, 'axes') or
+            len(self.feature_fig.axes) != num_features or
+            not hasattr(self, 'feature_lines') or
+            len(self.feature_lines) != num_features  # Lines don't match selected features
+        )
+        
+        if needs_structure_rebuild:
+            # Only clear and rebuild structure if number of features changed
+            # Clear old plot objects
+            for line in self.feature_lines:
+                if line is not None:
+                    line.remove()
+            self.feature_lines.clear()
+            
+            for rect_list in self.feature_event_rectangles:
+                for rect in rect_list:
+                    if rect is not None:
+                        rect.remove()
+            self.feature_event_rectangles.clear()
+            
+            for line in self.feature_frame_indicators:
+                if line is not None:
+                    line.remove()
+            self.feature_frame_indicators.clear()
+            
+            # Clear figure and rebuild structure
+            self.feature_fig.clear()
+            self.feature_axes = []
+            
+            # Create subplots for each selected feature
+            for idx in range(num_features):
+                ax = self.feature_fig.add_subplot(num_features, 1, idx + 1)
+                self.feature_axes.append(ax)
+                ax.set_ylabel(self.selected_features[idx], fontsize=9)
+                ax.grid(True, alpha=0.3)
+                if idx == num_features - 1:
+                    ax.set_xlabel('Frame')
+                else:
+                    ax.set_xticklabels([])
+        else:
+            # Reuse existing axes - update existing lines using set_data() instead of remove/add
+            # Only remove event rectangles and frame indicators, keep feature lines
+            for rect_list in self.feature_event_rectangles:
+                for rect in rect_list:
+                    if rect is not None:
+                        rect.remove()
+            self.feature_event_rectangles.clear()
+            
+            for line in self.feature_frame_indicators:
+                if line is not None:
+                    line.remove()
+            self.feature_frame_indicators.clear()
+            
+            # Clear patches but keep lines
+            for ax in self.feature_axes:
+                while ax.patches:
+                    ax.patches[0].remove()
+        
+        # Update each subplot with data
+        for idx, feature_name in enumerate(self.selected_features):
+            ax = self.feature_axes[idx]
+            
+            # Get feature data
+            feature_data = self.features_df[feature_name].values
+            frames = np.arange(len(feature_data))
+            
+            # Update or create feature line using set_data() for efficiency
+            if idx < len(self.feature_lines) and self.feature_lines[idx] is not None:
+                # Update existing line using set_data() - avoids remove/add
+                self.feature_lines[idx].set_data(frames, feature_data)
+            else:
+                # Create new line
+                line, = ax.plot(frames, feature_data, 'b-', linewidth=1.5, alpha=0.8, label=feature_name)
+                if idx >= len(self.feature_lines):
+                    self.feature_lines.append(line)
+                else:
+                    self.feature_lines[idx] = line
+            
+            # Set y-axis limits based on feature data (always update)
+            if len(feature_data) > 0:
+                valid_data = feature_data[~np.isnan(feature_data)]
+                if len(valid_data) > 0:
+                    y_margin = (valid_data.max() - valid_data.min()) * 0.1 if valid_data.max() != valid_data.min() else 0.1
+                    ax.set_ylim(valid_data.min() - y_margin, valid_data.max() + y_margin)
+                else:
+                    # Fallback if all NaN
+                    ax.set_ylim(-1, 1)
+            else:
+                ax.set_ylim(-1, 1)
+            
+            # Draw event bars and store references
+            # Remove old rectangles for this subplot if they exist
+            if idx < len(self.feature_event_rectangles):
+                for rect in self.feature_event_rectangles[idx]:
+                    if rect is not None:
+                        rect.remove()
+                self.feature_event_rectangles[idx] = []
+            else:
+                self.feature_event_rectangles.append([])
+            
+            rects_for_this_subplot = []
+            if len(events) > 0:
+                y_min, y_max = ax.get_ylim()
+                for start, end in events:
+                    width = end - start
+                    rect = Rectangle((start, y_min), width, y_max - y_min,
+                                   facecolor='red', alpha=0.3, edgecolor='darkred', linewidth=0.5)
+                    ax.add_patch(rect)
+                    rects_for_this_subplot.append(rect)
+            self.feature_event_rectangles[idx] = rects_for_this_subplot
+            
+            # Draw current frame indicator and store reference (as single Line2D, not list)
+            if idx < len(self.feature_frame_indicators) and self.feature_frame_indicators[idx] is not None:
+                # Remove old indicator
+                self.feature_frame_indicators[idx].remove()
+            
+            if 0 <= current_frame < len(feature_data):
+                y_min, y_max = ax.get_ylim()
+                indicator_line = ax.axvline(x=current_frame, color='blue', linestyle='--', linewidth=2, alpha=0.7)
+                if idx >= len(self.feature_frame_indicators):
+                    self.feature_frame_indicators.append(indicator_line)
+                else:
+                    self.feature_frame_indicators[idx] = indicator_line
+            
+            # Set labels and formatting (only if structure rebuild)
+            if needs_structure_rebuild:
+                ax.set_ylabel(feature_name, fontsize=9)
+                ax.grid(True, alpha=0.3)
+                
+                # Only show x-axis label on bottom subplot
+                if idx == num_features - 1:
+                    ax.set_xlabel('Frame')
+                else:
+                    ax.set_xticklabels([])
+            
+            # Store first axis for reference
+            if idx == 0:
+                self.feature_ax = ax
+        
+        # Set title
+        if num_features == 1:
+            self.feature_fig.suptitle(f'{self.selected_features[0]} with Rearing Events', fontsize=10)
+        else:
+            self.feature_fig.suptitle('Selected Features with Rearing Events', fontsize=10)
+        
+        # Adjust figure height based on number of features (always update to ensure visibility)
+        fig_height = min(max(3, 2 * num_features), 12)
+        self.feature_fig.set_size_inches(6, fig_height)
+        self.feature_canvas.setMinimumHeight(max(200, int(fig_height * 50)))
+        
+        # Always do tight_layout and full draw for full redraw path
+        self.feature_fig.tight_layout()
+        self.feature_canvas.draw()  # Use draw() not draw_idle() to ensure features are visible
+        self._last_drawn_events_hash = events_hash
+        self._last_feature_plot_update_frame = current_frame
+        
+        # Store background for future blitting
+        QtCore.QTimer.singleShot(100, self._store_feature_background)
+    
+    def _store_feature_background(self):
+        """Store background for blitting (called after draw completes)."""
+        if self.feature_canvas is not None and self.feature_fig is not None:
+            try:
+                self._feature_plot_background = self.feature_canvas.copy_from_bbox(self.feature_canvas.figure.bbox)
+            except:
+                self._feature_plot_background = None
+    
+    def _get_complete_events(self):
+        """Helper to get complete rearing events as (start, end) pairs."""
+        events = []
+        i = 0
+        while i < len(self.events_coords):
+            if i < len(self.events_actions) and self.events_actions[i] == 'rearing_start':
+                start_frame = int(self.events_coords[i])
+                end_frame = None
+                for j in range(i + 1, len(self.events_coords)):
+                    if j < len(self.events_actions) and self.events_actions[j] == 'rearing_end':
+                        end_frame = int(self.events_coords[j])
+                        break
+                if end_frame is not None:
+                    events.append((start_frame, end_frame))
+                i += 1
+            else:
+                i += 1
+        return events
+
     def insertBaseRow(self):
         self.tableWidget.setColumnCount(4)
         self.tableWidget.setHorizontalHeaderLabels(["Index", "Start Frame", "End Frame", "Duration"])
@@ -775,9 +1452,15 @@ class Window(QMainWindow):
                 if abs(current_frame - self._last_plot_update_frame) > update_threshold:
                     self.update_plot()
                     self._last_plot_update_frame = current_frame
+                    # Update feature plot window if open (throttled)
+                    if self.feature_plot_window is not None and self.feature_plot_window.isVisible():
+                        self.update_feature_plot()
             else:
                 self._last_plot_update_frame = current_frame
                 self.update_plot()
+                # Update feature plot window if open
+                if self.feature_plot_window is not None and self.feature_plot_window.isVisible():
+                    self.update_feature_plot()
 
     def durationChanged(self, duration):
         """Update slider range and estimate FPS if possible."""
@@ -808,9 +1491,15 @@ class Window(QMainWindow):
                 if abs(current_frame - self._last_plot_update_frame) > update_threshold:
                     self.update_plot()
                     self._last_plot_update_frame = current_frame
+                    # Update feature plot window if open (throttled)
+                    if self.feature_plot_window is not None and self.feature_plot_window.isVisible():
+                        self.update_feature_plot()
             else:
                 self._last_plot_update_frame = current_frame
                 self.update_plot()
+                # Update feature plot window if open
+                if self.feature_plot_window is not None and self.feature_plot_window.isVisible():
+                    self.update_feature_plot()
 
     def handleError(self):
         self.playButton.setEnabled(False)
@@ -868,9 +1557,15 @@ class Window(QMainWindow):
                 if abs(frame - self._last_plot_update_frame) > 10:  # Update every 10 frames when zoomed
                     self.update_plot()
                     self._last_plot_update_frame = frame
+                    # Update feature plot window if open
+                    if self.feature_plot_window is not None and self.feature_plot_window.isVisible():
+                        self.update_feature_plot()
             else:
                 self._last_plot_update_frame = frame
                 self.update_plot()
+                # Update feature plot window if open
+                if self.feature_plot_window is not None and self.feature_plot_window.isVisible():
+                    self.update_feature_plot()
 
     def dropEvent(self, event):
         f = str(event.mimeData().urls()[0].toLocalFile())
@@ -950,7 +1645,9 @@ class Window(QMainWindow):
                 selected_session = selected_items[0].data(Qt.UserRole)
                 try:
                     annotation_view_path = selected_session.path_to_view(selected_session.annotation_view)
-                    # Load new video
+                    # Set current session before loading
+                    self.current_session = selected_session
+                    # Load new video (will also load features if available)
                     self.load_video_from_path(annotation_view_path)
                     print(f"Switched to session {selected_session.id} ({selected_session.annotation_view} view)")
                 except Exception as e:

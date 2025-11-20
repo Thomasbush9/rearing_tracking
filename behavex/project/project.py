@@ -113,6 +113,12 @@ class Project:
             self.sessions = [
                 Session(metadata=s, project=self) for s in self.sessions_data
             ]
+            
+            # Check for and merge duplicate paths (cleanup existing duplicates)
+            self._merge_duplicate_sessions()
+            if len(self.sessions_data) != len(data["sessions"]):
+                # Some duplicates were merged, save the cleaned up sessions
+                self.save_sessions()
 
             return
         default_data = {"sessions": []}
@@ -121,6 +127,68 @@ class Project:
         self.sessions_data = []
         self.sessions = []
 
+    def _merge_sessions(self, existing_session_metadata: dict, new_views: dict, new_annotation_view: str = None):
+        """
+        Merge a new session's views into an existing session.
+        
+        Args:
+            existing_session_metadata: The existing session's metadata dict (will be modified in place)
+            new_views: New views dictionary to merge in
+            new_annotation_view: Optional new annotation_view to use if not set in existing
+        """
+        # Merge views (union - new views override existing if keys conflict)
+        existing_session_metadata["views"].update(new_views)
+        
+        # Set annotation_view if not already set or if provided
+        if existing_session_metadata.get("annotation_view") is None and new_annotation_view is not None:
+            existing_session_metadata["annotation_view"] = new_annotation_view
+        elif existing_session_metadata.get("annotation_view") not in existing_session_metadata["views"]:
+            # If current annotation_view is invalid, use new one or first available
+            if new_annotation_view and new_annotation_view in existing_session_metadata["views"]:
+                existing_session_metadata["annotation_view"] = new_annotation_view
+            elif existing_session_metadata["views"]:
+                existing_session_metadata["annotation_view"] = list(existing_session_metadata["views"].keys())[0]
+
+    def _merge_duplicate_sessions(self):
+        """
+        Detect and merge sessions with duplicate paths.
+        Keeps the first session's ID and merges views from duplicates.
+        """
+        seen_paths = {}
+        sessions_to_remove = []
+        
+        for idx, session_metadata in enumerate(self.sessions_data):
+            session_path = Path(session_metadata.get("video_dir", "")).expanduser().resolve()
+            
+            if not session_path or not session_path.exists():
+                continue
+            
+            # Check if we've seen this path before
+            path_key = str(session_path)
+            if path_key in seen_paths:
+                # Duplicate found - merge with existing
+                existing_idx = seen_paths[path_key]
+                existing_metadata = self.sessions_data[existing_idx]
+                new_views = session_metadata.get("views", {})
+                new_annotation_view = session_metadata.get("annotation_view")
+                
+                print(f"Warning: Found duplicate session path '{session_path}'. "
+                      f"Merging session '{session_metadata.get('id')}' into '{existing_metadata.get('id')}'.")
+                
+                self._merge_sessions(existing_metadata, new_views, new_annotation_view)
+                sessions_to_remove.append(idx)
+            else:
+                seen_paths[path_key] = idx
+        
+        # Remove duplicates (in reverse order to maintain indices)
+        for idx in sorted(sessions_to_remove, reverse=True):
+            removed_session = self.sessions_data.pop(idx)
+            # Also remove from sessions list
+            self.sessions = [s for s in self.sessions if s.id != removed_session.get("id")]
+        
+        if sessions_to_remove:
+            print(f"Merged {len(sessions_to_remove)} duplicate session(s).")
+
     def add_session(
         self, session_dir: Path, session_id: str = None, annotation_view: str = None
     ):
@@ -128,6 +196,39 @@ class Project:
 
         if not session_dir.exists():
             raise ValueError(f"Session directory does not exist: {session_dir}")
+        
+        # Check for duplicate path first
+        for existing_session in self.sessions:
+            existing_path = Path(existing_session.video_dir).expanduser().resolve()
+            if session_dir == existing_path:
+                # Duplicate path found - merge instead of creating new
+                print(f"Session with path '{session_dir}' already exists (ID: '{existing_session.id}'). Merging views.")
+                new_views = {}
+                video_files = list(session_dir.glob("*.mp4"))
+                for f in video_files:
+                    fname = f.stem
+                    raw_suffix = fname.split("_")[-1]
+                    if raw_suffix.startswith("mirror-"):
+                        view_name = raw_suffix.replace("mirror-", "")
+                    else:
+                        view_name = raw_suffix
+                    new_views[view_name] = str(f.resolve())
+                
+                if annotation_view is None:
+                    annotation_view = list(new_views.keys())[0] if new_views else None
+                
+                # Merge into existing session
+                self._merge_sessions(existing_session.metadata, new_views, annotation_view)
+                
+                # Recreate Session object to reflect updated metadata
+                existing_idx = next(i for i, s in enumerate(self.sessions) if s.id == existing_session.id)
+                self.sessions[existing_idx] = Session(metadata=existing_session.metadata, project=self)
+                
+                self.save_sessions()
+                print(f"Updated session {existing_session.id} with merged views.")
+                return self.sessions[existing_idx]
+        
+        # No duplicate found - create new session
         # check id
         if session_id is None:
             existing_ids = {s["id"] for s in self.sessions_data}
@@ -219,6 +320,39 @@ class Project:
         self,
     ):
         pass
+
+    def import_features_for_session(self, session_id: str, features_path: str | Path, video_frame_count: int = None):
+        """
+        Import features for a specific session.
+        
+        Args:
+            session_id: ID of the session (e.g., "session_001")
+            features_path: Path to features CSV or Excel file (string or Path)
+            video_frame_count: Optional frame count for validation
+        
+        Returns:
+            Path to imported features file
+        
+        Example:
+            project.import_features_for_session(
+                "session_001",
+                "/path/to/features.xlsx",
+                video_frame_count=3600
+            )
+        """
+        # Find session
+        session = None
+        for s in self.sessions:
+            if s.id == session_id:
+                session = s
+                break
+        
+        if session is None:
+            raise ValueError(f"Session {session_id} not found in project")
+        
+        # Import features (handle both string and Path)
+        features_path_obj = Path(features_path).expanduser().resolve()
+        return session.import_features(features_path_obj, video_frame_count)
 
     def annotate_sessions(self):
         """Open GUI to select and annotate a session."""
@@ -350,4 +484,10 @@ if __name__ == "__main__":
     # # get session annotaiton view file path 
     # annotation_view_path = session.path_to_view(session.annotation_view)
     # start_app(annotation_view_path)
+    project.import_features_for_session(
+        session_id=session.id,
+        features_path = Path("/Users/thomasbush/Downloads/shared WithTWB/m002_s001_object.xlsx"),
+
+    )
     project.annotate_sessions()
+    
