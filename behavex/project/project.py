@@ -2,6 +2,8 @@ from pathlib import Path
 from typing import List, Optional
 
 import yaml
+from behavex.project.session import Session
+import napari
 
 
 def _deep_update(base: dict, updates: dict) -> dict:
@@ -120,6 +122,70 @@ class Project:
         self.sessions_data = []
         self.sessions = []
 
+    def add_session(
+        self, session_dir: Path, session_id: str = None, annotation_view: str = None
+    ):
+        session_dir = Path(session_dir).expanduser().resolve()
+
+        if not session_dir.exists():
+            raise ValueError(f"Session directory does not exist: {session_dir}")
+        # check id
+        if session_id is None:
+            existing_ids = {s["id"] for s in self.sessions_data}
+            idx = 1
+            while f"session_{idx:03d}" in existing_ids:
+                idx += 1
+            session_id = f"session_{idx:03d}"
+
+        video_files = list(session_dir.glob("*.mp4"))
+        if len(video_files) == 0:
+            raise ValueError(f"No video files found in {session_dir}")
+
+        # parsing video paths:
+        views = {}
+        for f in video_files:
+            fname = f.stem  # no extension
+
+            # Example fname:
+            # multicam_video_2025-05-07T12_16_20_mirror-bottom
+
+            # Extract the suffix after the timestamp:
+            # split by "_" and take the last part
+            raw_suffix = fname.split("_")[-1]
+
+            # Normalize to canonical view names
+            if raw_suffix.startswith("mirror-"):
+                view_name = raw_suffix.replace("mirror-", "")
+            else:
+                view_name = raw_suffix  # e.g. "central"
+
+            views[view_name] = str(f.resolve())
+
+        if annotation_view is None:
+            annotation_view = list(views.keys())[0]
+        if annotation_view not in views:
+            raise ValueError(f"annotation_view {annotation_view} is not in views")
+        metadata = {
+            "id": session_id,
+            "video_dir": str(session_dir),
+            "views": views,
+            "annotation_view": annotation_view,
+        }
+        self.sessions_data.append(metadata)
+        new_sess = Session(metadata=metadata, project=self)
+        self.sessions.append(new_sess)
+
+        self.save_sessions()
+
+        print(f"Added session {session_id} with {len(views)} views.")
+        return new_sess
+
+    def save_sessions(self):
+        """Write current Session registry to sessions.yaml"""
+        data = {"sessions": self.sessions_data}
+        with open(self.sessions_path, "w") as f:
+            yaml.safe_dump(data, f, sort_keys=False)
+
     def set_config_value(self, key_path: str, value, save: bool = True):
         """Changes one value in the config file:"""
         if not hasattr(self, "config") or self.config is None:
@@ -150,11 +216,6 @@ class Project:
     def show_config(self):
         print(yaml.safe_dump(self.config, sort_keys=True))
 
-    def add_session(
-        self,
-    ):
-        pass
-
     def get_session(
         self,
     ):
@@ -180,3 +241,35 @@ if __name__ == "__main__":
     }
     project.edit_config(updates)
     project.show_config()
+
+    session_path = Path(
+        "/Users/thomasbush/Downloads/multicam_video_2025-05-07T12_16_20_cropped-v2_20250701121021"
+    )
+
+    # This automatically:
+    #   - detects the 5 camera files
+    #   - maps them to views (central, bottom, left, right, top)
+    #   - adds metadata to sessions.yaml
+    #   - creates Session object
+    #   - creates folder: project_dir/sessions/session_XXX/
+    session = project.add_session(session_path)
+
+    print(f"\nAdded session: {session.id}")
+    print("Views detected:", list(session.views.keys()))
+    print("Annotation view:", session.annotation_view)
+    print("Annotation file expected at:", session.annotation_path())
+    print("Feature file path:", session.features_path())
+
+    # ---------------------------------------------------------
+    # 4. List all sessions in this project
+    # ---------------------------------------------------------
+
+    print("\nAll sessions in project:")
+    for sess in project.sessions:
+        print(" -", sess.id, "at", sess.video_dir)
+
+    from behavex.annotation.pavs import start_app
+    # get session annotaiton view file path 
+    annotation_view_path = session.path_to_view(session.annotation_view)
+    start_app(annotation_view_path)
+    
