@@ -33,6 +33,8 @@ class Session:
         # Directory inside project for artifacts
         self.session_root = self.project.project_dir / "sessions" / self.id
 
+        self.features = None
+        self.annotations = None
     # ------------------------------------------------------------
     # Path helpers
     # ------------------------------------------------------------
@@ -71,6 +73,50 @@ class Session:
     def predictions_path(self) -> Path:
         """Return path for model predictions."""
         return self.session_root / f"{self.id}_predictions.npy"
+
+    def events_file(self) -> Path:
+        """Return path to events CSV in video_dir. Looks for CSV matching video filename, then annotation_view.csv."""
+        if not self.video_dir:
+            raise ValueError(f"Session {self.id} video_dir is not set")
+        video_dir = Path(self.video_dir).expanduser().resolve()
+        if not video_dir.exists():
+            raise ValueError(f"Session {self.id} video_dir does not exist: {video_dir}")
+        
+        # First, try to find CSV matching the annotation view video filename
+        if self.annotation_view:
+            try:
+                video_path = self.path_to_view(self.annotation_view)
+                video_stem = video_path.stem
+                # Look for CSV with same name as video (e.g., video.mp4 -> video.csv)
+                video_based_csv = video_dir / f"{video_stem}.csv"
+                if video_based_csv.exists():
+                    return video_based_csv
+                # Also check for _rearings suffix pattern
+                rearings_csv = video_dir / f"{video_stem}_rearings.csv"
+                if rearings_csv.exists():
+                    return rearings_csv
+            except (KeyError, ValueError):
+                pass  # Fall through to default
+        
+        # Fall back to annotation_view.csv
+        events_path = video_dir / "annotation_view.csv"
+        # Initialize empty CSV if it doesn't exist
+        if not events_path.exists():
+            self._initialize_events_file(events_path)
+        return events_path
+
+    def features_file(self) -> Path:
+        """Return path to features file."""
+        return self.features_path()
+
+    def _initialize_events_file(self, events_path: Path):
+        """Initialize an empty events CSV file with header if it doesn't exist."""
+        if events_path.exists():
+            return
+        events_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(events_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['index', 'start_frame', 'end_frame', 'duration'])
 
     # ------------------------------------------------------------
     # State checks
@@ -167,3 +213,28 @@ class Session:
     def update_metadata(self, key, value):
         """Update a field in metadata (Project should save YAML)."""
         self.metadata[key] = value
+
+
+    def select_features(self, features_set: list):
+        """Load features from file and select the features in the features_set."""
+        features_file = self.features_file()
+        if self.has_features():
+            if features_file.suffix == ".csv":
+                features = pd.read_csv(features_file)
+            elif features_file.suffix == ".xlsx":
+                features = pd.read_excel(features_file)
+            else:
+                raise ValueError(f"Unsupported file format: {features_file.suffix}")
+            try: 
+                self.features = features[features_set].to_numpy()
+            except Exception as e:
+                raise ValueError(f"Error selecting features: {e}")
+
+    def load_annotations(self):
+        """
+        Load annotation/events file as pandas DataFrame.
+        Loads from video_dir/annotation_view.csv (same file as events_file()).
+        File is initialized if it doesn't exist.
+        """
+        events_path = self.events_file()  # This initializes the file if missing
+        self.annotations = pd.read_csv(events_path)

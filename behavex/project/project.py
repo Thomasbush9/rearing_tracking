@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import yaml
+import pandas as pd
 from behavex.project.session import Session
 
 
@@ -353,7 +354,24 @@ class Project:
         # Import features (handle both string and Path)
         features_path_obj = Path(features_path).expanduser().resolve()
         return session.import_features(features_path_obj, video_frame_count)
+    
+    def get_feature_set(self):
+        """Get the feature set from the config"""
+        return self.config["data"]["feature_set"]
 
+    def select_features(self):
+        """Loads the features from the features dataset for each session. 
+        It iterates through the sessions and loads the features from the features dataset for each session.
+        It saves the featuers selected as np.ndarray in the session.features attribute.
+        """
+        featues_set = self.get_feature_set()
+        for session in self.sessions:
+            session.select_features(featues_set)
+                
+
+
+                
+    
     def annotate_sessions(self):
         """Open GUI to select and annotate a session."""
         from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget, QListWidgetItem, QApplication
@@ -480,14 +498,22 @@ if __name__ == "__main__":
     for sess in project.sessions:
         print(" -", sess.id, "at", sess.video_dir)
 
+
     # from behavex.annotation.pavs import start_app
     # # get session annotaiton view file path 
     # annotation_view_path = session.path_to_view(session.annotation_view)
     # start_app(annotation_view_path)
-    project.import_features_for_session(
-        session_id=session.id,
-        features_path = Path("/Users/thomasbush/Downloads/shared WithTWB/m002_s001_object.xlsx"),
+    # project.import_features_for_session(
+    #     session_id=session.id,
+    #     features_path = Path("/Users/thomasbush/Downloads/shared WithTWB/m002_s001_object.xlsx"),
 
-    )
-    project.annotate_sessions()
-    
+    # )
+    # print(project.sessions[0].features_file())
+    print(project.sessions[0].events_file())
+    # project.annotate_sessions()
+    project.set_config_value("data.feature_set", ["height", "dist"])
+    print(project.config["data"]["feature_set"])
+    project.select_features()
+    print(project.sessions[0].features.shape)
+    project.sessions[0].load_annotations()
+    print(project.sessions[0].annotations.head())
