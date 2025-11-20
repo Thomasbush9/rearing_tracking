@@ -2,6 +2,7 @@ from pathlib import Path
 import csv
 import shutil
 import pandas as pd
+import numpy as np
 
 
 class Session:
@@ -35,6 +36,7 @@ class Session:
 
         self.features = None
         self.annotations = None
+        self.labels = None
     # ------------------------------------------------------------
     # Path helpers
     # ------------------------------------------------------------
@@ -238,3 +240,16 @@ class Session:
         """
         events_path = self.events_file()  # This initializes the file if missing
         self.annotations = pd.read_csv(events_path)
+    
+    def build_labels(self):
+        """Build labels from annotaions"""
+        if self.annotations is None:
+            raise ValueError("Annotations not loaded. Call load_annotations() first.")
+        if self.features is None:
+            raise ValueError("Features not loaded. Call select_features() first.")
+        y = np.zeros(self.features.shape[0])
+        if "start_frame" not in self.annotations.columns or "end_frame" not in self.annotations.columns:
+            raise ValueError("Annotations must contain start_frame and end_frame columns.")
+        for s, e in self.annotations[["start_frame", "end_frame"]].itertuples(index=False):
+            y[s:e] = 1
+        self.labels = y

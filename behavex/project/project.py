@@ -505,7 +505,7 @@ if __name__ == "__main__":
     # start_app(annotation_view_path)
     # project.import_features_for_session(
     #     session_id=session.id,
-    #     features_path = Path("/Users/thomasbush/Downloads/shared WithTWB/m002_s001_object.xlsx"),
+    #     features_path = Path("/Users/thomasbush/Downloads/shared WithTWB/m002_s001_cricket.xlsx"),
 
     # )
     # print(project.sessions[0].features_file())
@@ -517,3 +517,5 @@ if __name__ == "__main__":
     print(project.sessions[0].features.shape)
     project.sessions[0].load_annotations()
     print(project.sessions[0].annotations.head())
+    project.sessions[0].build_labels()
+    print(project.sessions[0].labels.shape)
