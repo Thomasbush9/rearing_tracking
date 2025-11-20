@@ -240,7 +240,7 @@ class Session:
         """
         events_path = self.events_file()  # This initializes the file if missing
         self.annotations = pd.read_csv(events_path)
-    
+    #TODO: in the future add type of behavior to build the labels eg rearing, grooming, etc.
     def build_labels(self):
         """Build labels from annotaions"""
         if self.annotations is None:
@@ -253,3 +253,21 @@ class Session:
         for s, e in self.annotations[["start_frame", "end_frame"]].itertuples(index=False):
             y[s:e] = 1
         self.labels = y
+    
+    def build_windows(self, window_size:int=30):
+        """Build windows from features.
+        Given features of shape T, D -> T, W, D
+        """
+        T, F = self.features.shape
+        # padded X: prepend W-1 rows of zeros
+        pad = np.zeros((window_size-1, F), dtype=self.features.dtype)
+        Xpad = np.concatenate([pad, self.features], axis=0)  # shape (T+W-1, F)
+
+        # build windows via sliding strides
+        X_windows = np.lib.stride_tricks.as_strided(
+            Xpad,
+            shape=(T, window_size, F),
+            strides=(Xpad.strides[0], Xpad.strides[0], Xpad.strides[1])
+        ).copy()
+
+        self.windows = X_windows
