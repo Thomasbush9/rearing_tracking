@@ -74,8 +74,8 @@ class Project:
                 "training": {
                     "epochs": 20,
                     "device": "mps",
-                    "batch_size": 64,
-                    "hidden_size": 64,
+                    "batch_size": 32,
+                    "hidden_size": 16,
                     "lr": 1e-3,
                     "weight_decay": 1e-5,
                     "patience": 5,
@@ -546,7 +546,7 @@ if __name__ == "__main__":
     # print(project.sessions[0].features_file())
     print(project.sessions[0].events_file())
     # project.annotate_sessions()
-    project.set_config_value("data.feature_set", ["height", "dist"])
+    project.set_config_value("data.feature_set", ["height", "trunk_speed"])
     print(project.config["data"]["feature_set"])
     project.select_features()
     print(project.sessions[0].features.shape)

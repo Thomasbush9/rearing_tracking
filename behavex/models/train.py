@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torch import Tensor
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 class Trainer:
     def __init__(
@@ -27,7 +28,7 @@ class Trainer:
         train_dataset, test_dataset = self._build_dataset()
         self.train_loader = DataLoader(train_dataset, batch_size=self.training_args.batch_size, shuffle=True)
         self.test_loader = DataLoader(test_dataset, batch_size=self.training_args.batch_size, shuffle=False)
-        self.criterion = nn.BCELoss()
+        self.criterion = nn.BCEWithLogitsLoss()
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.training_args.learning_rate, weight_decay=self.training_args.weight_decay)
         self.train_losses = []
         self.test_losses = []
@@ -63,7 +64,24 @@ class Trainer:
         )
     def _build_dataset(self):
         """Build the training and test dataset based on the training args"""
-        X_train, X_test, y_train, y_test = train_test_split(self.project.train_windows, self.project.train_labels, test_size=0.1, random_state=42)
+        # Reshape windows from (N, T, F) to (N*T, F) for scaling
+        original_shape = self.project.train_windows.shape
+        windows_2d = self.project.train_windows.reshape(-1, original_shape[-1])
+        
+        # Fit scaler on training data only
+        self.scaler = StandardScaler()
+        windows_scaled_2d = self.scaler.fit_transform(windows_2d)
+        
+        # Reshape back to (N, T, F)
+        self.project.train_windows = windows_scaled_2d.reshape(original_shape)
+        
+        # Don't scale labels - they're binary (0/1)
+        X_train, X_test, y_train, y_test = train_test_split(
+            self.project.train_windows, 
+            self.project.train_labels, 
+            test_size=0.1, 
+            random_state=42
+        )
         train_dataset = CustomDataset(
             X_windows=X_train,
             y=y_train
@@ -74,16 +92,27 @@ class Trainer:
         )
         return train_dataset, test_dataset
     
+    def learning_step(self, X, y):
+        """Perform one learning step: forward, backward, optimizer step"""
+        X = X.to(self.device)
+        y = y.to(self.device)
+        
+        self.optimizer.zero_grad()
+        output = self.model(X)
+        loss = self.criterion(output, y)
+        loss.backward()
+        self.optimizer.step()
+        
+        return loss.item()
+    
     def train(self):
         """Train the model"""
+        self.model.train()
         for epoch in range(self.training_args.epochs):
             running_loss = 0.0
             for X, y in self.train_loader:
-                X = X.to(self.device)
-                y = y.to(self.device)
-                output = self.model(X)
-                loss = self.criterion(output, y)
-                if torch.isnan(loss).item():
+                loss = self.learning_step(X, y)
+                if np.isnan(loss):
                     print(f"NaN loss detected at epoch {epoch+1}, stopping training")
                     return
                 running_loss += loss * X.size(0)
@@ -98,4 +127,19 @@ class Trainer:
                 self.test_epochs.append(epoch + 1)
                 print(f" | Test Loss: {test_loss:.4f}")
             else:
-                print()  
+                print()
+    
+    def test(self):
+        """Evaluate the model on test set"""
+        self.model.eval()
+        running_loss = 0.0
+        with torch.no_grad():
+            for X, y in self.test_loader:
+                X = X.to(self.device)
+                y = y.to(self.device)
+                output = self.model(X)
+                loss = self.criterion(output, y)
+                running_loss += loss.item() * X.size(0)
+        avg_loss = running_loss / len(self.test_loader.dataset)
+        self.model.train()
+        return avg_loss  
