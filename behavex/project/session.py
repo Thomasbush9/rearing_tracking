@@ -273,62 +273,70 @@ class Session:
         self.windows = X_windows
 
     def subsample_session(self, ratio_positive: float = 0.5):
-        """Subsample the session to a given number of frames."""
+        """
+        Subsample the TRAINING data only (after split_data()).
+        Validation data remains unchanged to preserve temporal consistency.
+        """
+        if not hasattr(self, 'train_windows') or self.train_windows is None:
+            raise ValueError("Training data not split. Call split_data() first.")
+        if self.train_labels is None:
+            raise ValueError("Training labels not found. Call split_data() first.")
+        
+        # Subsample only training data
+        P = np.argwhere(self.train_labels==1).squeeze()
+        N = np.argwhere(self.train_labels==0).squeeze()
+        
+        if len(P) == 0:
+            raise ValueError("No positive labels in training data.")
+        
+        factor = int(N.shape[0] // P.shape[0] * ratio_positive)
+        if factor < 1:
+            factor = 1
+        N = N[::factor]  # subsample negative events
+        
+        idx = np.concatenate([P, N])
+        np.random.shuffle(idx)
+        
+        # Update only training data (validation remains unchanged)
+        self.train_windows = self.train_windows[idx]
+        self.train_labels = self.train_labels[idx]
+        
+        return self.train_windows, self.train_labels
+    
+    def split_data(self, validation_split: float=0.1):
+        """
+        Split the data into training and validation sets TEMPORALLY (before subsampling).
+        Extracts a continuous middle chunk for validation with original frame indices.
+        This must be called BEFORE subsample_session() to ensure temporal consistency.
+        """
         if self.windows is None:
             raise ValueError("Windows not loaded. Call build_windows() first.")
         if self.labels is None:
             raise ValueError("Labels not loaded. Call build_labels() first.")
-        P = np.argwhere(self.labels==1).squeeze()
-        N = np.argwhere(self.labels==0).squeeze()
-        factor = int(N.shape[0] // P.shape[0] * ratio_positive)
-        N = N[::factor] # subsample negative events
-        idx = np.concatenate([P, N])
-        np.random.shuffle(idx)
-        self.windows = self.windows[idx]
-        self.labels = self.labels[idx]
-        return self.windows, self.labels
-    
-    def extract_validation_data(self, validation_split: float = 0.1):
-        """
-        Determine TRAIN/VAL frame indices (before windows).
-        Stores self.val_indices and self.train_indices as arrays of *window* indices,
-        so that these match the windowed arrays' length as needed for training.
-        """
-        if self.features is None:
-            raise ValueError("Features not loaded. Call select_features() first.")
-        if self.windows is None:
-            raise ValueError("Windows not loaded. Call build_windows() first.")
 
         num_windows = self.windows.shape[0]
         val_len = int(np.round(num_windows * validation_split))
         if val_len == 0:
             raise ValueError("Session too short for validation split.")
+        
+        # Extract continuous middle chunk for validation (temporal split)
         val_start = (num_windows - val_len) // 2
         val_end = val_start + val_len
-
+        
+        # Store original frame indices for validation (windows align with frames)
+        self.val_frame_indices = np.arange(val_start, val_end)
+        
+        # Split windows and labels temporally
         all_indices = np.arange(num_windows)
         val_indices = all_indices[val_start:val_end]
         train_indices = np.delete(all_indices, np.arange(val_start, val_end))
+        
+        # Store indices for later use
         self.val_indices = val_indices
         self.train_indices = train_indices
-
-    def split_data(self, validation_split: float=0.1):
-        """
-        Split the data into training and validation sets.
-        Properly indexes into self.windows/labels using window indices.
-        """
-        if self.windows is None:
-            raise ValueError("Windows not loaded. Call build_windows() first.")
-        if self.labels is None:
-            raise ValueError("Labels not loaded. Call build_labels() first.")
-        self.extract_validation_data(validation_split)
-
-        # Safeguard: Ensure indices are in bounds
-        max_idx = self.windows.shape[0]
-        train_idx = self.train_indices[self.train_indices < max_idx]
-        val_idx = self.val_indices[self.val_indices < max_idx]
-
-        self.train_windows = self.windows[train_idx]
-        self.train_labels = self.labels[train_idx]
-        self.val_windows = self.windows[val_idx]
-        self.val_labels = self.labels[val_idx]
+        
+        # Split the data
+        self.train_windows = self.windows[train_indices]
+        self.train_labels = self.labels[train_indices]
+        self.val_windows = self.windows[val_indices]
+        self.val_labels = self.labels[val_indices]

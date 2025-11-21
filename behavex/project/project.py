@@ -380,13 +380,15 @@ class Project:
                 
 
     def merge_and_generate_training_data(self):
-        """Merge all the session data into a single training dataset"""
-        # Loop across sessions and merge labels (1d) and windows (3d array).
+        """Merge all the session training data into a single training dataset"""
+        # Loop across sessions and merge training labels (1d) and windows (3d array).
         train_labels = []
         train_windows = []
         for session in self.sessions:
-            train_labels.extend(session.labels)
-            train_windows.extend(session.windows)
+            if not hasattr(session, 'train_windows') or session.train_windows is None:
+                raise ValueError(f"Session {session.id} training data not split. Call split_data() first.")
+            train_labels.extend(session.train_labels)
+            train_windows.extend(session.train_windows)
         # Convert labels to a numpy array (TOT_FRAMES,)
         self.train_labels = np.array(train_labels)
         self.train_windows = np.stack(train_windows, axis=0)
@@ -556,15 +558,16 @@ if __name__ == "__main__":
     print(project.sessions[0].labels.shape)
     project.sessions[0].build_windows()
     print(project.sessions[0].windows.shape)
-    project.sessions[0].subsample_session()
-    print(project.sessions[0].windows.shape)
-    print(project.sessions[0].labels.shape)
-
+    # Split temporally FIRST (before subsampling)
     project.sessions[0].split_data()
     print(project.sessions[0].train_windows.shape)
     print(project.sessions[0].train_labels.shape)
     print(project.sessions[0].val_windows.shape)
     print(project.sessions[0].val_labels.shape)
+    # Then subsample only training data
+    project.sessions[0].subsample_session()
+    print(project.sessions[0].train_windows.shape)
+    print(project.sessions[0].train_labels.shape)
     project.merge_and_generate_training_data()
     print(project.train_windows.shape)
     print(project.train_labels.shape)

@@ -35,6 +35,7 @@ class Trainer:
         self.epochs = []
         self.test_epochs = []
         self.test_every_n_epochs = self.training_args.test_every_n_epochs
+        self.viz = Vizualizer()
     def _build_model(self):
         """Build the model based on the model name"""
         if self.model_name == "gru":
@@ -131,7 +132,7 @@ class Trainer:
             
             # Run validation every 5 epochs
             if (epoch + 1) % 5 == 0:
-                self.validation()
+                self.validation(epoch+1)
     
     def test(self):
         """Evaluate the model on test set"""
@@ -156,18 +157,54 @@ class Trainer:
         """Load the model"""
         self.model.load_state_dict(torch.load(self.training_args.save_path))
     
-    def validation(self):
-        """Run validation over a temporal consistent timeseries for each sessio
+    def validation(self, epoch:int):
+        """Run validation over a temporal consistent timeseries for each session
         Saves plot for each run, session into session folder under validation folder
         """
         for session in self.project.sessions:
-            session_dir = self.project.project_dir / "validation" / session.id
+            # Skip if no validation data
+            if not hasattr(session, 'val_windows') or session.val_windows is None:
+                continue
+                
+            session_dir = session.session_root / "validation"
             session_dir.mkdir(parents=True, exist_ok=True)
-            # run the model over validation data
-            validation_data = Tensor(session.val_windows).to(self.device)
-            predictions = self.model(validation_data)
-            predictions = predictions.detach().cpu().numpy()
-            true_labels = session.val_labels
-            print(predictions.shape, true_labels.shape)
+            save_path = session_dir / f"{session.id}_{epoch}_validation.png"
+            
+            # Scale validation data using the same scaler as training data
+            original_shape = session.val_windows.shape
+            windows_2d = session.val_windows.reshape(-1, original_shape[-1])
+            windows_scaled_2d = self.scaler.transform(windows_2d)
+            val_windows_scaled = windows_scaled_2d.reshape(original_shape)
+            
+            # Run model over validation data
+            with torch.no_grad():
+                validation_data = Tensor(val_windows_scaled).float().to(self.device)
+                predictions = self.model(validation_data)
+                probs = torch.sigmoid(predictions).cpu().numpy().squeeze()
+            
+            # Ensure true_labels is 1D
+            true_labels = np.array(session.val_labels).flatten()
+            
+            # Ensure probs is 1D and matches length
+            if probs.ndim > 1:
+                probs = probs.flatten()
+            
+            if len(probs) != len(true_labels):
+                print(f"Warning: Shape mismatch for session {session.id}. Predictions: {probs.shape}, Labels: {true_labels.shape}")
+                continue
+            
+            # Get actual frame indices (original frame numbers from temporal split)
+            if hasattr(session, 'val_frame_indices') and session.val_frame_indices is not None:
+                frame_indices = session.val_frame_indices  # Original frame indices from temporal split
+            elif hasattr(session, 'val_indices') and session.val_indices is not None:
+                frame_indices = session.val_indices  # Fallback to window indices
+            else:
+                frame_indices = np.arange(len(true_labels))
+            
+            # Debug: print label statistics
+            num_positives = np.sum(true_labels)
+            print(f"Session {session.id} - Validation: {len(true_labels)} frames, {num_positives} positive labels")
+                
+            self.viz.plot_validation_predictions(probs, true_labels, save_path=save_path, epoch=epoch, frame_indices=frame_indices)
 
         
