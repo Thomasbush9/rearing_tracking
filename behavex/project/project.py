@@ -4,6 +4,7 @@ from typing import List, Optional
 import yaml
 import pandas as pd
 from behavex.project.session import Session
+from behavex.models.train import Trainer
 import numpy as np
 
 def _deep_update(base: dict, updates: dict) -> dict:
@@ -67,12 +68,18 @@ class Project:
                 "annotator": "",
                 "output_format": "csv",
             },
+            #TODO: add other params for training 
             "model_defaults": {
                 "model_name": "gru_v1",
                 "training": {
                     "epochs": 20,
-                    "batch_size": 32,
+                    "batch_size": 64,
                     "lr": 1e-3,
+                    "weight_decay": 1e-5,
+                    "patience": 5,
+                    "save_model": True,
+                    "save_path": str(self.project_dir / "models"),
+                    "verbose": False,
                 },
                 "inference": {
                     "smoothing": True,
@@ -389,11 +396,14 @@ class Project:
         num_features = len(self.config["data"]["feature_set"])
         if self.train_windows.shape[2] != num_features:
             raise ValueError("Number of features does not match the feature set")
+
+    def train(self):
+        """Launch model training"""
+        #TODO: write safety checks before calling trainer: 
+
+        trainer = Trainer(project=self)
+
        
-
-
-                
-    
     def annotate_sessions(self):
         """Open GUI to select and annotate a session."""
         from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget, QListWidgetItem, QApplication
@@ -555,3 +565,4 @@ if __name__ == "__main__":
     project.merge_and_generate_training_data()
     print(project.train_windows.shape)
     print(project.train_labels.shape)
+    project.train()

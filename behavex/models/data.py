@@ -53,6 +53,9 @@ class GRUTrainingArgs:
     Arguments for training a GRU model.
     """
     batch_size: int
+    input_size: int
+    hidden_size: int
+    output_size: int
     learning_rate: float
     epochs: int
     weight_decay: float
