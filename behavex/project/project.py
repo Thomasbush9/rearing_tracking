@@ -4,7 +4,7 @@ from typing import List, Optional
 import yaml
 import pandas as pd
 from behavex.project.session import Session
-
+import numpy as np
 
 def _deep_update(base: dict, updates: dict) -> dict:
     """Recursively update dict 'base' with values from 'updates'"""
@@ -369,6 +369,28 @@ class Project:
             session.select_features(featues_set)
                 
 
+    def merge_and_generate_training_data(self):
+        """Merge all the session data into a single training dataset"""
+        # Loop across sessions and merge labels (1d) and windows (3d array).
+        train_labels = []
+        train_windows = []
+        for session in self.sessions:
+            train_labels.extend(session.labels)
+            train_windows.extend(session.windows)
+        # Convert labels to a numpy array (TOT_FRAMES,)
+        self.train_labels = np.array(train_labels)
+        self.train_windows = np.stack(train_windows, axis=0)
+        # Ensure labels are 1-dimensional (just 0 and 1)
+        if self.train_labels.shape[0] != self.train_windows.shape[0]:
+            raise ValueError("Number of labels and windows do not match")
+        if self.train_labels.ndim != 1:
+            raise ValueError("Labels must be 1-dimensional (array of 0s and 1s)")
+        # Check number of features matches feature set length
+        num_features = len(self.config["data"]["feature_set"])
+        if self.train_windows.shape[2] != num_features:
+            raise ValueError("Number of features does not match the feature set")
+       
+
 
                 
     
@@ -530,3 +552,6 @@ if __name__ == "__main__":
     print(project.sessions[0].train_labels.shape)
     print(project.sessions[0].val_windows.shape)
     print(project.sessions[0].val_labels.shape)
+    project.merge_and_generate_training_data()
+    print(project.train_windows.shape)
+    print(project.train_labels.shape)
