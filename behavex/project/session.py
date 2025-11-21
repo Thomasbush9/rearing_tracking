@@ -32,7 +32,7 @@ class Session:
         self.group = metadata.get("group", None)
 
         # Directory inside project for artifacts
-        self.session_root = self.project.project_dir / "sessions" / self.id
+        self.session_root = self.project.project_dir / "sessions" / self.video_dir.name
 
         self.features = None
         self.annotations = None

@@ -1,6 +1,6 @@
 from pathlib import Path
 from typing import List, Optional
-
+from datetime import datetime
 import yaml
 import pandas as pd
 from behavex.project.session import Session
@@ -540,12 +540,12 @@ if __name__ == "__main__":
     # # get session annotaiton view file path 
     # annotation_view_path = session.path_to_view(session.annotation_view)
     # start_app(annotation_view_path)
-    # project.import_features_for_session(
-    #     session_id=session.id,
-    #     features_path = Path("/Users/thomasbush/Downloads/shared WithTWB/m002_s001_cricket.xlsx"),
+    project.import_features_for_session(
+        session_id=session.id,
+        features_path = Path("/Users/thomasbush/Downloads/shared WithTWB/m002_s001_cricket.xlsx"),
 
-    # )
-    # print(project.sessions[0].features_file())
+    )
+    print(project.sessions[0].features_file())
     print(project.sessions[0].events_file())
     # project.annotate_sessions()
     project.set_config_value("data.feature_set", ["height", "trunk_speed"])
