@@ -128,6 +128,10 @@ class Trainer:
                 print(f" | Test Loss: {test_loss:.4f}")
             else:
                 print()
+            
+            # Run validation every 5 epochs
+            if (epoch + 1) % 5 == 0:
+                self.validation()
     
     def test(self):
         """Evaluate the model on test set"""
@@ -143,3 +147,27 @@ class Trainer:
         avg_loss = running_loss / len(self.test_loader.dataset)
         self.model.train()
         return avg_loss  
+    
+    def save_model(self):
+        """Save the model"""
+        torch.save(self.model.state_dict(), self.training_args.save_path)
+    
+    def load_model(self):
+        """Load the model"""
+        self.model.load_state_dict(torch.load(self.training_args.save_path))
+    
+    def validation(self):
+        """Run validation over a temporal consistent timeseries for each sessio
+        Saves plot for each run, session into session folder under validation folder
+        """
+        for session in self.project.sessions:
+            session_dir = self.project.project_dir / "validation" / session.id
+            session_dir.mkdir(parents=True, exist_ok=True)
+            # run the model over validation data
+            validation_data = Tensor(session.val_windows).to(self.device)
+            predictions = self.model(validation_data)
+            predictions = predictions.detach().cpu().numpy()
+            true_labels = session.val_labels
+            print(predictions.shape, true_labels.shape)
+
+        
