@@ -53,6 +53,7 @@ class GRUTrainingArgs:
     Arguments for training a GRU model.
     """
     batch_size: int
+    device: str
     input_size: int
     hidden_size: int
     output_size: int
@@ -63,3 +64,4 @@ class GRUTrainingArgs:
     verbose: bool
     save_model: bool
     save_path: str
+    test_every_n_epochs: int

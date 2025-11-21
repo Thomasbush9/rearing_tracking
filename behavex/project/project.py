@@ -70,16 +70,19 @@ class Project:
             },
             #TODO: add other params for training 
             "model_defaults": {
-                "model_name": "gru_v1",
+                "model_name": "gru",
                 "training": {
                     "epochs": 20,
+                    "device": "mps",
                     "batch_size": 64,
+                    "hidden_size": 64,
                     "lr": 1e-3,
                     "weight_decay": 1e-5,
                     "patience": 5,
                     "save_model": True,
                     "save_path": str(self.project_dir / "models"),
                     "verbose": False,
+                    "test_every_n_epochs": 1,
                 },
                 "inference": {
                     "smoothing": True,
@@ -402,7 +405,7 @@ class Project:
         #TODO: write safety checks before calling trainer: 
 
         trainer = Trainer(project=self)
-
+        trainer.train()
        
     def annotate_sessions(self):
         """Open GUI to select and annotate a session."""
