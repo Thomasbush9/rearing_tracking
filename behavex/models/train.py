@@ -12,6 +12,7 @@ from tqdm import tqdm
 from torch import Tensor
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from datetime import datetime
 
 class Trainer:
     def __init__(
@@ -133,7 +134,13 @@ class Trainer:
             # Run validation every 5 epochs
             if (epoch + 1) % 5 == 0:
                 self.validation(epoch+1)
-    
+        self.plot_loss_history()
+    def plot_loss_history(self):
+        plot_dir = self.project.project_dir / "plots"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        save_path = plot_dir / f"loss_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        self.viz.plot_loss_history(self.train_losses, self.test_losses, save_path=save_path)
+
     def test(self):
         """Evaluate the model on test set"""
         self.model.eval()

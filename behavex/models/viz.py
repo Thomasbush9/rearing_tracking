@@ -45,7 +45,7 @@ class Vizualizer:
         plt.close(fig)
         
 
-    def plot_loss_history(self, train_losses: list[float], test_losses: list[float], save:bool = True) -> None:
+    def plot_loss_history(self, train_losses: list[float], test_losses: list[float], save_path: Path = None) -> None:
         """Plot the loss history"""
         fig, ax = plt.subplots(figsize=(10, 6))
         ax.plot(train_losses, label='Train Loss', marker='o', alpha=0.7)
@@ -56,8 +56,9 @@ class Vizualizer:
         ax.legend()
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        if save:
-            plt.savefig(self.save_dir / "loss_history.png")
+        if save_path is not None    :
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
     def plot_confusion_matrix(self, confusion_matrix: np.ndarray) -> None:
         """Plot the confusion matrix."""
         pass

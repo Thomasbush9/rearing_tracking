@@ -571,4 +571,5 @@ if __name__ == "__main__":
     project.merge_and_generate_training_data()
     print(project.train_windows.shape)
     print(project.train_labels.shape)
+    project.set_config_value("model_defaults.training.epochs", 10)
     project.train()
