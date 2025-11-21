@@ -524,3 +524,9 @@ if __name__ == "__main__":
     project.sessions[0].subsample_session()
     print(project.sessions[0].windows.shape)
     print(project.sessions[0].labels.shape)
+
+    project.sessions[0].split_data()
+    print(project.sessions[0].train_windows.shape)
+    print(project.sessions[0].train_labels.shape)
+    print(project.sessions[0].val_windows.shape)
+    print(project.sessions[0].val_labels.shape)
