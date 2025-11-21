@@ -521,3 +521,6 @@ if __name__ == "__main__":
     print(project.sessions[0].labels.shape)
     project.sessions[0].build_windows()
     print(project.sessions[0].windows.shape)
+    project.sessions[0].subsample_session()
+    print(project.sessions[0].windows.shape)
+    print(project.sessions[0].labels.shape)
