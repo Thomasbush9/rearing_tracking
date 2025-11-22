@@ -3,6 +3,7 @@ import csv
 import shutil
 import pandas as pd
 import numpy as np
+from behavex.utils.helpers import Helper
 
 
 class Session:
@@ -217,20 +218,13 @@ class Session:
         self.metadata[key] = value
 
 
-    def select_features(self, features_set: list):
+    def select_features(self, features_set: list = None):
         """Load features from file and select the features in the features_set."""
-        features_file = self.features_file()
-        if self.has_features():
-            if features_file.suffix == ".csv":
-                features = pd.read_csv(features_file)
-            elif features_file.suffix == ".xlsx":
-                features = pd.read_excel(features_file)
-            else:
-                raise ValueError(f"Unsupported file format: {features_file.suffix}")
-            try: 
-                self.features = features[features_set].to_numpy()
-            except Exception as e:
-                raise ValueError(f"Error selecting features: {e}")
+        if not self.has_features():
+            raise ValueError("Session has no features")
+        helper = Helper(self.project)
+        df = helper.extract_features_df(self)
+        self.features = df.to_numpy()
 
     def load_annotations(self):
         """
