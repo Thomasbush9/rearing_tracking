@@ -16,6 +16,14 @@ from sklearn.preprocessing import StandardScaler
 from datetime import datetime
 import json
 from pathlib import Path
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import subprocess
+import atexit
+import signal
+import time
+import os
 
 class Trainer:
     def __init__(
@@ -50,6 +58,43 @@ class Trainer:
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(log_dir=self.runs_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         
+        # TensorBoard process tracking
+        self.tensorboard_process = None
+        atexit.register(self._cleanup_tensorboard)
+    
+    def _start_tensorboard(self):
+        """Start TensorBoard in background process"""
+        try:
+            # Point TensorBoard to the runs directory
+            self.tensorboard_process = subprocess.Popen(
+                ['tensorboard', '--logdir', str(self.runs_dir), '--port', '6006'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=None if hasattr(os, 'setsid') else None
+            )
+            # Give TensorBoard time to start
+            time.sleep(2)
+            print(f"\n{'='*60}")
+            print(f"TensorBoard started at: http://localhost:6006")
+            print(f"Log directory: {self.runs_dir}")
+            print(f"{'='*60}\n")
+        except FileNotFoundError:
+            print("Warning: TensorBoard not found. Install with: pip install tensorboard")
+        except Exception as e:
+            print(f"Warning: Could not start TensorBoard: {e}")
+    
+    def _cleanup_tensorboard(self):
+        """Terminate TensorBoard process"""
+        if self.tensorboard_process is not None:
+            try:
+                self.tensorboard_process.terminate()
+                self.tensorboard_process.wait(timeout=5)
+                print("\nTensorBoard stopped.")
+            except subprocess.TimeoutExpired:
+                self.tensorboard_process.kill()
+            except Exception as e:
+                print(f"Warning: Error stopping TensorBoard: {e}")
+
     def _build_model(self):
         """Build the model based on the model name"""
         if self.model_name == "gru":
@@ -122,41 +167,54 @@ class Trainer:
     
     def train(self):
         """Train the model"""
-        self.model.train()
-        for epoch in range(self.training_args.epochs):
-            running_loss = 0.0
-            for X, y in self.train_loader:
-                loss = self.learning_step(X, y)
-                if np.isnan(loss):
-                    print(f"NaN loss detected at epoch {epoch+1}, stopping training")
-                    return
-                running_loss += loss * X.size(0)
-            avg_loss = running_loss / len(self.train_loader.dataset)
-            self.train_losses.append(avg_loss)
-            self.epochs.append(epoch + 1)
-            self.writer.add_scalar('train/loss', avg_loss, epoch + 1)
+        # Start TensorBoard
+        self._start_tensorboard()
+        
+        try:
+            self.model.train()
+            for epoch in range(self.training_args.epochs):
+                running_loss = 0.0
+                for X, y in self.train_loader:
+                    loss = self.learning_step(X, y)
+                    if np.isnan(loss):
+                        print(f"NaN loss detected at epoch {epoch+1}, stopping training")
+                        return
+                    running_loss += loss * X.size(0)
+                avg_loss = running_loss / len(self.train_loader.dataset)
+                self.train_losses.append(avg_loss)
+                self.epochs.append(epoch + 1)
+                self.writer.add_scalar('train/loss', avg_loss, epoch + 1)
+                
+                print(f"Epoch {epoch+1}/{self.training_args.epochs} - Train Loss: {avg_loss:.4f}", end="")
+                if (epoch + 1) % self.test_every_n_epochs == 0:
+                    test_loss = self.test()
+                    self.test_losses.append(test_loss)
+                    self.test_epochs.append(epoch + 1)
+                    self.writer.add_scalar('test/loss', test_loss, epoch + 1)
+                    print(f" | Test Loss: {test_loss:.4f}")
+                else:
+                    print()
+                
+                # Run validation every 5 epochs
+                if (epoch + 1) % 5 == 0:
+                    self.validation(epoch+1)
             
-            print(f"Epoch {epoch+1}/{self.training_args.epochs} - Train Loss: {avg_loss:.4f}", end="")
-            if (epoch + 1) % self.test_every_n_epochs == 0:
-                test_loss = self.test()
-                self.test_losses.append(test_loss)
-                self.test_epochs.append(epoch + 1)
-                self.writer.add_scalar('test/loss', test_loss, epoch + 1)
-                print(f" | Test Loss: {test_loss:.4f}")
-            else:
-                print()
+            # Plot and log loss history
+            loss_fig = self.plot_loss_history()
+            self.writer.add_figure('loss_history', loss_fig, self.training_args.epochs)
+            plt.close(loss_fig)
             
-            # Run validation every 5 epochs
-            if (epoch + 1) % 5 == 0:
-                self.validation(epoch+1)
-        self.plot_loss_history()
-        if self.training_args.save_model:
-            self.save_model()
+            if self.training_args.save_model:
+                self.save_model()
+        finally:
+            # Ensure TensorBoard is stopped even if training fails
+            self._cleanup_tensorboard()
+            self.writer.close()
     def plot_loss_history(self):
         plot_dir = self.project.project_dir / "plots"
         plot_dir.mkdir(parents=True, exist_ok=True)
         save_path = plot_dir / f"loss_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-        self.viz.plot_loss_history(self.train_losses, self.test_losses, save_path=save_path)
+        return self.viz.plot_loss_history(self.train_losses, self.test_losses, save_path=save_path)
 
     def test(self):
         """Evaluate the model on test set"""
@@ -369,6 +427,8 @@ class Trainer:
             num_positives = np.sum(true_labels)
             print(f"Session {session.id} - Validation: {len(true_labels)} frames, {num_positives} positive labels")
                 
-            self.viz.plot_validation_predictions(probs, true_labels, save_path=save_path, epoch=epoch, frame_indices=frame_indices)
+            val_fig = self.viz.plot_validation_predictions(probs, true_labels, save_path=save_path, epoch=epoch, frame_indices=frame_indices)
+            self.writer.add_figure(f'validation/{session.id}', val_fig, epoch)
+            plt.close(val_fig)
 
         

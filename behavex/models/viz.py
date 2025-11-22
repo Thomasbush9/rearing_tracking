@@ -1,3 +1,5 @@
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for TensorBoard
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
@@ -9,8 +11,12 @@ class Vizualizer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
     def plot_validation_predictions(self, predicted_labels: np.ndarray, true_labels: np.ndarray,
-                                     save_path: Path = None, epoch: int = None, frame_indices: np.ndarray = None) -> None:
-        """Plot the validation predictions + real labels overlapping and absolute error"""
+                                     save_path: Path = None, epoch: int = None, frame_indices: np.ndarray = None):
+        """Plot the validation predictions + real labels overlapping and absolute error
+        
+        Returns:
+            matplotlib.figure.Figure: The figure object for TensorBoard logging
+        """
         if frame_indices is None:
             frame_indices = np.arange(len(true_labels))
         
@@ -42,11 +48,20 @@ class Vizualizer:
         
         if save_path is not None:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close(fig)
+        
+        # Ensure figure is drawn for TensorBoard
+        if fig.canvas is not None and hasattr(fig.canvas, 'draw'):
+            fig.canvas.draw()
+        
+        return fig
         
 
-    def plot_loss_history(self, train_losses: list[float], test_losses: list[float], save_path: Path = None) -> None:
-        """Plot the loss history"""
+    def plot_loss_history(self, train_losses: list[float], test_losses: list[float], save_path: Path = None):
+        """Plot the loss history
+        
+        Returns:
+            matplotlib.figure.Figure: The figure object for TensorBoard logging
+        """
         fig, ax = plt.subplots(figsize=(10, 6))
         ax.plot(train_losses, label='Train Loss', marker='o', alpha=0.7)
         ax.plot(test_losses, label='Test Loss', marker='s', alpha=0.7)
@@ -56,9 +71,14 @@ class Vizualizer:
         ax.legend()
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        if save_path is not None    :
+        if save_path is not None:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close(fig)
+        
+        # Ensure figure is drawn for TensorBoard
+        if fig.canvas is not None and hasattr(fig.canvas, 'draw'):
+            fig.canvas.draw()
+        
+        return fig
     def plot_confusion_matrix(self, confusion_matrix: np.ndarray) -> None:
         """Plot the confusion matrix."""
         pass
