@@ -42,7 +42,8 @@ class Helper:
         result_dict = {}
         for feat_name in self.features_names:
             if feat_name in df.columns:
-                result_dict[feat_name] = df[feat_name].values
+                # Fill NaN values to prevent NaN loss in training
+                result_dict[feat_name] = df[feat_name].ffill().bfill().fillna(0).values
             elif feat_name.endswith("_displacement") or feat_name.endswith("_disp"):
                 base_name = feat_name.replace("_displacement", "").replace("_disp", "")
                 if base_name in df.columns:
@@ -68,11 +69,14 @@ class Helper:
         #check shape of feature
         if feature.ndim != 1:
             raise ValueError("Feature must be 1-dimensional")
-        displacement = np.diff(feature)
+        # Fill NaN values with forward fill, then backward fill for leading NaNs
+        feature_clean = pd.Series(feature).ffill().bfill().fillna(0).values
+        displacement = np.diff(feature_clean)
         displacement = np.concatenate(([0], displacement))
         return displacement
     def get_mean_features(self, df:pd.DataFrame, features:list[str]) -> np.ndarray:
         """Get the mean of a list of features"""
         if not all(feature in df.columns for feature in features):
             raise ValueError("Features not found in dataframe")
-        return df[features].values.mean(axis=1)
+        # Use skipna=True to handle NaN values
+        return df[features].mean(axis=1, skipna=True).fillna(0).values

@@ -540,11 +540,11 @@ if __name__ == "__main__":
     # # get session annotaiton view file path 
     # annotation_view_path = session.path_to_view(session.annotation_view)
     # start_app(annotation_view_path)
-    project.import_features_for_session(
-        session_id=session.id,
-        features_path = Path("/Users/thomasbush/Downloads/shared WithTWB/m002_s001_cricket.xlsx"),
+    # project.import_features_for_session(
+    #     session_id=session.id,
+    #     features_path = Path("/Users/thomasbush/Downloads/shared WithTWB/m002_s001_cricket.xlsx"),
 
-    )
+    # )
     print(project.sessions[0].features_file())
     print(project.sessions[0].events_file())
     # project.annotate_sessions()
@@ -552,24 +552,24 @@ if __name__ == "__main__":
     print(project.config["data"]["feature_set"])
     project.select_features()
     print(project.sessions[0].features.shape)
-    # project.sessions[0].load_annotations()
-    # print(project.sessions[0].annotations.head())
-    # project.sessions[0].build_labels()
-    # print(project.sessions[0].labels.shape)
-    # project.sessions[0].build_windows()
-    # print(project.sessions[0].windows.shape)
-    # # Split temporally FIRST (before subsampling)
-    # project.sessions[0].split_data()
-    # print(project.sessions[0].train_windows.shape)
-    # print(project.sessions[0].train_labels.shape)
-    # print(project.sessions[0].val_windows.shape)
-    # print(project.sessions[0].val_labels.shape)
-    # # Then subsample only training data
-    # project.sessions[0].subsample_session()
-    # print(project.sessions[0].train_windows.shape)
-    # print(project.sessions[0].train_labels.shape)
-    # project.merge_and_generate_training_data()
-    # print(project.train_windows.shape)
-    # print(project.train_labels.shape)
-    # project.set_config_value("model_defaults.training.epochs", 10)
-    # project.train()
+    project.sessions[0].load_annotations()
+    print(project.sessions[0].annotations.head())
+    project.sessions[0].build_labels()
+    print(project.sessions[0].labels.shape)
+    project.sessions[0].build_windows()
+    print(project.sessions[0].windows.shape)
+    # Split temporally FIRST (before subsampling)
+    project.sessions[0].split_data()
+    print(project.sessions[0].train_windows.shape)
+    print(project.sessions[0].train_labels.shape)
+    print(project.sessions[0].val_windows.shape)
+    print(project.sessions[0].val_labels.shape)
+    # Then subsample only training data
+    project.sessions[0].subsample_session()
+    print(project.sessions[0].train_windows.shape)
+    print(project.sessions[0].train_labels.shape)
+    project.merge_and_generate_training_data()
+    print(project.train_windows.shape)
+    print(project.train_labels.shape)
+    project.set_config_value("model_defaults.training.epochs", 10)
+    project.train()

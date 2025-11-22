@@ -2,6 +2,7 @@
 import torch 
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from typing import List, Literal
 from behavex.models.data import CustomDataset, GRUTrainingArgs
@@ -39,6 +40,16 @@ class Trainer:
         self.test_epochs = []
         self.test_every_n_epochs = self.training_args.test_every_n_epochs
         self.viz = Vizualizer()
+        
+        # Set up model directory structure
+        self.model_directory = self.project.project_dir / "models"
+        self.model_directory.mkdir(parents=True, exist_ok=True)
+        
+        # Create runs directory for TensorBoard
+        self.runs_dir = self.model_directory / "runs"
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=self.runs_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        
     def _build_model(self):
         """Build the model based on the model name"""
         if self.model_name == "gru":
@@ -123,12 +134,14 @@ class Trainer:
             avg_loss = running_loss / len(self.train_loader.dataset)
             self.train_losses.append(avg_loss)
             self.epochs.append(epoch + 1)
+            self.writer.add_scalar('train/loss', avg_loss, epoch + 1)
             
             print(f"Epoch {epoch+1}/{self.training_args.epochs} - Train Loss: {avg_loss:.4f}", end="")
             if (epoch + 1) % self.test_every_n_epochs == 0:
                 test_loss = self.test()
                 self.test_losses.append(test_loss)
                 self.test_epochs.append(epoch + 1)
+                self.writer.add_scalar('test/loss', test_loss, epoch + 1)
                 print(f" | Test Loss: {test_loss:.4f}")
             else:
                 print()
@@ -166,16 +179,17 @@ class Trainer:
         Args:
             model_name: Optional custom name, otherwise auto-generated
         """
-        models_dir = Path(self.training_args.save_path)
-        models_dir.mkdir(parents=True, exist_ok=True)
+        # Save models in models/models/ subdirectory
+        models_subdir = self.model_directory / "models"
+        models_subdir.mkdir(parents=True, exist_ok=True)
         
         # Generate descriptive filename
         if model_name is None:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             model_name = f"{self.model_name}_h{self.training_args.hidden_size}_e{self.training_args.epochs}_{timestamp}"
         
-        model_path = models_dir / f"{model_name}.pth"
-        metadata_path = models_dir / f"{model_name}_metadata.json"
+        model_path = models_subdir / f"{model_name}.pth"
+        metadata_path = models_subdir / f"{model_name}_metadata.json"
         
         # Save model state dict
         torch.save(self.model.state_dict(), model_path)
@@ -213,7 +227,7 @@ class Trainer:
 
     def _update_model_registry(self, model_name: str, metadata: dict):
         """Update or create model registry index"""
-        registry_path = Path(self.training_args.save_path) / "model_registry.json"
+        registry_path = self.model_directory / "model_registry.json"
         
         if registry_path.exists():
             with open(registry_path, 'r') as f:
@@ -223,7 +237,7 @@ class Trainer:
         
         registry[model_name] = {
             "model_path": metadata["model_path"],
-            "metadata_path": str(Path(self.training_args.save_path) / f"{model_name}_metadata.json"),
+            "metadata_path": str(self.model_directory / "models" / f"{model_name}_metadata.json"),
             "timestamp": metadata["timestamp"],
             "hidden_size": metadata["training_args"]["hidden_size"],
             "epochs": metadata["training_args"]["epochs"],
@@ -240,7 +254,7 @@ class Trainer:
             model_identifier: Model name (from registry) or full path to .pth file
                              If None, loads the most recent model
         """
-        models_dir = Path(self.training_args.save_path)
+        models_subdir = self.model_directory / "models"
         
         if model_identifier is None:
             # Load most recent model
@@ -250,7 +264,7 @@ class Trainer:
             model_path = Path(model_identifier)
         else:
             # Model name from registry
-            model_path = models_dir / f"{model_identifier}.pth"
+            model_path = models_subdir / f"{model_identifier}.pth"
             if not model_path.exists():
                 raise FileNotFoundError(f"Model not found: {model_path}")
         
@@ -277,7 +291,7 @@ class Trainer:
 
     def _get_latest_model(self) -> Path:
         """Get the most recently saved model"""
-        registry_path = Path(self.training_args.save_path) / "model_registry.json"
+        registry_path = self.model_directory / "model_registry.json"
         if not registry_path.exists():
             raise FileNotFoundError("No models found. Train and save a model first.")
         
