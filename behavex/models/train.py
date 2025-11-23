@@ -23,6 +23,7 @@ import subprocess
 import atexit
 import signal
 import time
+import joblib
 import os
 
 class Trainer:
@@ -276,11 +277,23 @@ class Trainer:
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
         
+        # Save scaler
+        scalers_dir = self.model_directory / "scalers"
+        scalers_dir.mkdir(parents=True, exist_ok=True)
+        scaler_path = scalers_dir / f"scaler_{model_name}.pkl"
+        joblib.dump(self.scaler, scaler_path)
+        metadata["scaler_path"] = str(scaler_path)
+        
+        # Update metadata file with scaler path
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
         # Update model registry
         self._update_model_registry(model_name, metadata)
         
         print(f"Model saved: {model_path}")
         print(f"Metadata saved: {metadata_path}")
+        print(f"Scaler saved: {scaler_path}")
         return model_path
 
     def _update_model_registry(self, model_name: str, metadata: dict):

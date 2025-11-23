@@ -5,6 +5,7 @@ import yaml
 import pandas as pd
 from behavex.project.session import Session
 from behavex.models.train import Trainer
+from behavex.inference.inference import Inference
 import numpy as np
 
 def _deep_update(base: dict, updates: dict) -> dict:
@@ -15,8 +16,7 @@ def _deep_update(base: dict, updates: dict) -> dict:
         else:
             base[k] = v
     return base
-
-
+    
 class Project:
     def __init__(
         self,
@@ -33,6 +33,9 @@ class Project:
         # load or create config file
         self.load_config()
         self.load_sessions()
+        
+        # List of sessions to predict (session IDs or Session objects)
+        self.sessions_to_predict = []
 
     def load_config(
         self,
@@ -408,6 +411,111 @@ class Project:
 
         trainer = Trainer(project=self)
         trainer.train()
+    
+    def _prepare_session_for_prediction(self, session):
+        """Prepare session data for prediction: load features, build windows, scale data
+        
+        Args:
+            session: Session object to prepare
+            
+        Returns:
+            np.ndarray: Scaled windows ready for inference, shape (TOT_FRAMES, window_size, features)
+        """
+        # Load/select features if not already done
+        if session.features is None:
+            session.select_features(self.config["data"]["feature_set"])
+        
+        # Build windows
+        window_size = self.config["data"]["window_size"]
+        if not hasattr(session, 'windows') or session.windows is None:
+            session.build_windows(window_size)
+        
+        # Scale windows using the loaded scaler (must be called after Inference.load_model)
+        # Reshape windows from (N, T, F) to (N*T, F) for scaling
+        original_shape = session.windows.shape
+        windows_2d = session.windows.reshape(-1, original_shape[-1])
+        windows_scaled_2d = self.inference.scaler.transform(windows_2d)
+        windows_scaled = windows_scaled_2d.reshape(original_shape)
+        
+        return windows_scaled
+    
+    def predict_session(self, session, model_identifier=None, batch_size=64):
+        """Predict on a single session
+        
+        Args:
+            session: Session object or session ID string
+            model_identifier: Model name or path (None for latest)
+            batch_size: Batch size for inference
+            
+        Returns:
+            np.ndarray: Probabilities array for each frame
+        """
+        # Convert session ID to Session object if needed
+        if isinstance(session, str):
+            session = next((s for s in self.sessions if s.id == session), None)
+            if session is None:
+                raise ValueError(f"Session {session} not found")
+        
+        # Initialize Inference and load model if not already done
+        if not hasattr(self, 'inference') or self.inference.model is None:
+            self.inference = Inference(project=self)
+            self.inference.load_model(model_identifier)
+        
+        # Prepare session data
+        scaled_windows = self._prepare_session_for_prediction(session)
+        
+        # Run inference
+        probs = self.inference.predict(scaled_windows, batch_size=batch_size)
+        
+        return probs
+    
+    def predict(self, sessions_to_predict=None, model_identifier=None, batch_size=64):
+        """Predict on multiple sessions
+        
+        Args:
+            sessions_to_predict: List of session IDs or Session objects (None uses self.sessions_to_predict)
+            model_identifier: Model name or path (None for latest)
+            batch_size: Batch size for inference
+            
+        Returns:
+            dict: Mapping of session_id -> probabilities array
+        """
+        if sessions_to_predict is None:
+            sessions_to_predict = self.sessions_to_predict
+        
+        if not sessions_to_predict:
+            raise ValueError("No sessions specified for prediction. Set sessions_to_predict or self.sessions_to_predict")
+        
+        # Initialize Inference once, load model, warm up
+        self.inference = Inference(project=self)
+        metadata = self.inference.load_model(model_identifier)
+        
+        # Warm up model
+        window_size = metadata.get("window_size", self.config["data"]["window_size"])
+        num_features = metadata["training_args"]["input_size"]
+        self.inference.warm_up(window_size, num_features, batch_size)
+        
+        # Convert session IDs to Session objects if needed
+        session_objects = []
+        for sess in sessions_to_predict:
+            if isinstance(sess, str):
+                session_obj = next((s for s in self.sessions if s.id == sess), None)
+                if session_obj is None:
+                    raise ValueError(f"Session {sess} not found")
+                session_objects.append(session_obj)
+            else:
+                session_objects.append(sess)
+        
+        # Predict on each session (model already loaded, so pass None to avoid reload)
+        results = {}
+        for session in session_objects:
+            print(f"Predicting on session: {session.id}")
+            # Use the already-loaded inference instance
+            scaled_windows = self._prepare_session_for_prediction(session)
+            probs = self.inference.predict(scaled_windows, batch_size=batch_size)
+            results[session.id] = probs
+        
+        return results
        
     def annotate_sessions(self):
         """Open GUI to select and annotate a session."""
@@ -573,3 +681,8 @@ if __name__ == "__main__":
     print(project.train_labels.shape)
     project.set_config_value("model_defaults.training.epochs", 10)
     project.train()
+    
+    # Test inference
+    project.sessions_to_predict = [project.sessions[0].id]
+    results = project.predict()
+    print(f"Predictions shape for {project.sessions[0].id}: {results[project.sessions[0].id].shape}")

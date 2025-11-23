@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 from typing import Literal
 import numpy as np
+import joblib
 
 from behavex.models.gru import GRUModel
 
@@ -16,6 +17,7 @@ class Inference:
         self.model_name = model_name
         self.model = None
         self.metadata = None
+        self.scaler = None
         
         # Set up device (use same logic as Trainer)
         train_cfg = project.config.get("model_defaults", {}).get("training", {})
@@ -117,8 +119,28 @@ class Inference:
         self.model = self.model.to(self.device)
         self.model.eval()
         
+        # Load scaler using model name from path
+        model_name = model_path.stem
+        self.load_scaler(model_name)
+        
         print(f"Model loaded: {model_path}")
         return metadata
+    
+    def load_scaler(self, model_name: str):
+        """Load the scaler associated with a model
+        
+        Args:
+            model_name: Model name (stem of .pth file, without extension)
+        """
+        # Load scaler
+        scalers_dir = self.model_directory / "scalers"
+        scaler_path = scalers_dir / f"scaler_{model_name}.pkl"
+        
+        if not scaler_path.exists():
+            raise FileNotFoundError(f"Scaler not found: {scaler_path}")
+        
+        self.scaler = joblib.load(scaler_path)
+        print(f"Scaler loaded: {scaler_path}")
     
     def _get_latest_model(self) -> Path:
         """Get the most recently saved model"""
