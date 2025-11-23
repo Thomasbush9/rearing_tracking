@@ -1,0 +1,16 @@
+numpy
+pandas
+torch
+scikit-learn
+matplotlib
+plotly
+pyyaml
+joblib
+tqdm
+PyQt5
+tensorboard
+
+[dev]
+pytest
+black
+flake8

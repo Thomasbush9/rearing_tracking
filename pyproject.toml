@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "behavex"
+version = "0.1.0"
+description = "Behavioral analysis and annotation package"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "pandas",
+    "torch",
+    "scikit-learn",
+    "matplotlib",
+    "plotly",
+    "pyyaml",
+    "joblib",
+    "tqdm",
+    "PyQt5",
+    "tensorboard",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "flake8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.yml"]
+
