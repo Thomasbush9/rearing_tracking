@@ -438,14 +438,67 @@ class Project:
         windows_scaled = windows_scaled_2d.reshape(original_shape)
         
         return windows_scaled
+    #TODO: make features consistent between training and prediction
+    def _probabilities_to_events(self, probs: np.ndarray, threshold: float = 0.8) -> pd.DataFrame:
+        """Convert probability array to events DataFrame
+        
+        Args:
+            probs: Probability array for each frame
+            threshold: Threshold for binary classification
+            
+        Returns:
+            pd.DataFrame: DataFrame with columns: index, start_frame, end_frame, duration, label
+        """
+        binary = (probs >= threshold).astype(int)
+        
+        # Find contiguous regions
+        events = []
+        in_event = False
+        start_frame = None
+        
+        for i, pred in enumerate(binary):
+            if pred == 1 and not in_event:
+                start_frame = i
+                in_event = True
+            elif pred == 0 and in_event:
+                end_frame = i - 1
+                duration = end_frame - start_frame + 1
+                events.append({
+                    'start_frame': start_frame,
+                    'end_frame': end_frame,
+                    'duration': duration,
+                    'label': 'rearing'  # or get from config
+                })
+                in_event = False
+        
+        # Handle event that extends to end
+        if in_event:
+            end_frame = len(binary) - 1
+            duration = end_frame - start_frame + 1
+            events.append({
+                'start_frame': start_frame,
+                'end_frame': end_frame,
+                'duration': duration,
+                'label': 'rearing'
+            })
+        
+        df = pd.DataFrame(events)
+        if len(df) > 0:
+            df.insert(0, 'index', range(1, len(df) + 1))
+        else:
+            df = pd.DataFrame(columns=['index', 'start_frame', 'end_frame', 'duration', 'label'])
+        
+        return df
     
-    def predict_session(self, session, model_identifier=None, batch_size=64):
+    def predict_session(self, session, model_identifier=None, batch_size=64, threshold=0.5, save=True):
         """Predict on a single session
         
         Args:
             session: Session object or session ID string
             model_identifier: Model name or path (None for latest)
             batch_size: Batch size for inference
+            threshold: Probability threshold for binary classification
+            save: Whether to save predictions to CSV
             
         Returns:
             np.ndarray: Probabilities array for each frame
@@ -467,15 +520,26 @@ class Project:
         # Run inference
         probs = self.inference.predict(scaled_windows, batch_size=batch_size)
         
+        # Save predictions if requested
+        if save:
+            events_df = self._probabilities_to_events(probs, threshold)
+            pred_dir = session.session_root / "predictions"
+            pred_dir.mkdir(parents=True, exist_ok=True)
+            pred_path = pred_dir / f"{session.id}_pred.csv"
+            events_df.to_csv(pred_path, index=False)
+            print(f"Predictions saved: {pred_path}")
+        
         return probs
     
-    def predict(self, sessions_to_predict=None, model_identifier=None, batch_size=64):
+    def predict(self, sessions_to_predict=None, model_identifier=None, batch_size=64, threshold=0.5, save=True):
         """Predict on multiple sessions
         
         Args:
             sessions_to_predict: List of session IDs or Session objects (None uses self.sessions_to_predict)
             model_identifier: Model name or path (None for latest)
             batch_size: Batch size for inference
+            threshold: Probability threshold for binary classification
+            save: Whether to save predictions to CSV
             
         Returns:
             dict: Mapping of session_id -> probabilities array
@@ -514,6 +578,15 @@ class Project:
             scaled_windows = self._prepare_session_for_prediction(session)
             probs = self.inference.predict(scaled_windows, batch_size=batch_size)
             results[session.id] = probs
+            
+            # Save predictions if requested
+            if save:
+                events_df = self._probabilities_to_events(probs, threshold)
+                pred_dir = session.session_root / "predictions"
+                pred_dir.mkdir(parents=True, exist_ok=True)
+                pred_path = pred_dir / f"{session.id}_pred.csv"
+                events_df.to_csv(pred_path, index=False)
+                print(f"Predictions saved: {pred_path}")
         
         return results
        
