@@ -1,170 +1,134 @@
-import torch
-import json
+import torch 
+import torch.nn as nn
 from pathlib import Path
-from datetime import datetime
+import json
+from typing import Literal
+import numpy as np
 
-# ... existing code ...
+from behavex.models.gru import GRUModel
 
-def save_model(self, model_name: str = None):
-    """Save the model with metadata for future loading
-    
-    Args:
-        model_name: Optional custom name, otherwise auto-generated
-    """
-    models_dir = Path(self.training_args.save_path)
-    models_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Generate descriptive filename
-    if model_name is None:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        model_name = f"{self.model_name}_h{self.training_args.hidden_size}_e{self.training_args.epochs}_{timestamp}"
-    
-    model_path = models_dir / f"{model_name}.pth"
-    metadata_path = models_dir / f"{model_name}_metadata.json"
-    
-    # Save model state dict
-    torch.save(self.model.state_dict(), model_path)
-    
-    # Save metadata for reconstruction
-    metadata = {
-        "model_name": self.model_name,
-        "model_path": str(model_path),
-        "timestamp": datetime.now().isoformat(),
-        "training_args": {
-            "input_size": self.training_args.input_size,
-            "hidden_size": self.training_args.hidden_size,
-            "output_size": self.training_args.output_size,
-            "batch_size": self.training_args.batch_size,
-            "learning_rate": self.training_args.learning_rate,
-            "epochs": self.training_args.epochs,
-            "weight_decay": self.training_args.weight_decay,
-            "device": self.training_args.device,
-        },
-        "feature_set": self.project.config["data"]["feature_set"],
-        "window_size": self.project.config["data"]["window_size"],
-        "final_train_loss": self.train_losses[-1] if self.train_losses else None,
-        "final_test_loss": self.test_losses[-1] if self.test_losses else None,
-    }
-    
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
-    # Update model registry
-    self._update_model_registry(model_name, metadata)
-    
-    print(f"Model saved: {model_path}")
-    print(f"Metadata saved: {metadata_path}")
-    return model_path
+class Inference:
+    def __init__(self, project=None, model_name: Literal["gru"] = "gru"):
+        if project is None:
+            raise ValueError("Project must be provided")
+        
+        self.project = project
+        self.model_name = model_name
+        self.model = None
+        self.metadata = None
+        
+        # Set up device (use same logic as Trainer)
+        train_cfg = project.config.get("model_defaults", {}).get("training", {})
+        self.device = train_cfg.get("device", "mps")
+        
+        # Model directory structure
+        self.model_directory = project.project_dir / "models"
 
-def _update_model_registry(self, model_name: str, metadata: dict):
-    """Update or create model registry index"""
-    registry_path = Path(self.training_args.save_path) / "model_registry.json"
+    def predict(self, x: np.ndarray, batch_size: int = 64) -> np.ndarray:
+        """Predict probabilities on time series windows
+        
+        Args:
+            x: Array of shape (TOT_FRAMES, window_size, features)
+            batch_size: Batch size for inference
+        """
+        self.model.eval()
+        all_probs = []
+        
+        with torch.no_grad():
+            # Process in batches
+            for i in range(0, len(x), batch_size):
+                batch = x[i:i+batch_size]
+                batch_tensor = torch.from_numpy(batch).float().to(self.device)
+                output = self.model(batch_tensor)
+                probs = torch.sigmoid(output).cpu().numpy().squeeze()
+                all_probs.append(probs)
+        
+        return np.concatenate(all_probs)
     
-    if registry_path.exists():
+    def warm_up(self, window_size: int, num_features: int, batch_size: int = 64):
+        """Warm up the compiled model with a dummy forward pass
+        
+        Args:
+            window_size: Window size used in the model
+            num_features: Number of features
+            batch_size: Batch size for inference
+        """
+        if self.model is None:
+            raise ValueError("Model not loaded. Call load_model() first.")
+        
+        self.model.eval()
+        with torch.no_grad():
+            # Create dummy input matching the expected shape (batch_size, window_size, num_features)
+            dummy_input = torch.zeros(batch_size, window_size, num_features).float().to(self.device)
+            _ = self.model(dummy_input)  # Triggers compilation if using torch.compile
+        
+        print(f"Model warmed up with shape: ({batch_size}, {window_size}, {num_features})")
+    
+    def _build_model(self, input_size: int, hidden_size: int, output_size: int = 1):
+        """Build the model based on the model name and architecture parameters"""
+        if self.model_name == "gru":
+            return GRUModel(input_size=input_size, hidden_size=hidden_size, output_size=output_size)
+        else:
+            raise ValueError(f"Model name {self.model_name} not supported")
+    
+    def load_model(self, model_identifier: str = None):
+        """Load a model by name or path
+        
+        Args:
+            model_identifier: Model name (from registry) or full path to .pth file
+                             If None, loads the most recent model
+        
+        Returns:
+            dict: Model metadata if available, None otherwise
+        """
+        models_subdir = self.model_directory / "models"
+        
+        if model_identifier is None:
+            # Load most recent model
+            model_path = self._get_latest_model()
+        elif Path(model_identifier).exists():
+            # Direct path provided
+            model_path = Path(model_identifier)
+        else:
+            # Model name from registry
+            model_path = models_subdir / f"{model_identifier}.pth"
+            if not model_path.exists():
+                raise FileNotFoundError(f"Model not found: {model_path}")
+        
+        # Load metadata if available
+        metadata_path = model_path.parent / f"{model_path.stem}_metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            self.metadata = metadata
+            
+            # Build model with architecture from metadata
+            training_args = metadata["training_args"]
+            self.model = self._build_model(
+                input_size=training_args["input_size"],
+                hidden_size=training_args["hidden_size"],
+                output_size=training_args["output_size"]
+            )
+        else:
+            raise FileNotFoundError(f"Metadata not found: {metadata_path}. Cannot determine model architecture.")
+        
+        # Load state dict
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model = self.model.to(self.device)
+        self.model.eval()
+        
+        print(f"Model loaded: {model_path}")
+        return metadata
+    
+    def _get_latest_model(self) -> Path:
+        """Get the most recently saved model"""
+        registry_path = self.model_directory / "model_registry.json"
+        if not registry_path.exists():
+            raise FileNotFoundError("No models found. Train and save a model first.")
+        
         with open(registry_path, 'r') as f:
             registry = json.load(f)
-    else:
-        registry = {}
-    
-    registry[model_name] = {
-        "model_path": metadata["model_path"],
-        "metadata_path": str(Path(self.training_args.save_path) / f"{model_name}_metadata.json"),
-        "timestamp": metadata["timestamp"],
-        "hidden_size": metadata["training_args"]["hidden_size"],
-        "epochs": metadata["training_args"]["epochs"],
-        "final_test_loss": metadata["final_test_loss"],
-    }
-    
-    with open(registry_path, 'w') as f:
-        json.dump(registry, f, indent=2, sort_keys=True)
-
-def load_model(self, model_identifier: str = None):
-    """Load a model by name or path
-    
-    Args:
-        model_identifier: Model name (from registry) or full path to .pth file
-                         If None, loads the most recent model
-    """
-    models_dir = Path(self.training_args.save_path)
-    
-    if model_identifier is None:
-        # Load most recent model
-        model_path = self._get_latest_model()
-    elif Path(model_identifier).exists():
-        # Direct path provided
-        model_path = Path(model_identifier)
-    else:
-        # Model name from registry
-        model_path = models_dir / f"{model_identifier}.pth"
-        if not model_path.exists():
-            raise FileNotFoundError(f"Model not found: {model_path}")
-    
-    # Load metadata if available
-    metadata_path = model_path.parent / f"{model_path.stem}_metadata.json"
-    if metadata_path.exists():
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
-        # Verify architecture matches
-        if metadata["training_args"]["input_size"] != self.training_args.input_size:
-            raise ValueError(f"Model input_size ({metadata['training_args']['input_size']}) "
-                           f"doesn't match current config ({self.training_args.input_size})")
-        if metadata["training_args"]["hidden_size"] != self.training_args.hidden_size:
-            print(f"Warning: Model hidden_size ({metadata['training_args']['hidden_size']}) "
-                  f"differs from current config ({self.training_args.hidden_size})")
-            # Rebuild model with correct architecture
-            self.training_args.hidden_size = metadata["training_args"]["hidden_size"]
-            self.model = self._build_model().to(self.device)
-    
-    self.model.load_state_dict(torch.load(model_path))
-    self.model.eval()
-    print(f"Model loaded: {model_path}")
-    return metadata if metadata_path.exists() else None
-
-def _get_latest_model(self) -> Path:
-    """Get the most recently saved model"""
-    registry_path = Path(self.training_args.save_path) / "model_registry.json"
-    if not registry_path.exists():
-        raise FileNotFoundError("No models found. Train and save a model first.")
-    
-    with open(registry_path, 'r') as f:
-        registry = json.load(f)
-    
-    # Sort by timestamp and return most recent
-    latest = max(registry.items(), key=lambda x: x[1]["timestamp"])
-    return Path(latest[1]["model_path"])
-
-@staticmethod
-def list_models(project_dir: str) -> dict:
-    """List all available models in a project
-    
-    Args:
-        project_dir: Path to project directory
         
-    Returns:
-        Dictionary of model_name -> metadata
-    """
-    models_dir = Path(project_dir) / "models"
-    registry_path = models_dir / "model_registry.json"
-    
-    if not registry_path.exists():
-        return {}
-    
-    with open(registry_path, 'r') as f:
-        return json.load(f)
-
-# Update train() to save model at the end
-def train(self):
-    """Train the model"""
-    self.model.train()
-    for epoch in range(self.training_args.epochs):
-        # ... existing training loop ...
-        
-    self.plot_loss_history()
-    
-    # Save model after training completes
-    if self.training_args.save_model:
-        self.save_model()
-
-Benefits:
--
-
+        # Sort by timestamp and return most recent
+        latest = max(registry.items(), key=lambda x: x[1]["timestamp"])
+        return Path(latest[1]["model_path"])
