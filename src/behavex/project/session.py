@@ -248,6 +248,19 @@ class Session:
             y[s:e] = 1
         self.labels = y
     
+    def plot_labels(self, save_path: Path = None):
+        """Plot labels with event regions
+        
+        Args:
+            save_path: Optional path to save figure
+        """
+        if self.labels is None:
+            raise ValueError("Labels not built. Call build_labels() first.")
+        
+        from behavex.models.viz import Vizualizer
+        viz = Vizualizer()
+        return viz.plot_labels(self.labels, self.annotations, save_path, title=f'Labels for {self.id}')
+    
     def build_windows(self, window_size:int=30):
         """Build windows from features.
         Given features of shape T, D -> T, W, D

@@ -88,6 +88,41 @@ class Vizualizer:
         """Plot the features."""
         pass
     
+    def plot_labels(self, labels: np.ndarray, annotations_df=None, save_path: Path = None, title: str = "Labels"):
+        """Plot binary labels with optional event regions
+        
+        Args:
+            labels: Binary labels array (0/1)
+            annotations_df: Optional DataFrame with events (start_frame, end_frame)
+            save_path: Optional path to save figure
+            title: Plot title
+            
+        Returns:
+            matplotlib.figure.Figure
+        """
+        fig, ax = plt.subplots(figsize=(12, 3))
+        ax.plot(labels, linewidth=1, label='Labels')
+        
+        # Add shaded regions for events if provided
+        if annotations_df is not None and len(annotations_df) > 0:
+            for idx, event in annotations_df.iterrows():
+                ax.axvspan(event['start_frame'], event['end_frame'], 
+                          alpha=0.3, color='green', label='Events' if idx == 0 else '')
+        
+        ax.set_xlabel('Frame')
+        ax.set_ylabel('Label (0/1)')
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        if save_path is not None:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        
+        plt.show()  # Add this line
+        return fig
+    
     def plot_interactive_predictions(self, probs: np.ndarray, save_path: Path = None, 
                                      events_df=None, threshold: float = 0.8):
         """Create interactive HTML plot of predictions with zoom/pan capabilities
