@@ -6,6 +6,7 @@ import pandas as pd
 from behavex.project.session import Session
 from behavex.models.train import Trainer
 from behavex.inference.inference import Inference
+from behavex.models.viz import Vizualizer
 import numpy as np
 
 def _deep_update(base: dict, updates: dict) -> dict:
@@ -33,7 +34,7 @@ class Project:
         # load or create config file
         self.load_config()
         self.load_sessions()
-        
+        self.viz = Vizualizer()
         # List of sessions to predict (session IDs or Session objects)
         self.sessions_to_predict = []
 
@@ -528,7 +529,8 @@ class Project:
             pred_path = pred_dir / f"{session.id}_pred.csv"
             events_df.to_csv(pred_path, index=False)
             print(f"Predictions saved: {pred_path}")
-        
+            html_path = pred_dir / f"{session.id}_interactive.html"
+            self.viz.plot_interactive_predictions(probs, save_path=html_path, events_df=events_df, threshold=threshold)
         return probs
     
     def predict(self, sessions_to_predict=None, model_identifier=None, batch_size=64, threshold=0.5, save=True):
@@ -587,6 +589,8 @@ class Project:
                 pred_path = pred_dir / f"{session.id}_pred.csv"
                 events_df.to_csv(pred_path, index=False)
                 print(f"Predictions saved: {pred_path}")
+                html_path = pred_dir / f"{session.id}_interactive.html"
+                self.viz.plot_interactive_predictions(probs, save_path=html_path, events_df=events_df, threshold=threshold)
         
         return results
        
@@ -753,7 +757,7 @@ if __name__ == "__main__":
     print(project.train_windows.shape)
     print(project.train_labels.shape)
     project.set_config_value("model_defaults.training.epochs", 10)
-    project.train()
+    # project.train()
     
     # Test inference
     project.sessions_to_predict = [project.sessions[0].id]

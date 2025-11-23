@@ -3,6 +3,8 @@ matplotlib.use('Agg')  # Use non-interactive backend for TensorBoard
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 class Vizualizer:
     """Visualizer for the training and validation loss."""
@@ -85,4 +87,81 @@ class Vizualizer:
     def plot_features(self, features: np.ndarray) -> None:
         """Plot the features."""
         pass
+    
+    def plot_interactive_predictions(self, probs: np.ndarray, save_path: Path = None, 
+                                     events_df=None, threshold: float = 0.8):
+        """Create interactive HTML plot of predictions with zoom/pan capabilities
+        
+        Args:
+            probs: Probability array for each frame
+            save_path: Path to save HTML file (required)
+            events_df: Optional DataFrame with events (start_frame, end_frame, duration, label)
+            threshold: Threshold line to display
+            
+        Returns:
+            str: Path to saved HTML file
+        """
+        if save_path is None:
+            raise ValueError("save_path is required for interactive plot")
+        
+        frames = np.arange(len(probs))
+        
+        # Create figure
+        fig = go.Figure()
+        
+        # Plot probabilities
+        fig.add_trace(go.Scatter(
+            x=frames,
+            y=probs,
+            mode='lines',
+            name='Probability',
+            line=dict(color='blue', width=1),
+            hovertemplate='Frame: %{x}<br>Probability: %{y:.3f}<extra></extra>'
+        ))
+        
+        # Add threshold line
+        fig.add_hline(
+            y=threshold,
+            line_dash="dash",
+            line_color="red",
+            annotation_text=f"Threshold ({threshold})",
+            annotation_position="right"
+        )
+        
+        # Add event regions if events_df provided
+        if events_df is not None and len(events_df) > 0:
+            for _, event in events_df.iterrows():
+                fig.add_vrect(
+                    x0=event['start_frame'],
+                    x1=event['end_frame'],
+                    fillcolor="green",
+                    opacity=0.2,
+                    layer="below",
+                    line_width=0,
+                    annotation_text=f"Event {event['index']}",
+                    annotation_position="top left"
+                )
+        
+        # Update layout
+        fig.update_layout(
+            title="Prediction Probabilities Over Time",
+            xaxis_title="Frame",
+            yaxis_title="Probability",
+            hovermode='x unified',
+            template="plotly_white",
+            width=1200,
+            height=600,
+            xaxis=dict(
+                rangeslider=dict(visible=True),  # Range slider for easy navigation
+                type="linear"
+            )
+        )
+        
+        # Save as HTML
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.write_html(str(save_path))
+        print(f"Interactive plot saved: {save_path}")
+        
+        return str(save_path)
 
+    
