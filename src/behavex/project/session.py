@@ -295,7 +295,7 @@ class Session:
         
         if len(P) == 0:
             raise ValueError("No positive labels in training data.")
-        
+        #TODO adjust the sampling to include more training data wiht negative samples
         factor = int(N.shape[0] // P.shape[0] * ratio_positive)
         if factor < 1:
             factor = 1

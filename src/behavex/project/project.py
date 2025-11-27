@@ -7,6 +7,7 @@ from behavex.project.session import Session
 from behavex.models.train import Trainer
 from behavex.inference.inference import Inference
 from behavex.models.viz import Vizualizer
+from behavex.hpo.HPO import HPO
 import numpy as np
 
 def _deep_update(base: dict, updates: dict) -> dict:
@@ -406,13 +407,16 @@ class Project:
         if self.train_windows.shape[2] != num_features:
             raise ValueError("Number of features does not match the feature set")
 
-    def train(self):
+    def train(self, hpo: bool = False):
         """Launch model training"""
         #TODO: write safety checks before calling trainer: 
-
-        trainer = Trainer(project=self)
-        trainer.train()
-    
+        if hpo:
+            hpo = HPO(project=self)
+            hpo.optimize()
+        else:
+            trainer = Trainer(project=self)
+            trainer.train()
+        
     def _prepare_session_for_prediction(self, session):
         """Prepare session data for prediction: load features, build windows, scale data
         
