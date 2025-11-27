@@ -36,13 +36,13 @@ class HPO:
         self.project.config["model_defaults"]["training"]["batch_size"] = batch_size
         self.project.config["model_defaults"]["training"]["weight_decay"] = weight_decay
         
-        # Create trainer with modified config
-        trainer = Trainer(project=self.project)
+        # Create trainer with modified config (disable TensorBoard for HPO)
+        trainer = Trainer(project=self.project, enable_tensorboard=False)
         
-        # Train and get metric (will be implemented when trainer.train() returns metric)
-        # For now, placeholder:
-        trainer.train()
-        metric = trainer.test_losses[-1] if trainer.test_losses else float('inf')
+        # Train and get best test loss
+        metric = trainer.train()
+        if metric is None:
+            metric = float('inf')
         
         # Restore original config
         self.project.config = original_config

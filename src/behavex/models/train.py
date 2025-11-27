@@ -30,10 +30,12 @@ class Trainer:
     def __init__(
         self, 
         project=None,
-        model_name: Literal["gru"] = "gru",):
+        model_name: Literal["gru"] = "gru",
+        enable_tensorboard: bool = True):
 
         self.project = project
         self.model_name = model_name 
+        self.enable_tensorboard = enable_tensorboard
         self.training_args = self._build_training_args()
         self.model = self._build_model()
         self.device = self.training_args.device
@@ -54,14 +56,18 @@ class Trainer:
         self.model_directory = self.project.project_dir / "models"
         self.model_directory.mkdir(parents=True, exist_ok=True)
         
-        # Create runs directory for TensorBoard
-        self.runs_dir = self.model_directory / "runs"
-        self.runs_dir.mkdir(parents=True, exist_ok=True)
-        self.writer = SummaryWriter(log_dir=self.runs_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        # Create runs directory for TensorBoard (only if enabled)
+        if self.enable_tensorboard:
+            self.runs_dir = self.model_directory / "runs"
+            self.runs_dir.mkdir(parents=True, exist_ok=True)
+            self.writer = SummaryWriter(log_dir=self.runs_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        else:
+            self.writer = None
         
         # TensorBoard process tracking
         self.tensorboard_process = None
-        atexit.register(self._cleanup_tensorboard)
+        if self.enable_tensorboard:
+            atexit.register(self._cleanup_tensorboard)
     
     def _start_tensorboard(self):
         """Start TensorBoard in background process"""
@@ -167,9 +173,16 @@ class Trainer:
         return loss.item()
     
     def train(self):
-        """Train the model"""
-        # Start TensorBoard
-        self._start_tensorboard()
+        """Train the model
+        
+        Returns:
+            float: Best test loss achieved during training
+        """
+        # Start TensorBoard (only if enabled)
+        if self.enable_tensorboard:
+            self._start_tensorboard()
+        
+        best_test_loss = float('inf')
         
         try:
             self.model.train()
@@ -179,38 +192,49 @@ class Trainer:
                     loss = self.learning_step(X, y)
                     if np.isnan(loss):
                         print(f"NaN loss detected at epoch {epoch+1}, stopping training")
-                        return
+                        return best_test_loss if best_test_loss != float('inf') else None
                     running_loss += loss * X.size(0)
                 avg_loss = running_loss / len(self.train_loader.dataset)
                 self.train_losses.append(avg_loss)
                 self.epochs.append(epoch + 1)
-                self.writer.add_scalar('train/loss', avg_loss, epoch + 1)
+                if self.writer is not None:
+                    self.writer.add_scalar('train/loss', avg_loss, epoch + 1)
                 
                 print(f"Epoch {epoch+1}/{self.training_args.epochs} - Train Loss: {avg_loss:.4f}", end="")
                 if (epoch + 1) % self.test_every_n_epochs == 0:
                     test_loss = self.test()
                     self.test_losses.append(test_loss)
                     self.test_epochs.append(epoch + 1)
-                    self.writer.add_scalar('test/loss', test_loss, epoch + 1)
+                    if self.writer is not None:
+                        self.writer.add_scalar('test/loss', test_loss, epoch + 1)
                     print(f" | Test Loss: {test_loss:.4f}")
+                    # Track best test loss
+                    if test_loss < best_test_loss:
+                        best_test_loss = test_loss
                 else:
                     print()
                 
-                # Run validation every 5 epochs
-                if (epoch + 1) % 5 == 0:
+                # Run validation every 5 epochs (only if tensorboard enabled)
+                if self.enable_tensorboard and (epoch + 1) % 5 == 0:
                     self.validation(epoch+1)
             
-            # Plot and log loss history
-            loss_fig = self.plot_loss_history()
-            self.writer.add_figure('loss_history', loss_fig, self.training_args.epochs)
-            plt.close(loss_fig)
+            # Plot and log loss history (only if tensorboard enabled)
+            if self.enable_tensorboard:
+                loss_fig = self.plot_loss_history()
+                if self.writer is not None:
+                    self.writer.add_figure('loss_history', loss_fig, self.training_args.epochs)
+                plt.close(loss_fig)
             
             if self.training_args.save_model:
                 self.save_model()
         finally:
             # Ensure TensorBoard is stopped even if training fails
-            self._cleanup_tensorboard()
-            self.writer.close()
+            if self.enable_tensorboard:
+                self._cleanup_tensorboard()
+            if self.writer is not None:
+                self.writer.close()
+        
+        return best_test_loss if best_test_loss != float('inf') else (self.test_losses[-1] if self.test_losses else None)
     def plot_loss_history(self):
         plot_dir = self.project.project_dir / "plots"
         plot_dir.mkdir(parents=True, exist_ok=True)
@@ -441,7 +465,8 @@ class Trainer:
             print(f"Session {session.id} - Validation: {len(true_labels)} frames, {num_positives} positive labels")
                 
             val_fig = self.viz.plot_validation_predictions(probs, true_labels, save_path=save_path, epoch=epoch, frame_indices=frame_indices)
-            self.writer.add_figure(f'validation/{session.id}', val_fig, epoch)
+            if self.writer is not None:
+                self.writer.add_figure(f'validation/{session.id}', val_fig, epoch)
             plt.close(val_fig)
 
         

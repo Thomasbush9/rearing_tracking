@@ -412,7 +412,7 @@ class Project:
         #TODO: write safety checks before calling trainer: 
         if hpo:
             hpo = HPO(project=self)
-            hpo.optimize()
+            hpo.optimize(n_trials=10)
         else:
             trainer = Trainer(project=self)
             trainer.train()
@@ -762,8 +762,8 @@ if __name__ == "__main__":
     print(project.train_labels.shape)
     project.set_config_value("model_defaults.training.epochs", 10)
     # project.train()
-    
-    # Test inference
-    project.sessions_to_predict = [project.sessions[0].id]
-    results = project.predict()
-    print(f"Predictions shape for {project.sessions[0].id}: {results[project.sessions[0].id].shape}")
+    project.train(hpo=True)
+    # # Test inference
+    # project.sessions_to_predict = [project.sessions[0].id]
+    # results = project.predict()
+    # print(f"Predictions shape for {project.sessions[0].id}: {results[project.sessions[0].id].shape}")
