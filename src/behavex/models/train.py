@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
-from typing import List, Literal
+from typing import List, Literal, Optional
 from behavex.models.data import CustomDataset, GRUTrainingArgs
 from behavex.models.gru import GRUModel
 from behavex.models.viz import Vizualizer
@@ -31,12 +31,17 @@ class Trainer:
         self, 
         project=None,
         model_name: Literal["gru"] = "gru",
-        enable_tensorboard: bool = True):
+        enable_tensorboard: bool = True,
+        save_model: Optional[bool] = None):
 
         self.project = project
         self.model_name = model_name 
         self.enable_tensorboard = enable_tensorboard
         self.training_args = self._build_training_args()
+        
+        # Override save_model if explicitly provided
+        if save_model is not None:
+            self.training_args.save_model = save_model
         self.model = self._build_model()
         self.device = self.training_args.device
         self.model = self.model.to(self.device)

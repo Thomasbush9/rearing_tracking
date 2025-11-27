@@ -407,12 +407,12 @@ class Project:
         if self.train_windows.shape[2] != num_features:
             raise ValueError("Number of features does not match the feature set")
 
-    def train(self, hpo: bool = False):
+    def train(self, hpo: bool = False, n_trials: int = 10):
         """Launch model training"""
         #TODO: write safety checks before calling trainer: 
         if hpo:
             hpo = HPO(project=self)
-            hpo.optimize(n_trials=10)
+            hpo.optimize(n_trials=n_trials)
         else:
             trainer = Trainer(project=self)
             trainer.train()
