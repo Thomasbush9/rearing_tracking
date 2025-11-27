@@ -762,7 +762,7 @@ if __name__ == "__main__":
     print(project.train_labels.shape)
     project.set_config_value("model_defaults.training.epochs", 10)
     # project.train()
-    project.train(hpo=True)
+    project.train(hpo=False)
     # # Test inference
     # project.sessions_to_predict = [project.sessions[0].id]
     # results = project.predict()

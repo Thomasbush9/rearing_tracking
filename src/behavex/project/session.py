@@ -279,32 +279,40 @@ class Session:
 
         self.windows = X_windows
 
-    def subsample_session(self, ratio_positive: float = 0.5):
+    def subsample_session(self, neg_to_pos_ratio: float = 2.0):
         """
         Subsample the TRAINING data only (after split_data()).
         Validation data remains unchanged to preserve temporal consistency.
+        
+        Args:
+            neg_to_pos_ratio: Desired ratio of negatives to positives (default: 2.0 = 2:1)
         """
         if not hasattr(self, 'train_windows') or self.train_windows is None:
             raise ValueError("Training data not split. Call split_data() first.")
         if self.train_labels is None:
             raise ValueError("Training labels not found. Call split_data() first.")
         
-        # Subsample only training data
         P = np.argwhere(self.train_labels==1).squeeze()
         N = np.argwhere(self.train_labels==0).squeeze()
         
         if len(P) == 0:
             raise ValueError("No positive labels in training data.")
-        #TODO adjust the sampling to include more training data wiht negative samples
-        factor = int(N.shape[0] // P.shape[0] * ratio_positive)
-        if factor < 1:
-            factor = 1
-        N = N[::factor]  # subsample negative events
         
-        idx = np.concatenate([P, N])
+        # Calculate how many negatives we want: neg_to_pos_ratio * num_positives
+        target_negatives = int(len(P) * neg_to_pos_ratio)
+        
+        if target_negatives >= len(N):
+            # Not enough negatives, use all
+            N_sampled = N
+        else:
+            # Randomly sample exactly target_negatives
+            indices = np.random.choice(len(N), size=target_negatives, replace=False)
+            N_sampled = N[indices]
+        
+        idx = np.concatenate([P, N_sampled])
         np.random.shuffle(idx)
         
-        # Update only training data (validation remains unchanged)
+        # Update only training data
         self.train_windows = self.train_windows[idx]
         self.train_labels = self.train_labels[idx]
         
