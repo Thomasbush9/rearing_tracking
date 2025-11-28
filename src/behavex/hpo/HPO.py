@@ -39,6 +39,7 @@ class HPO:
         learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
         batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128])
         weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+        patience = trial.suggest_int("patience", 3, 10)
         
         # Temporarily update project config with trial parameters
         original_config = copy.deepcopy(self.project.config)
@@ -46,7 +47,7 @@ class HPO:
         self.project.config["model_defaults"]["training"]["lr"] = learning_rate
         self.project.config["model_defaults"]["training"]["batch_size"] = batch_size
         self.project.config["model_defaults"]["training"]["weight_decay"] = weight_decay
-        
+        self.project.config["model_defaults"]["training"]["patience"] = patience
         try:
             # Create trainer with modified config (disable TensorBoard and model saving for HPO)
             trainer = Trainer(project=self.project, enable_tensorboard=False, save_model=False)
