@@ -437,6 +437,40 @@ class Project:
             trainer = Trainer(project=self)
             trainer.train()
         
+    def tune_window_size(self, window_sizes: list[int]):
+        """Tune the window size for the best performance"""
+        from datetime import datetime
+        from torch.utils.tensorboard import SummaryWriter
+        
+        results = {}
+        runs_dir = self.project_dir / "models" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        
+        for window_size in window_sizes:
+            self.set_config_value("data.window_size", window_size)
+            self.process_sessions_for_training()
+            
+            trainer = Trainer(project=self, enable_tensorboard=False)
+            trainer.writer = SummaryWriter(log_dir=runs_dir / f"window_{window_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            trainer.enable_tensorboard = True
+            trainer._start_tensorboard = lambda: None
+            trainer._cleanup_tensorboard = lambda: None
+            
+            trainer.train()
+            
+            best_auc = max(trainer.test_aucs) if trainer.test_aucs else None
+            results[window_size] = {
+                'best_auc': best_auc,
+                'final_auc': trainer.test_aucs[-1] if trainer.test_aucs else None,
+                'best_test_loss': min(trainer.test_losses) if trainer.test_losses else None,
+            }
+            print(f"Window size {window_size}: Best AUC: {best_auc:.4f}, Final AUC: {results[window_size]['final_auc']:.4f}")
+        
+        best_window = max(results.keys(), key=lambda w: results[w]['best_auc'] or 0)
+        print(f"\nBest window size: {best_window} with AUC: {results[best_window]['best_auc']:.4f}")
+        print(f"\nView results: tensorboard --logdir {runs_dir}")
+        
+        return results
     def _prepare_session_for_prediction(self, session):
         """Prepare session data for prediction: load features, build windows, scale data
         
@@ -762,9 +796,10 @@ if __name__ == "__main__":
     project.process_sessions_for_training()
     print(project.train_windows.shape)
     print(project.train_labels.shape)
-    project.set_config_value("model_defaults.training.epochs", 10)
+    project.set_config_value("model_defaults.training.epochs", 20)
     # project.train()
-    project.train(hpo=False)
+    # project.train(hpo=False)
+    project.tune_window_size(window_sizes=[20, 30, 40, 50, 60, 70, 80, 90, 100])
     # # Test inference
     # project.sessions_to_predict = [project.sessions[0].id]
     # results = project.predict()

@@ -52,6 +52,8 @@ class Trainer:
         self.test_loader = DataLoader(test_dataset, batch_size=self.training_args.batch_size, shuffle=False)
         self.criterion = nn.BCEWithLogitsLoss()
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.training_args.learning_rate, weight_decay=self.training_args.weight_decay)
+        self.smoothing=False
+        self.smoothing_window=5
         self.train_losses = []
         self.test_losses = []
         self.test_aucs = []
@@ -174,12 +176,13 @@ class Trainer:
         
         self.optimizer.zero_grad()
         output = self.model(X)
+        # Do NOT apply smoothing during training - it breaks gradients
         loss = self.criterion(output, y)
         loss.backward()
         self.optimizer.step()
         
         return loss.item()
-    
+        
     def train(self):
         """Train the model
         
@@ -261,6 +264,17 @@ class Trainer:
                 X = X.to(self.device)
                 y = y.to(self.device)
                 output = self.model(X)
+                # Apply smoothing if enabled (only during evaluation)
+                if getattr(self, "smoothing", False):
+                    from scipy.signal import savgol_filter
+                    if output.dim() == 2 and output.size(1) == 1:
+                        output_np = output.cpu().numpy()
+                        window_length = min(getattr(self, "smoothing_window", 5), output_np.shape[0])
+                        if window_length % 2 == 0:
+                            window_length -= 1
+                        if window_length >= 3:
+                            output_np = savgol_filter(output_np, window_length, polyorder=2, axis=0)
+                        output = torch.from_numpy(output_np).to(output.device).type_as(output)
                 loss = self.criterion(output, y)
                 running_loss += loss.item() * X.size(0)
                 # Correct auc calculation: accumulate sum for each batch and normalize after the loop
