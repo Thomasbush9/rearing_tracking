@@ -13,6 +13,7 @@ from tqdm import tqdm
 from torch import Tensor
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
 from datetime import datetime
 import json
 from pathlib import Path
@@ -25,6 +26,7 @@ import signal
 import time
 import joblib
 import os
+
 
 class Trainer:
     def __init__(
@@ -52,6 +54,7 @@ class Trainer:
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.training_args.learning_rate, weight_decay=self.training_args.weight_decay)
         self.train_losses = []
         self.test_losses = []
+        self.test_aucs = []
         self.epochs = []
         self.test_epochs = []
         self.test_every_n_epochs = self.training_args.test_every_n_epochs
@@ -85,7 +88,7 @@ class Trainer:
                 preexec_fn=None if hasattr(os, 'setsid') else None
             )
             # Give TensorBoard time to start
-            time.sleep(2)
+            time.sleep(3)
             print(f"\n{'='*60}")
             print(f"TensorBoard started at: http://localhost:6006")
             print(f"Log directory: {self.runs_dir}")
@@ -207,12 +210,14 @@ class Trainer:
                 
                 print(f"Epoch {epoch+1}/{self.training_args.epochs} - Train Loss: {avg_loss:.4f}", end="")
                 if (epoch + 1) % self.test_every_n_epochs == 0:
-                    test_loss = self.test()
+                    test_loss, test_auc = self.test()
                     self.test_losses.append(test_loss)
+                    self.test_aucs.append(test_auc)
                     self.test_epochs.append(epoch + 1)
                     if self.writer is not None:
                         self.writer.add_scalar('test/loss', test_loss, epoch + 1)
-                    print(f" | Test Loss: {test_loss:.4f}")
+                        self.writer.add_scalar('test/auc', test_auc, epoch + 1)
+                    print(f" | Test Loss: {test_loss:.4f} | Test AUC: {test_auc:.4f}")
                     # Track best test loss
                     if test_loss < best_test_loss:
                         best_test_loss = test_loss
@@ -250,6 +255,7 @@ class Trainer:
         """Evaluate the model on test set"""
         self.model.eval()
         running_loss = 0.0
+        running_auc = 0.0  # Initialize here, before the loop
         with torch.no_grad():
             for X, y in self.test_loader:
                 X = X.to(self.device)
@@ -257,9 +263,13 @@ class Trainer:
                 output = self.model(X)
                 loss = self.criterion(output, y)
                 running_loss += loss.item() * X.size(0)
+                # Correct auc calculation: accumulate sum for each batch and normalize after the loop
+                batch_auc = roc_auc_score(y.cpu().numpy(), output.cpu().numpy())
+                running_auc += batch_auc * X.size(0)  # Remove the if check
         avg_loss = running_loss / len(self.test_loader.dataset)
+        avg_auc = running_auc / len(self.test_loader.dataset)
         self.model.train()
-        return avg_loss  
+        return avg_loss, avg_auc
     
     def save_model(self, model_name: str = None):
         """Save the model with metadata for future loading
