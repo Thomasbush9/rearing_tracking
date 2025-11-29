@@ -406,6 +406,26 @@ class Project:
         num_features = len(self.config["data"]["feature_set"])
         if self.train_windows.shape[2] != num_features:
             raise ValueError("Number of features does not match the feature set")
+    def process_sessions_for_training(self):
+        """
+        Run select_features(), build_windows(), build_labels(), split_data(), 
+        subsample_session() for each session, then merge training data.
+
+        Ensures labels are built before attempting split_data(), per error in context.
+        """
+        # Always select features first (across all sessions)
+        self.select_features()
+        # Then process each session stepwise
+        for session in self.sessions:
+            session.load_annotations()
+            session.build_windows(self.config["data"]["window_size"])
+            session.build_labels()
+            # Ensure labels exist before split_data
+            if not hasattr(session, "labels") or session.labels is None:
+                raise ValueError(f"Labels not loaded for session {session.id}. Call build_labels() first.")
+            session.split_data()
+            session.subsample_session()
+        self.merge_and_generate_training_data()
 
     def train(self, hpo: bool = False, n_trials: int = 10):
         """Launch model training"""
@@ -736,28 +756,10 @@ if __name__ == "__main__":
     # )
     print(project.sessions[0].features_file())
     print(project.sessions[0].events_file())
-    # project.annotate_sessions()
-    project.set_config_value("data.feature_set", ["height", "forepaw_tail_distance", "height_displacement","trunk_speed"])
+    project.set_config_value("data.feature_set", ["height", "forepaw_tail_distance", "height_displacement", "trunk_speed"])
     print(project.config["data"]["feature_set"])
-    project.select_features()
-    print(project.sessions[0].features.shape)
-    project.sessions[0].load_annotations()
-    print(project.sessions[0].annotations.head())
-    project.sessions[0].build_labels()
-    print(project.sessions[0].labels.shape)
-    project.sessions[0].build_windows()
-    print(project.sessions[0].windows.shape)
-    # Split temporally FIRST (before subsampling)
-    project.sessions[0].split_data()
-    print(project.sessions[0].train_windows.shape)
-    print(project.sessions[0].train_labels.shape)
-    print(project.sessions[0].val_windows.shape)
-    print(project.sessions[0].val_labels.shape)
-    # Then subsample only training data
-    project.sessions[0].subsample_session()
-    print(project.sessions[0].train_windows.shape)
-    print(project.sessions[0].train_labels.shape)
-    project.merge_and_generate_training_data()
+    # Use the new data preparation pipeline function
+    project.process_sessions_for_training()
     print(project.train_windows.shape)
     print(project.train_labels.shape)
     project.set_config_value("model_defaults.training.epochs", 10)
