@@ -18,7 +18,7 @@ def _deep_update(base: dict, updates: dict) -> dict:
         else:
             base[k] = v
     return base
-    
+
 class Project:
     def __init__(
         self,
@@ -73,7 +73,7 @@ class Project:
                 "annotator": "",
                 "output_format": "csv",
             },
-            #TODO: add other params for training 
+            #TODO: add other params for training
             "model_defaults": {
                 "model_name": "gru",
                 "training": {
@@ -129,7 +129,7 @@ class Project:
             self.sessions = [
                 Session(metadata=s, project=self) for s in self.sessions_data
             ]
-            
+
             # Check for and merge duplicate paths (cleanup existing duplicates)
             self._merge_duplicate_sessions()
             if len(self.sessions_data) != len(data["sessions"]):
@@ -146,7 +146,7 @@ class Project:
     def _merge_sessions(self, existing_session_metadata: dict, new_views: dict, new_annotation_view: str = None):
         """
         Merge a new session's views into an existing session.
-        
+
         Args:
             existing_session_metadata: The existing session's metadata dict (will be modified in place)
             new_views: New views dictionary to merge in
@@ -154,7 +154,7 @@ class Project:
         """
         # Merge views (union - new views override existing if keys conflict)
         existing_session_metadata["views"].update(new_views)
-        
+
         # Set annotation_view if not already set or if provided
         if existing_session_metadata.get("annotation_view") is None and new_annotation_view is not None:
             existing_session_metadata["annotation_view"] = new_annotation_view
@@ -163,7 +163,11 @@ class Project:
             if new_annotation_view and new_annotation_view in existing_session_metadata["views"]:
                 existing_session_metadata["annotation_view"] = new_annotation_view
             elif existing_session_metadata["views"]:
-                existing_session_metadata["annotation_view"] = list(existing_session_metadata["views"].keys())[0]
+                # Prefer "bottom" view if available, otherwise use first view
+                if "bottom" in existing_session_metadata["views"]:
+                    existing_session_metadata["annotation_view"] = "bottom"
+                else:
+                    existing_session_metadata["annotation_view"] = list(existing_session_metadata["views"].keys())[0]
 
     def _merge_duplicate_sessions(self):
         """
@@ -172,13 +176,13 @@ class Project:
         """
         seen_paths = {}
         sessions_to_remove = []
-        
+
         for idx, session_metadata in enumerate(self.sessions_data):
             session_path = Path(session_metadata.get("video_dir", "")).expanduser().resolve()
-            
+
             if not session_path or not session_path.exists():
                 continue
-            
+
             # Check if we've seen this path before
             path_key = str(session_path)
             if path_key in seen_paths:
@@ -187,21 +191,21 @@ class Project:
                 existing_metadata = self.sessions_data[existing_idx]
                 new_views = session_metadata.get("views", {})
                 new_annotation_view = session_metadata.get("annotation_view")
-                
+
                 print(f"Warning: Found duplicate session path '{session_path}'. "
                       f"Merging session '{session_metadata.get('id')}' into '{existing_metadata.get('id')}'.")
-                
+
                 self._merge_sessions(existing_metadata, new_views, new_annotation_view)
                 sessions_to_remove.append(idx)
             else:
                 seen_paths[path_key] = idx
-        
+
         # Remove duplicates (in reverse order to maintain indices)
         for idx in sorted(sessions_to_remove, reverse=True):
             removed_session = self.sessions_data.pop(idx)
             # Also remove from sessions list
             self.sessions = [s for s in self.sessions if s.id != removed_session.get("id")]
-        
+
         if sessions_to_remove:
             print(f"Merged {len(sessions_to_remove)} duplicate session(s).")
 
@@ -212,7 +216,7 @@ class Project:
 
         if not session_dir.exists():
             raise ValueError(f"Session directory does not exist: {session_dir}")
-        
+
         # Check for duplicate path first
         for existing_session in self.sessions:
             existing_path = Path(existing_session.video_dir).expanduser().resolve()
@@ -229,21 +233,25 @@ class Project:
                     else:
                         view_name = raw_suffix
                     new_views[view_name] = str(f.resolve())
-                
+
                 if annotation_view is None:
-                    annotation_view = list(new_views.keys())[0] if new_views else None
-                
+                    # Prefer "bottom" view if available, otherwise use first view
+                    if "bottom" in new_views:
+                        annotation_view = "bottom"
+                    else:
+                        annotation_view = list(new_views.keys())[0] if new_views else None
+
                 # Merge into existing session
                 self._merge_sessions(existing_session.metadata, new_views, annotation_view)
-                
+
                 # Recreate Session object to reflect updated metadata
                 existing_idx = next(i for i, s in enumerate(self.sessions) if s.id == existing_session.id)
                 self.sessions[existing_idx] = Session(metadata=existing_session.metadata, project=self)
-                
+
                 self.save_sessions()
                 print(f"Updated session {existing_session.id} with merged views.")
                 return self.sessions[existing_idx]
-        
+
         # No duplicate found - create new session
         # check id
         if session_id is None:
@@ -278,7 +286,11 @@ class Project:
             views[view_name] = str(f.resolve())
 
         if annotation_view is None:
-            annotation_view = list(views.keys())[0]
+            # Prefer "bottom" view if available, otherwise use first view
+            if "bottom" in views:
+                annotation_view = "bottom"
+            else:
+                annotation_view = list(views.keys())[0]
         if annotation_view not in views:
             raise ValueError(f"annotation_view {annotation_view} is not in views")
         metadata = {
@@ -340,15 +352,15 @@ class Project:
     def import_features_for_session(self, session_id: str, features_path: str | Path, video_frame_count: int = None):
         """
         Import features for a specific session.
-        
+
         Args:
             session_id: ID of the session (e.g., "session_001")
             features_path: Path to features CSV or Excel file (string or Path)
             video_frame_count: Optional frame count for validation
-        
+
         Returns:
             Path to imported features file
-        
+
         Example:
             project.import_features_for_session(
                 "session_001",
@@ -362,27 +374,27 @@ class Project:
             if s.id == session_id:
                 session = s
                 break
-        
+
         if session is None:
             raise ValueError(f"Session {session_id} not found in project")
-        
+
         # Import features (handle both string and Path)
         features_path_obj = Path(features_path).expanduser().resolve()
         return session.import_features(features_path_obj, video_frame_count)
-    
+
     def get_feature_set(self):
         """Get the feature set from the config"""
         return self.config["data"]["feature_set"]
 
     def select_features(self):
-        """Loads the features from the features dataset for each session. 
+        """Loads the features from the features dataset for each session.
         It iterates through the sessions and loads the features from the features dataset for each session.
         It saves the featuers selected as np.ndarray in the session.features attribute.
         """
         featues_set = self.get_feature_set()
         for session in self.sessions:
             session.select_features(featues_set)
-                
+
 
     def merge_and_generate_training_data(self):
         """Merge all the session training data into a single training dataset"""
@@ -408,7 +420,7 @@ class Project:
             raise ValueError("Number of features does not match the feature set")
     def process_sessions_for_training(self):
         """
-        Run select_features(), build_windows(), build_labels(), split_data(), 
+        Run select_features(), build_windows(), build_labels(), split_data(),
         subsample_session() for each session, then merge training data.
 
         Ensures labels are built before attempting split_data(), per error in context.
@@ -429,35 +441,35 @@ class Project:
 
     def train(self, hpo: bool = False, n_trials: int = 10):
         """Launch model training"""
-        #TODO: write safety checks before calling trainer: 
+        #TODO: write safety checks before calling trainer:
         if hpo:
             hpo = HPO(project=self)
             hpo.optimize(n_trials=n_trials)
         else:
             trainer = Trainer(project=self)
             trainer.train()
-        
+
     def tune_window_size(self, window_sizes: list[int]):
         """Tune the window size for the best performance"""
         from datetime import datetime
         from torch.utils.tensorboard import SummaryWriter
-        
+
         results = {}
         runs_dir = self.project_dir / "models" / "runs"
         runs_dir.mkdir(parents=True, exist_ok=True)
-        
+
         for window_size in window_sizes:
             self.set_config_value("data.window_size", window_size)
             self.process_sessions_for_training()
-            
+
             trainer = Trainer(project=self, enable_tensorboard=False)
             trainer.writer = SummaryWriter(log_dir=runs_dir / f"window_{window_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
             trainer.enable_tensorboard = True
             trainer._start_tensorboard = lambda: None
             trainer._cleanup_tensorboard = lambda: None
-            
+
             trainer.train()
-            
+
             best_auc = max(trainer.test_aucs) if trainer.test_aucs else None
             results[window_size] = {
                 'best_auc': best_auc,
@@ -465,56 +477,56 @@ class Project:
                 'best_test_loss': min(trainer.test_losses) if trainer.test_losses else None,
             }
             print(f"Window size {window_size}: Best AUC: {best_auc:.4f}, Final AUC: {results[window_size]['final_auc']:.4f}")
-        
+
         best_window = max(results.keys(), key=lambda w: results[w]['best_auc'] or 0)
         print(f"\nBest window size: {best_window} with AUC: {results[best_window]['best_auc']:.4f}")
         print(f"\nView results: tensorboard --logdir {runs_dir}")
-        
+
         return results
     def _prepare_session_for_prediction(self, session):
         """Prepare session data for prediction: load features, build windows, scale data
-        
+
         Args:
             session: Session object to prepare
-            
+
         Returns:
             np.ndarray: Scaled windows ready for inference, shape (TOT_FRAMES, window_size, features)
         """
         # Load/select features if not already done
         if session.features is None:
             session.select_features(self.config["data"]["feature_set"])
-        
+
         # Build windows
         window_size = self.config["data"]["window_size"]
         if not hasattr(session, 'windows') or session.windows is None:
             session.build_windows(window_size)
-        
+
         # Scale windows using the loaded scaler (must be called after Inference.load_model)
         # Reshape windows from (N, T, F) to (N*T, F) for scaling
         original_shape = session.windows.shape
         windows_2d = session.windows.reshape(-1, original_shape[-1])
         windows_scaled_2d = self.inference.scaler.transform(windows_2d)
         windows_scaled = windows_scaled_2d.reshape(original_shape)
-        
+
         return windows_scaled
     #TODO: make features consistent between training and prediction
     def _probabilities_to_events(self, probs: np.ndarray, threshold: float = 0.8) -> pd.DataFrame:
         """Convert probability array to events DataFrame
-        
+
         Args:
             probs: Probability array for each frame
             threshold: Threshold for binary classification
-            
+
         Returns:
             pd.DataFrame: DataFrame with columns: index, start_frame, end_frame, duration, label
         """
         binary = (probs >= threshold).astype(int)
-        
+
         # Find contiguous regions
         events = []
         in_event = False
         start_frame = None
-        
+
         for i, pred in enumerate(binary):
             if pred == 1 and not in_event:
                 start_frame = i
@@ -529,7 +541,7 @@ class Project:
                     'label': 'rearing'  # or get from config
                 })
                 in_event = False
-        
+
         # Handle event that extends to end
         if in_event:
             end_frame = len(binary) - 1
@@ -540,25 +552,25 @@ class Project:
                 'duration': duration,
                 'label': 'rearing'
             })
-        
+
         df = pd.DataFrame(events)
         if len(df) > 0:
             df.insert(0, 'index', range(1, len(df) + 1))
         else:
             df = pd.DataFrame(columns=['index', 'start_frame', 'end_frame', 'duration', 'label'])
-        
+
         return df
-    
+
     def predict_session(self, session, model_identifier=None, batch_size=64, threshold=0.5, save=True):
         """Predict on a single session
-        
+
         Args:
             session: Session object or session ID string
             model_identifier: Model name or path (None for latest)
             batch_size: Batch size for inference
             threshold: Probability threshold for binary classification
             save: Whether to save predictions to CSV
-            
+
         Returns:
             np.ndarray: Probabilities array for each frame
         """
@@ -567,18 +579,18 @@ class Project:
             session = next((s for s in self.sessions if s.id == session), None)
             if session is None:
                 raise ValueError(f"Session {session} not found")
-        
+
         # Initialize Inference and load model if not already done
         if not hasattr(self, 'inference') or self.inference.model is None:
             self.inference = Inference(project=self)
             self.inference.load_model(model_identifier)
-        
+
         # Prepare session data
         scaled_windows = self._prepare_session_for_prediction(session)
-        
+
         # Run inference
         probs = self.inference.predict(scaled_windows, batch_size=batch_size)
-        
+
         # Save predictions if requested
         if save:
             events_df = self._probabilities_to_events(probs, threshold)
@@ -590,35 +602,35 @@ class Project:
             html_path = pred_dir / f"{session.id}_interactive.html"
             self.viz.plot_interactive_predictions(probs, save_path=html_path, events_df=events_df, threshold=threshold)
         return probs
-    
+
     def predict(self, sessions_to_predict=None, model_identifier=None, batch_size=64, threshold=0.5, save=True):
         """Predict on multiple sessions
-        
+
         Args:
             sessions_to_predict: List of session IDs or Session objects (None uses self.sessions_to_predict)
             model_identifier: Model name or path (None for latest)
             batch_size: Batch size for inference
             threshold: Probability threshold for binary classification
             save: Whether to save predictions to CSV
-            
+
         Returns:
             dict: Mapping of session_id -> probabilities array
         """
         if sessions_to_predict is None:
             sessions_to_predict = self.sessions_to_predict
-        
+
         if not sessions_to_predict:
             raise ValueError("No sessions specified for prediction. Set sessions_to_predict or self.sessions_to_predict")
-        
+
         # Initialize Inference once, load model, warm up
         self.inference = Inference(project=self)
         metadata = self.inference.load_model(model_identifier)
-        
+
         # Warm up model
         window_size = metadata.get("window_size", self.config["data"]["window_size"])
         num_features = metadata["training_args"]["input_size"]
         self.inference.warm_up(window_size, num_features, batch_size)
-        
+
         # Convert session IDs to Session objects if needed
         session_objects = []
         for sess in sessions_to_predict:
@@ -629,7 +641,7 @@ class Project:
                 session_objects.append(session_obj)
             else:
                 session_objects.append(sess)
-        
+
         # Predict on each session (model already loaded, so pass None to avoid reload)
         results = {}
         for session in session_objects:
@@ -638,7 +650,7 @@ class Project:
             scaled_windows = self._prepare_session_for_prediction(session)
             probs = self.inference.predict(scaled_windows, batch_size=batch_size)
             results[session.id] = probs
-            
+
             # Save predictions if requested
             if save:
                 events_df = self._probabilities_to_events(probs, threshold)
@@ -649,39 +661,39 @@ class Project:
                 print(f"Predictions saved: {pred_path}")
                 html_path = pred_dir / f"{session.id}_interactive.html"
                 self.viz.plot_interactive_predictions(probs, save_path=html_path, events_df=events_df, threshold=threshold)
-        
+
         return results
-       
+
     def annotate_sessions(self):
         """Open GUI to select and annotate a session."""
         from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget, QListWidgetItem, QApplication
         from PyQt5.QtCore import Qt
         import sys
         from behavex.annotation.pavs import start_app
-        
+
         if len(self.sessions) == 0:
             print("No sessions found in project. Add sessions first using add_session().")
             return
-        
+
         # Ensure QApplication exists
         app = QApplication.instance()
         if app is None:
             app = QApplication(sys.argv)
-        
+
         # Create session selection dialog
         dialog = QDialog()
         dialog.setWindowTitle("Select Session to Annotate")
         dialog.setMinimumSize(600, 400)
-        
+
         layout = QVBoxLayout()
         dialog.setLayout(layout)
-        
+
         label = QLabel(f"Select a session from {self.project_name}:")
         layout.addWidget(label)
-        
+
         list_widget = QListWidget()
         list_widget.setSelectionMode(QListWidget.SingleSelection)
-        
+
         # Add sessions to list
         for session in self.sessions:
             item_text = f"{session.id} - {session.annotation_view} view"
@@ -694,27 +706,27 @@ class Project:
             item = QListWidgetItem(item_text)
             item.setData(Qt.UserRole, session)
             list_widget.addItem(item)
-        
+
         # Select first item by default
         if list_widget.count() > 0:
             list_widget.setCurrentRow(0)
-        
+
         layout.addWidget(list_widget)
-        
+
         # Buttons
         button_layout = QHBoxLayout()
-        
+
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(dialog.reject)
         button_layout.addWidget(cancel_button)
-        
+
         annotate_button = QPushButton("Annotate Selected Session")
         annotate_button.setDefault(True)
         annotate_button.clicked.connect(dialog.accept)
         button_layout.addWidget(annotate_button)
-        
+
         layout.addLayout(button_layout)
-        
+
         # Show dialog and get selection
         if dialog.exec_() == QDialog.Accepted:
             selected_items = list_widget.selectedItems()
@@ -733,54 +745,89 @@ class Project:
 
 
 if __name__ == "__main__":
-    # simple test of the Project class
-    project_dir_root = Path("/users/thomasbush/Downloads") / "project_dir_rear"
+    # Load existing project (sessions are loaded from sessions.yaml)
+    project_dir_root = Path("/Users/thomasbush/Downloads") / "project_dir_rear_test"
     project = Project(project_dir=str(project_dir_root), project_name="Test Project")
-    project.set_config_value("data.window_size", 40)
-    updates = {
-        "data": {
-            "window_size": 40,
-            "fps": 60,
-        },
-        "model_defaults": {
-            "training": {
-                "epochs": 30,
-                "batch_size": 64,
-            }
-        },
-    }
-    project.edit_config(updates)
-    project.show_config()
+    
+    print("\n=== Loaded project ===")
+    print(f"Project directory: {project.project_dir}")
+    print(f"Number of sessions: {len(project.sessions)}")
+    
+    # List all sessions
+    print("\n=== All sessions in project ===")
+    for sess in project.sessions:
+        print(f"  - {sess.id}: {sess.annotation_view} view")
+        print(f"    Video dir: {sess.video_dir}")
+        print(f"    Has features: {sess.has_features()}")
+        print(f"    Has annotations: {sess.has_annotation()}")
+    
+    # Import features for session 1 only
+    # TODO: Update this path to your actual features file path
+    session1_features_path = Path("/Users/thomasbush/Downloads/shared WithTWB/m002_s001_cricket.xlsx")
+    
+    if len(project.sessions) > 0:
+        session1 = project.sessions[0]
+        print(f"\n=== Importing features for {session1.id} ===")
+        
+        if session1_features_path.exists():
+            try:
+                imported_path = project.import_features_for_session(
+                    session_id=session1.id,
+                    features_path=session1_features_path
+                )
+                print(f"Successfully imported features to: {imported_path}")
+            except Exception as e:
+                print(f"Error importing features: {e}")
+        else:
+            print(f"Features file not found at: {session1_features_path}")
+            print("Please update session1_features_path in the code")
+    
+    # Set feature set in config (update with your actual feature names)
+    feature_set = ["height", "forepaw_tail_distance", "height_displacement", "trunk_speed"]
+    project.set_config_value("data.feature_set", feature_set)
+    print(f"\n=== Feature set configured ===")
+    print(f"Features: {feature_set}")
+    
+    # Check if we can create training data
+    print("\n=== Testing training data creation ===")
+    try:
+        # This will:
+        # 1. Select features for all sessions (only session 1 has features)
+        # 2. Load annotations for all sessions
+        # 3. Build windows and labels
+        # 4. Split data
+        # 5. Merge training data
+        project.process_sessions_for_training()
+        
+        print(f"✓ Training data created successfully!")
+        print(f"  Training windows shape: {project.train_windows.shape}")
+        print(f"  Training labels shape: {project.train_labels.shape}")
+        print(f"  Number of training samples: {len(project.train_labels)}")
+        print(f"  Positive samples: {np.sum(project.train_labels == 1)}")
+        print(f"  Negative samples: {np.sum(project.train_labels == 0)}")
+        
+    except Exception as e:
+        print(f"✗ Error creating training data: {e}")
+        import traceback
+        traceback.print_exc()
+    # run window tuning 
 
-    session_path = Path(
-        "/Users/thomasbush/Downloads/multicam_video_2025-05-07T12_16_20_cropped-v2_20250701121021"
-    )
+    project.set_config_value("model_defaults.training.epochs", 20)
+    project.tune_window_size([30, 40, 50, 60, 70, 80, 90, 100])
 
-    # This automatically:
-    #   - detects the 5 camera files
-    #   - maps them to views (central, bottom, left, right, top)
-    #   - adds metadata to sessions.yaml
-    #   - creates Session object
-    #   - creates folder: project_dir/sessions/session_XXX/
-    session = project.add_session(session_path)
 
-    print(f"\nAdded session: {session.id}")
-    print("Views detected:", list(session.views.keys()))
-    print("Annotation view:", session.annotation_view)
-    print("Annotation file expected at:", session.annotation_path())
-    print("Feature file path:", session.features_path())
 
     # ---------------------------------------------------------
     # 4. List all sessions in this project
     # ---------------------------------------------------------
 
-    print("\nAll sessions in project:")
-    for sess in project.sessions:
-        print(" -", sess.id, "at", sess.video_dir)
-
-
+    # print("\nAll sessions in project:")
+    # for sess in project.sessions:
+    #     print(" -", sess.id, "at", sess.video_dir)
+    #
+    #
     # from behavex.annotation.pavs import start_app
-    # # get session annotaiton view file path 
+    # # get session annotaiton view file path
     # annotation_view_path = session.path_to_view(session.annotation_view)
     # start_app(annotation_view_path)
     # project.import_features_for_session(
@@ -788,18 +835,18 @@ if __name__ == "__main__":
     #     features_path = Path("/Users/thomasbush/Downloads/shared WithTWB/m002_s001_cricket.xlsx"),
 
     # )
-    print(project.sessions[0].features_file())
-    print(project.sessions[0].events_file())
-    project.set_config_value("data.feature_set", ["height", "forepaw_tail_distance", "height_displacement", "trunk_speed"])
-    print(project.config["data"]["feature_set"])
-    # Use the new data preparation pipeline function
-    project.process_sessions_for_training()
-    print(project.train_windows.shape)
-    print(project.train_labels.shape)
-    project.set_config_value("model_defaults.training.epochs", 20)
+    # print(project.sessions[0].features_file())
+    # print(project.sessions[0].events_file())
+    # project.set_config_value("data.feature_set", ["height", "forepaw_tail_distance", "height_displacement", "trunk_speed"])
+    # print(project.config["data"]["feature_set"])
+    # # Use the new data preparation pipeline function
+    # project.process_sessions_for_training()
+    # print(project.train_windows.shape)
+    # print(project.train_labels.shape)
+    # project.set_config_value("model_defaults.training.epochs", 20)
+    #
     # project.train()
     # project.train(hpo=False)
-    project.tune_window_size(window_sizes=[20, 30, 40, 50, 60, 70, 80, 90, 100])
     # # Test inference
     # project.sessions_to_predict = [project.sessions[0].id]
     # results = project.predict()
