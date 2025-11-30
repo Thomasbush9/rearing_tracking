@@ -229,11 +229,30 @@ class Session:
     def load_annotations(self):
         """
         Load annotation/events file as pandas DataFrame.
-        Loads from video_dir/annotation_view.csv (same file as events_file()).
+        First checks annotation_path() (in session_root), then falls back to events_file() (in video_dir).
         File is initialized if it doesn't exist.
         """
-        events_path = self.events_file()  # This initializes the file if missing
-        self.annotations = pd.read_csv(events_path)
+        # First try annotation_path (in session_root) - works when video_dir doesn't exist
+        annotation_path = self.annotation_path()
+        if annotation_path.exists():
+            self.annotations = pd.read_csv(annotation_path)
+            return
+        
+        # Fall back to events_file (in video_dir) - for backward compatibility
+        try:
+            events_path = self.events_file()
+            if events_path.exists():
+                self.annotations = pd.read_csv(events_path)
+                return
+        except (ValueError, FileNotFoundError):
+            # video_dir doesn't exist, which is OK if annotation_path exists
+            pass
+        
+        # If neither exists, raise error
+        raise FileNotFoundError(
+            f"Annotation file not found for session {self.id}. "
+            f"Expected at: {annotation_path} or in video_dir"
+        )
     #TODO: in the future add type of behavior to build the labels eg rearing, grooming, etc.
     def build_labels(self):
         """Build labels from annotaions"""
