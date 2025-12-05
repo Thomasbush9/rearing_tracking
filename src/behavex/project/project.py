@@ -23,14 +23,35 @@ class Project:
     def __init__(
         self,
         project_dir: str,
-        project_name: str,
+        project_name: Optional[str] = None,
     ):
         # init the project directory
         self.project_dir = Path(project_dir)
-        self.project_name = project_name
         self.sessions_path = self.project_dir / "sessions.yaml"
         if not self.project_dir.exists():
             self.project_dir.mkdir(parents=True)
+
+        # Determine project name: use provided, load from config, or use directory name
+        config_path = self.project_dir / "config.yaml"
+        if project_name is None:
+            if config_path.exists():
+                # Load existing config to get project name
+                with open(config_path) as stream:
+                    try:
+                        existing_config = yaml.safe_load(stream)
+                        if existing_config and "project" in existing_config and "name" in existing_config["project"]:
+                            self.project_name = existing_config["project"]["name"]
+                        else:
+                            # Fallback to directory name if name not in config
+                            self.project_name = self.project_dir.name
+                    except yaml.YAMLError:
+                        # Fallback to directory name on error
+                        self.project_name = self.project_dir.name
+            else:
+                # New project: use directory name
+                self.project_name = self.project_dir.name
+        else:
+            self.project_name = project_name
 
         # load or create config file
         self.load_config()
@@ -745,9 +766,10 @@ class Project:
 
 
 if __name__ == "__main__":
-    # Load existing project (sessions are loaded from sessions.yaml)
+    # Load existing project - project_name is optional, will be loaded from config if not provided
     project_dir_root = Path("/Users/thomasbush/Downloads") / "project_dir_rear_test"
-    project = Project(project_dir=str(project_dir_root), project_name="Test Project")
+    project = Project(project_dir=str(project_dir_root))  # Name loaded from config.yaml
+    # Alternative: project = Project(project_dir=str(project_dir_root), project_name="Test Project")
     
     print("\n=== Loaded project ===")
     print(f"Project directory: {project.project_dir}")

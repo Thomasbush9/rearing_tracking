@@ -13,13 +13,14 @@ Manages behavioral analysis projects.
 ```python
 from behavex.project import Project
 
-project = Project(
-    project_dir: str,
-    project_name: str
-)
+# Load existing project (name loaded from config.yaml)
+project = Project(project_dir: str)
+
+# Create new project or specify name explicitly
+project = Project(project_dir: str, project_name: str)
 ```
 
-Creates or loads a project directory with config and session management.
+Creates or loads a project directory with config and session management. If `project_name` is not provided, it will be loaded from the existing `config.yaml` file, or use the directory name for new projects.
 
 #### Methods
 
