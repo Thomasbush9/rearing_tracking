@@ -253,9 +253,14 @@ class Session:
             f"Annotation file not found for session {self.id}. "
             f"Expected at: {annotation_path} or in video_dir"
         )
-    #TODO: in the future add type of behavior to build the labels eg rearing, grooming, etc.
-    def build_labels(self):
-        """Build labels from annotaions"""
+    def build_labels(self, behavior_filter: str = None):
+        """Build labels from annotations, optionally filtered by behavior category.
+        
+        Args:
+            behavior_filter: Optional behavior name to filter annotations (e.g., "rearing", "grooming").
+                           If None, includes all events regardless of label.
+                           If "label" column doesn't exist in annotations, all events are included.
+        """
         if self.annotations is None:
             raise ValueError("Annotations not loaded. Call load_annotations() first.")
         if self.features is None:
@@ -263,7 +268,15 @@ class Session:
         y = np.zeros(self.features.shape[0])
         if "start_frame" not in self.annotations.columns or "end_frame" not in self.annotations.columns:
             raise ValueError("Annotations must contain start_frame and end_frame columns.")
-        for s, e in self.annotations[["start_frame", "end_frame"]].itertuples(index=False):
+        
+        # Filter annotations by behavior if specified and label column exists
+        annotations_to_use = self.annotations
+        if behavior_filter is not None and "label" in self.annotations.columns:
+            annotations_to_use = self.annotations[self.annotations["label"] == behavior_filter]
+            if len(annotations_to_use) == 0:
+                print(f"Warning: No events found for behavior '{behavior_filter}' in session {self.id}")
+        
+        for s, e in annotations_to_use[["start_frame", "end_frame"]].itertuples(index=False):
             y[s:e] = 1
         self.labels = y
     

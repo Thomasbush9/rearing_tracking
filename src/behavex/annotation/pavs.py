@@ -2,7 +2,7 @@
 https://github.com/kevalvc/Python-Annotator-for-VideoS
 """
 
-from PyQt5.QtWidgets import QMainWindow, QApplication, QPushButton, QFileDialog, QHBoxLayout, QLabel, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QShortcut, QLineEdit, QSpinBox, QDialog, QListWidget, QListWidgetItem, QCheckBox, QScrollArea, QMenu, QAction
+from PyQt5.QtWidgets import QMainWindow, QApplication, QPushButton, QFileDialog, QHBoxLayout, QLabel, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QShortcut, QLineEdit, QSpinBox, QDialog, QListWidget, QListWidgetItem, QCheckBox, QScrollArea, QMenu, QAction, QComboBox
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 from PyQt5 import QtCore
@@ -34,10 +34,12 @@ class Window(QMainWindow):
         self.video_fps = 60.0  # Default FPS, will be estimated if available
         self.frame_count = 0
         self.open_rearing = False
+        self.current_behavior = "rearing"  # Default behavior, can be changed in GUI
         
         # Track rearing events (frame-based)
         self.events_coords = []  # List of frame numbers
         self.events_actions = []  # List of 'rearing_start' or 'rearing_end'
+        self.events_labels = []  # List of behavior labels for each event pair
         
         # Plot zoom state
         self.plot_zoom_factor = 1.0  # Zoom factor (1.0 = full view)
@@ -70,6 +72,23 @@ class Window(QMainWindow):
         self._feature_plot_background = None  # Background for blitting
         
         self.InitWindow()
+
+    def get_available_behaviors(self):
+        """Get list of available behaviors from project config or return defaults."""
+        default_behaviors = ["rearing", "grooming", "feeding", "drinking", "exploring", "resting"]
+        
+        if self.project is not None and hasattr(self.project, 'config'):
+            # Try to get behaviors from project config
+            annotation_config = self.project.config.get("annotation", {})
+            behaviors = annotation_config.get("behaviors", None)
+            if behaviors and isinstance(behaviors, list):
+                return behaviors
+            # Fallback to single behavior field for backward compatibility
+            single_behavior = annotation_config.get("behavior", None)
+            if single_behavior:
+                return [single_behavior] + [b for b in default_behaviors if b != single_behavior]
+        
+        return default_behaviors
 
     def InitWindow(self):
         self.setWindowTitle(self.title)
@@ -121,7 +140,7 @@ class Window(QMainWindow):
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         with open(csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['index', 'start_frame', 'end_frame', 'duration'])
+            writer.writerow(['index', 'start_frame', 'end_frame', 'duration', 'label'])
     
     def load_csv(self, csv_path: Path):
         """Load events from CSV file."""
@@ -131,22 +150,28 @@ class Window(QMainWindow):
         # Clear existing events
         self.events_coords = []
         self.events_actions = []
+        self.events_labels = []
         self.open_rearing = False
         
         try:
             with open(csv_path, 'r') as stream:
                 reader = csv.reader(stream)
+                header = next(reader, None)  # Get header to check format
+                has_label = header and 'label' in [col.lower() for col in header]
+                
                 for i, row in enumerate(reader):
-                    if i == 0:  # Skip header
-                        continue
-                    if len(row) >= 3:  # index, start_frame, end_frame, [duration]
+                    if len(row) >= 3:  # index, start_frame, end_frame, [duration, label]
                         try:
                             start_frame = int(row[1])
                             end_frame = int(row[2])
+                            # Get label if present, otherwise default to "rearing" for backward compatibility
+                            label = row[4].strip() if has_label and len(row) > 4 and row[4].strip() else "rearing"
+                            
                             self.events_coords.append(start_frame)
                             self.events_actions.append('rearing_start')
                             self.events_coords.append(end_frame)
                             self.events_actions.append('rearing_end')
+                            self.events_labels.append(label)  # Store label for this event pair
                         except (ValueError, IndexError):
                             continue
             
@@ -227,8 +252,9 @@ class Window(QMainWindow):
         if csv_path is None:
             return
 
-        # Group events into complete pairs
+        # Group events into complete pairs with labels
         events = []
+        event_idx = 0
         i = 0
         while i < len(self.events_coords):
             if i < len(self.events_actions) and self.events_actions[i] == 'rearing_start':
@@ -241,7 +267,10 @@ class Window(QMainWindow):
                         break
                 if end_frame is not None:
                     duration = end_frame - start_frame
-                    events.append((start_frame, end_frame, duration))
+                    # Get label for this event (use stored label or default to current_behavior)
+                    label = self.events_labels[event_idx] if event_idx < len(self.events_labels) else self.current_behavior
+                    events.append((start_frame, end_frame, duration, label))
+                    event_idx += 1
                 i += 1
             else:
                 i += 1
@@ -252,9 +281,9 @@ class Window(QMainWindow):
         
         with open(csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['index', 'start_frame', 'end_frame', 'duration'])
-            for idx, (start, end, duration) in enumerate(events, 1):
-                writer.writerow([idx, start, end, duration])
+            writer.writerow(['index', 'start_frame', 'end_frame', 'duration', 'label'])
+            for idx, (start, end, duration, label) in enumerate(events, 1):
+                writer.writerow([idx, start, end, duration, label])
         
         # Update session metadata if this is a new file
         if file_is_new:
@@ -348,6 +377,16 @@ class Window(QMainWindow):
         self.importFeaturesButton.setContextMenuPolicy(Qt.CustomContextMenu)
         self.importFeaturesButton.customContextMenuRequested.connect(self.show_feature_menu)
         
+        # Behavior selector combo box
+        behaviorLabel = QLabel("Behavior:")
+        behaviorLabel.setStyleSheet("font-weight: bold;")
+        self.behaviorComboBox = QComboBox()
+        available_behaviors = self.get_available_behaviors()
+        self.behaviorComboBox.addItems(available_behaviors)
+        # Set current behavior if it's in the list
+        if self.current_behavior in available_behaviors:
+            self.behaviorComboBox.setCurrentText(self.current_behavior)
+        self.behaviorComboBox.currentTextChanged.connect(self.on_behavior_changed)
         
         # Add switch session button if project/sessions available
         self.switchSessionButton = None
@@ -460,6 +499,11 @@ class Window(QMainWindow):
         plotBox.addLayout(layout, 5)
 
         # Right Layout
+        # Behavior selector
+        behaviorLayout = QHBoxLayout()
+        behaviorLayout.addWidget(behaviorLabel)
+        behaviorLayout.addWidget(self.behaviorComboBox)
+        
         feats = QHBoxLayout()
         feats.addWidget(self.delButton)
         feats.addWidget(self.exportButton)
@@ -469,6 +513,7 @@ class Window(QMainWindow):
             feats.addWidget(self.switchSessionButton)
 
         layout2 = QVBoxLayout()
+        layout2.addLayout(behaviorLayout)
         layout2.addWidget(self.tableWidget)
         layout2.addLayout(feats, 1)
         
@@ -532,7 +577,7 @@ class Window(QMainWindow):
         self.events_actions.append('rearing_start')
         self.open_rearing = True
         self.update_table()  # This will call update_plot()
-        self.statusLabel.setText(f"Rearing start at frame {frame}")
+        self.statusLabel.setText(f"{self.current_behavior.capitalize()} start at frame {frame}")
         self.statusLabel.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
 
     def add_rearing_end(self):
@@ -545,16 +590,31 @@ class Window(QMainWindow):
         frame = self.get_current_frame()
         self.events_coords.append(frame)
         self.events_actions.append('rearing_end')
+        # Store the current behavior label for this event
+        self.events_labels.append(self.current_behavior)
         self.open_rearing = False
         self.update_table()  # This will call update_plot()
         self.write_csv()  # Auto-save when event completes
-        self.statusLabel.setText(f"Rearing end at frame {frame} - Saved!")
+        self.statusLabel.setText(f"{self.current_behavior.capitalize()} end at frame {frame} - Saved!")
         self.statusLabel.setStyleSheet("color: blue; font-weight: bold; padding: 5px;")
+
+    def on_behavior_changed(self, behavior_text):
+        """Callback when behavior selector changes."""
+        if not self.open_rearing:
+            self.current_behavior = behavior_text
+            self.statusLabel.setText(f"Behavior changed to: {behavior_text.capitalize()}")
+            self.statusLabel.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
+        else:
+            # Don't change behavior while event is open
+            self.behaviorComboBox.setCurrentText(self.current_behavior)
+            self.statusLabel.setText("Cannot change behavior while event is open. Close current event first.")
+            self.statusLabel.setStyleSheet("color: orange; font-weight: bold; padding: 5px;")
 
     def update_table(self):
         """Update the table with current rearing events."""
-        # Group start/end pairs
+        # Group start/end pairs with labels
         events = []
+        event_idx = 0
         i = 0
         while i < len(self.events_coords):
             if i < len(self.events_actions) and self.events_actions[i] == 'rearing_start':
@@ -567,10 +627,13 @@ class Window(QMainWindow):
                         break
                 if end_frame is not None:
                     duration = end_frame - start_frame
-                    events.append((start_frame, end_frame, duration))
+                    # Get label for this event (use stored label or default to current_behavior)
+                    label = self.events_labels[event_idx] if event_idx < len(self.events_labels) else self.current_behavior
+                    events.append((start_frame, end_frame, duration, label))
+                    event_idx += 1
                 else:
                     # Incomplete event
-                    events.append((start_frame, None, None))
+                    events.append((start_frame, None, None, self.current_behavior))
                 i += 1
             else:
                 i += 1
@@ -592,7 +655,14 @@ class Window(QMainWindow):
         self.tableWidget.setRowCount(0)
         self.tableWidget.setRowCount(len(events))
         
-        for row, (start, end, duration) in enumerate(events):
+        for row, event_data in enumerate(events):
+            if len(event_data) == 4:
+                start, end, duration, label = event_data
+            else:
+                # Backward compatibility
+                start, end, duration = event_data[:3]
+                label = self.current_behavior
+            
             # Index
             item_idx = QTableWidgetItem(str(row + 1))
             item_idx.setFlags(item_idx.flags() & ~Qt.ItemIsEditable)
@@ -613,6 +683,11 @@ class Window(QMainWindow):
                 item_dur = QTableWidgetItem(f"{duration} frames")
                 item_dur.setFlags(item_dur.flags() & ~Qt.ItemIsEditable)
                 self.tableWidget.setItem(row, 3, item_dur)
+                
+                # Label
+                item_label = QTableWidgetItem(str(label))
+                item_label.setFlags(item_label.flags() & ~Qt.ItemIsEditable)
+                self.tableWidget.setItem(row, 4, item_label)
             else:
                 # Incomplete event
                 item_end = QTableWidgetItem("...")
@@ -623,8 +698,12 @@ class Window(QMainWindow):
                 item_dur.setFlags(item_dur.flags() & ~Qt.ItemIsEditable)
                 self.tableWidget.setItem(row, 3, item_dur)
                 
+                item_label = QTableWidgetItem(str(label))
+                item_label.setFlags(item_label.flags() & ~Qt.ItemIsEditable)
+                self.tableWidget.setItem(row, 4, item_label)
+                
                 # Highlight incomplete events
-                for col in range(4):
+                for col in range(5):
                     item = self.tableWidget.item(row, col)
                     if item:
                         item.setBackground(QBrush(QColor(255, 255, 0, 100)))
@@ -828,6 +907,7 @@ class Window(QMainWindow):
     def clearTable(self):
         self.events_coords = []
         self.events_actions = []
+        self.events_labels = []
         self.open_rearing = False
         self.update_table()
         print("Cleared all events")
@@ -848,17 +928,22 @@ class Window(QMainWindow):
             with open(path, 'r') as stream:
                 print("loading", path)
                 reader = csv.reader(stream)
+                header = next(reader, None)  # Get header to check format
+                has_label = header and 'label' in [col.lower() for col in header]
+                
                 for i, row in enumerate(reader):
-                    if i == 0:  # Skip header
-                        continue
-                    if len(row) >= 3:  # index, start_frame, end_frame, [duration]
+                    if len(row) >= 3:  # index, start_frame, end_frame, [duration, label]
                         try:
                             start_frame = int(row[1])
                             end_frame = int(row[2])
+                            # Get label if present, otherwise use current_behavior
+                            label = row[4].strip() if has_label and len(row) > 4 and row[4].strip() else self.current_behavior
+                            
                             self.events_coords.append(start_frame)
                             self.events_actions.append('rearing_start')
                             self.events_coords.append(end_frame)
                             self.events_actions.append('rearing_end')
+                            self.events_labels.append(label)
                         except ValueError:
                             continue
                 self.update_table()
@@ -1418,8 +1503,8 @@ class Window(QMainWindow):
         return events
 
     def insertBaseRow(self):
-        self.tableWidget.setColumnCount(4)
-        self.tableWidget.setHorizontalHeaderLabels(["Index", "Start Frame", "End Frame", "Duration"])
+        self.tableWidget.setColumnCount(5)
+        self.tableWidget.setHorizontalHeaderLabels(["Index", "Start Frame", "End Frame", "Duration", "Label"])
         self.tableWidget.setRowCount(0)
         self.rowNo = 1
         self.colNo = 0

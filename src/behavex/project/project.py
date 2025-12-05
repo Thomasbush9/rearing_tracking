@@ -448,11 +448,17 @@ class Project:
         """
         # Always select features first (across all sessions)
         self.select_features()
+        # Get behavior filter from config (default to None for all behaviors)
+        behavior_filter = self.config.get("annotation", {}).get("behavior_filter", None)
+        # Fallback to single behavior field for backward compatibility
+        if behavior_filter is None:
+            behavior_filter = self.config.get("annotation", {}).get("behavior", None)
+        
         # Then process each session stepwise
         for session in self.sessions:
             session.load_annotations()
             session.build_windows(self.config["data"]["window_size"])
-            session.build_labels()
+            session.build_labels(behavior_filter=behavior_filter)
             # Ensure labels exist before split_data
             if not hasattr(session, "labels") or session.labels is None:
                 raise ValueError(f"Labels not loaded for session {session.id}. Call build_labels() first.")
