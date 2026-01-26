@@ -1244,9 +1244,11 @@ class Window(QMainWindow):
             self.feature_plot_window.setMinimumSize(800, 600)
 
             main_layout = QVBoxLayout()
+            main_layout.setContentsMargins(0, 0, 0, 0)
 
-            self.feature_fig = Figure(figsize=(10, 6))
+            self.feature_fig = Figure(figsize=(10, 6), facecolor='white')
             self.feature_canvas = FigureCanvas(self.feature_fig)
+            self.feature_canvas.setStyleSheet("background-color: white;")
             self.feature_ax = None
 
             # Connect click handler for click-to-jump functionality
@@ -1257,6 +1259,9 @@ class Window(QMainWindow):
 
         # Reset state for clean redraw
         self._reset_feature_plot_state()
+
+        # Clear figure before showing to prevent artifacts
+        self.feature_fig.clf()
 
         self.feature_plot_window.show()
         self.update_feature_plot()
@@ -1340,20 +1345,29 @@ class Window(QMainWindow):
     def _update_feature_plot_incremental(self, current_frame: int, events: list, events_hash: int):
         """Incremental update: move frame indicators and update events if changed.
 
+        Only updates frame indicator positions without redrawing data lines.
+        Falls back to full redraw if state is inconsistent.
+
         Args:
             current_frame: Current video frame number
             events: List of (start, end, label) tuples
             events_hash: Hash of events for change detection
         """
+        # Validate state before incremental update
+        if len(self.feature_frame_indicators) != len(self.feature_axes):
+            # State mismatch - do full redraw instead
+            self._update_feature_plot_full(current_frame, events, events_hash, len(self.selected_features))
+            return
+
         events_changed = events_hash != self._last_drawn_events_hash
 
         # Update frame indicators (fast path using set_xdata)
         for idx, ax in enumerate(self.feature_axes):
-            if idx < len(self.feature_frame_indicators) and self.feature_frame_indicators[idx] is not None:
-                line = self.feature_frame_indicators[idx]
+            indicator = self.feature_frame_indicators[idx]
+            if indicator is not None:
                 y_min, y_max = ax.get_ylim()
-                line.set_xdata([current_frame, current_frame])
-                line.set_ydata([y_min, y_max])
+                indicator.set_xdata([current_frame, current_frame])
+                indicator.set_ydata([y_min, y_max])
 
         # Update event rectangles only if events changed
         if events_changed:
@@ -1372,16 +1386,32 @@ class Window(QMainWindow):
             events_hash: Hash of events for change detection
             num_features: Number of features to plot
         """
-        # Clear figure completely
-        self.feature_fig.clear()
+        # Clear all tracked objects first
         self.feature_lines = []
         self.feature_event_rectangles = []
         self.feature_frame_indicators = []
         self.feature_axes = []
 
-        # Create subplots
+        # Thorough figure clear: remove all axes and reset
+        for ax in self.feature_fig.axes[:]:
+            self.feature_fig.delaxes(ax)
+        self.feature_fig.clf()
+
+        # Set figure size before creating subplots to avoid resize artifacts
+        fig_height = min(max(3, 2 * num_features), 12)
+        self.feature_fig.set_size_inches(8, fig_height)
+
+        # Create subplots using subplots() for cleaner layout
+        if num_features == 1:
+            axes_list = [self.feature_fig.add_subplot(1, 1, 1)]
+        else:
+            axes_list = []
+            for idx in range(num_features):
+                ax = self.feature_fig.add_subplot(num_features, 1, idx + 1)
+                axes_list.append(ax)
+
         for idx, feature_name in enumerate(self.selected_features):
-            ax = self.feature_fig.add_subplot(num_features, 1, idx + 1)
+            ax = axes_list[idx]
             self.feature_axes.append(ax)
 
             # Plot feature data
@@ -1398,6 +1428,9 @@ class Window(QMainWindow):
                 ax.set_ylim(valid_data.min() - margin, valid_data.max() + margin)
             else:
                 ax.set_ylim(-1, 1)
+
+            # Set x-axis limits to data range
+            ax.set_xlim(0, len(feature_data))
 
             # Draw event rectangles
             rects = []
@@ -1433,12 +1466,11 @@ class Window(QMainWindow):
         else:
             self.feature_fig.suptitle('Selected Features with Events', fontsize=10)
 
-        # Adjust layout
-        fig_height = min(max(3, 2 * num_features), 12)
-        self.feature_fig.set_size_inches(8, fig_height)
+        # Layout and draw
         self.feature_fig.tight_layout()
-
         self.feature_canvas.draw()
+        self.feature_canvas.flush_events()
+
         self._last_drawn_events_hash = events_hash
         self._last_feature_plot_update_frame = current_frame
 
