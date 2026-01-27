@@ -2,7 +2,7 @@
 https://github.com/kevalvc/Python-Annotator-for-VideoS
 """
 
-from PyQt5.QtWidgets import QMainWindow, QApplication, QPushButton, QFileDialog, QHBoxLayout, QLabel, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QShortcut, QLineEdit, QSpinBox, QDialog, QListWidget, QListWidgetItem, QCheckBox, QScrollArea, QMenu, QAction, QComboBox
+from PyQt5.QtWidgets import QMainWindow, QApplication, QPushButton, QFileDialog, QHBoxLayout, QLabel, QSizePolicy, QSlider, QStyle, QVBoxLayout, QWidget, QTableWidget, QTableWidgetItem, QShortcut, QLineEdit, QSpinBox, QDialog, QListWidget, QListWidgetItem, QCheckBox, QScrollArea, QMenu, QAction, QComboBox, QStatusBar
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 from PyQt5 import QtCore
@@ -81,7 +81,10 @@ class Window(QMainWindow):
         self.feature_event_rectangles = []  # List of Rectangle patches per subplot
         self.feature_axes = []  # Store axes references
         self._last_drawn_events_hash = None  # Hash of last drawn events to detect changes
-        
+
+        # Status tracking
+        self._last_save_time = None  # Track last save timestamp
+
         self.InitWindow()
 
     def get_available_behaviors(self):
@@ -302,7 +305,11 @@ class Window(QMainWindow):
             writer.writerow(['index', 'start_frame', 'end_frame', 'duration', 'label'])
             for idx, (start, end, duration, label) in enumerate(events, 1):
                 writer.writerow([idx, start, end, duration, label])
-        
+
+        # Record save time
+        from datetime import datetime
+        self._last_save_time = datetime.now().strftime("%H:%M:%S")
+
         # Update session metadata if this is a new file
         if file_is_new:
             self.update_session_metadata(csv_path)
@@ -600,18 +607,74 @@ class Window(QMainWindow):
         self.ax.set_ylim(0, 1)
         self.canvas.draw()
 
+        # Status bar at bottom of window
+        self._init_status_bar()
+
+    def _init_status_bar(self):
+        """Initialize the status bar with persistent labels."""
+        self.main_status_bar = QStatusBar()
+        self.setStatusBar(self.main_status_bar)
+
+        # Behavior indicator
+        self.sb_behavior = QLabel()
+        self.sb_behavior.setStyleSheet("padding: 2px 8px; font-weight: bold;")
+        self.main_status_bar.addWidget(self.sb_behavior)
+
+        # Event state indicator
+        self.sb_event_state = QLabel()
+        self.sb_event_state.setStyleSheet("padding: 2px 8px;")
+        self.main_status_bar.addWidget(self.sb_event_state)
+
+        # Event count
+        self.sb_event_count = QLabel()
+        self.sb_event_count.setStyleSheet("padding: 2px 8px;")
+        self.main_status_bar.addWidget(self.sb_event_count)
+
+        # Last save time (right-aligned)
+        self.sb_save_time = QLabel()
+        self.sb_save_time.setStyleSheet("padding: 2px 8px; color: gray;")
+        self.main_status_bar.addPermanentWidget(self.sb_save_time)
+
+        self._update_status_bar()
+
+    def _update_status_bar(self):
+        """Update all status bar indicators."""
+        # Behavior
+        color = self.behavior_colors.get(self.current_behavior, self.default_color)[0]
+        self.sb_behavior.setText(f"Behavior: {self.current_behavior.upper()}")
+        self.sb_behavior.setStyleSheet(f"padding: 2px 8px; font-weight: bold; color: {color};")
+
+        # Event state
+        if self.open_rearing:
+            self.sb_event_state.setText("EVENT OPEN")
+            self.sb_event_state.setStyleSheet("padding: 2px 8px; background: #ffeb3b; color: black; font-weight: bold;")
+        else:
+            self.sb_event_state.setText("Ready")
+            self.sb_event_state.setStyleSheet("padding: 2px 8px; color: gray;")
+
+        # Event count
+        complete_events = len(self.events_labels)
+        self.sb_event_count.setText(f"Events: {complete_events}")
+
+        # Last save time
+        if self._last_save_time:
+            self.sb_save_time.setText(f"Saved: {self._last_save_time}")
+        else:
+            self.sb_save_time.setText("Not saved")
+
     def add_rearing_start(self):
         """Mark rearing start event at current frame."""
         if self.open_rearing:
             self.statusLabel.setText("Close current event before starting new one")
             self.statusLabel.setStyleSheet("color: red; font-weight: bold; padding: 5px;")
             return
-        
+
         frame = self.get_current_frame()
         self.events_coords.append(frame)
         self.events_actions.append('rearing_start')
         self.open_rearing = True
-        self.update_table()  # This will call update_plot()
+        self.update_table()
+        self._update_status_bar()
         self.statusLabel.setText(f"{self.current_behavior.capitalize()} start at frame {frame}")
         self.statusLabel.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
 
@@ -621,15 +684,15 @@ class Window(QMainWindow):
             self.statusLabel.setText("No open event to close")
             self.statusLabel.setStyleSheet("color: red; font-weight: bold; padding: 5px;")
             return
-        
+
         frame = self.get_current_frame()
         self.events_coords.append(frame)
         self.events_actions.append('rearing_end')
-        # Store the current behavior label for this event
         self.events_labels.append(self.current_behavior)
         self.open_rearing = False
-        self.update_table()  # This will call update_plot()
-        self.write_csv()  # Auto-save when event completes
+        self.update_table()
+        self.write_csv()
+        self._update_status_bar()
         self.statusLabel.setText(f"{self.current_behavior.capitalize()} end at frame {frame} - Saved!")
         self.statusLabel.setStyleSheet("color: blue; font-weight: bold; padding: 5px;")
 
@@ -637,10 +700,10 @@ class Window(QMainWindow):
         """Callback when behavior selector changes."""
         if not self.open_rearing:
             self.current_behavior = behavior_text
+            self._update_status_bar()
             self.statusLabel.setText(f"Behavior changed to: {behavior_text.capitalize()}")
             self.statusLabel.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
         else:
-            # Don't change behavior while event is open
             self.behaviorComboBox.setCurrentText(self.current_behavior)
             self.statusLabel.setText("Cannot change behavior while event is open. Close current event first.")
             self.statusLabel.setStyleSheet("color: orange; font-weight: bold; padding: 5px;")
@@ -660,6 +723,7 @@ class Window(QMainWindow):
             self.behaviorComboBox.setCurrentIndex(index)
             behavior = self.behaviorComboBox.currentText()
             self.current_behavior = behavior
+            self._update_status_bar()
             self.statusLabel.setText(f"[{index+1}] Selected: {behavior.capitalize()}")
             self.statusLabel.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
         else:
