@@ -85,6 +85,9 @@ class Window(QMainWindow):
         # Status tracking
         self._last_save_time = None  # Track last save timestamp
 
+        # Dark mode state
+        self._dark_mode = False
+
         # Undo/redo history
         self._undo_stack = []  # List of (events_coords, events_actions, events_labels, open_rearing) tuples
         self._redo_stack = []
@@ -553,11 +556,17 @@ class Window(QMainWindow):
         shortcutsLayout = QHBoxLayout()
         shortcutsLayout.addWidget(self.shortcutsLabel)
 
+        # Dark mode toggle
+        self.darkModeButton = QPushButton("Dark Mode")
+        self.darkModeButton.setCheckable(True)
+        self.darkModeButton.clicked.connect(self._toggle_dark_mode)
+
         feats = QHBoxLayout()
         feats.addWidget(self.delButton)
         feats.addWidget(self.exportButton)
         feats.addWidget(self.importButton)
         feats.addWidget(self.importFeaturesButton)
+        feats.addWidget(self.darkModeButton)
         if self.switchSessionButton is not None:
             feats.addWidget(self.switchSessionButton)
 
@@ -724,6 +733,59 @@ class Window(QMainWindow):
         self.write_csv()
         self.statusLabel.setText("Redo")
         self.statusLabel.setStyleSheet("color: blue; font-weight: bold; padding: 5px;")
+
+    def _toggle_dark_mode(self, checked: bool):
+        """Toggle between dark and light themes."""
+        self._dark_mode = checked
+        self._apply_theme()
+        self.darkModeButton.setText("Light Mode" if checked else "Dark Mode")
+
+    def _apply_theme(self):
+        """Apply current theme (dark or light) to the application."""
+        if self._dark_mode:
+            # Dark theme
+            self.setStyleSheet("""
+                QMainWindow, QWidget { background-color: #2b2b2b; color: #e0e0e0; }
+                QTableWidget { background-color: #3c3c3c; color: #e0e0e0; gridline-color: #555; }
+                QTableWidget::item { background-color: #3c3c3c; }
+                QTableWidget::item:selected { background-color: #5a5a5a; }
+                QHeaderView::section { background-color: #4a4a4a; color: #e0e0e0; }
+                QPushButton { background-color: #4a4a4a; color: #e0e0e0; border: 1px solid #666; padding: 5px; }
+                QPushButton:hover { background-color: #5a5a5a; }
+                QPushButton:checked { background-color: #6a6a6a; }
+                QComboBox { background-color: #4a4a4a; color: #e0e0e0; border: 1px solid #666; }
+                QComboBox QAbstractItemView { background-color: #3c3c3c; color: #e0e0e0; }
+                QLabel { color: #e0e0e0; }
+                QSlider::groove:horizontal { background: #555; height: 6px; }
+                QSlider::handle:horizontal { background: #888; width: 12px; margin: -3px 0; }
+                QCheckBox { color: #e0e0e0; }
+                QStatusBar { background-color: #3c3c3c; color: #e0e0e0; }
+                QScrollArea { background-color: #3c3c3c; }
+            """)
+            # Update matplotlib plot colors
+            if hasattr(self, 'fig') and self.fig:
+                self.fig.set_facecolor('#2b2b2b')
+                if hasattr(self, 'ax') and self.ax:
+                    self.ax.set_facecolor('#3c3c3c')
+                    self.ax.tick_params(colors='#e0e0e0')
+                    self.ax.xaxis.label.set_color('#e0e0e0')
+                    self.ax.yaxis.label.set_color('#e0e0e0')
+                    for spine in self.ax.spines.values():
+                        spine.set_color('#666')
+                self.canvas.draw_idle()
+        else:
+            # Light theme (default)
+            self.setStyleSheet("")
+            if hasattr(self, 'fig') and self.fig:
+                self.fig.set_facecolor('white')
+                if hasattr(self, 'ax') and self.ax:
+                    self.ax.set_facecolor('white')
+                    self.ax.tick_params(colors='black')
+                    self.ax.xaxis.label.set_color('black')
+                    self.ax.yaxis.label.set_color('black')
+                    for spine in self.ax.spines.values():
+                        spine.set_color('black')
+                self.canvas.draw_idle()
 
     def _update_status_bar(self):
         # Behavior
