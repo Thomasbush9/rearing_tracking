@@ -85,6 +85,11 @@ class Window(QMainWindow):
         # Status tracking
         self._last_save_time = None  # Track last save timestamp
 
+        # Undo/redo history
+        self._undo_stack = []  # List of (events_coords, events_actions, events_labels, open_rearing) tuples
+        self._redo_stack = []
+        self._max_history = 50  # Maximum undo levels
+
         self.InitWindow()
 
     def get_available_behaviors(self):
@@ -571,6 +576,12 @@ class Window(QMainWindow):
         self.shortcut_play = QShortcut(QKeySequence(Qt.Key_Space), self)
         self.shortcut_play.activated.connect(self.play)
 
+        # Undo/Redo shortcuts
+        self.shortcut_undo = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self.shortcut_undo.activated.connect(self.undo)
+        self.shortcut_redo = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+        self.shortcut_redo.activated.connect(self.redo)
+
         # Number keys 1-9 for quick behavior selection
         self.behavior_shortcuts = []
         for i in range(1, 10):
@@ -637,8 +648,74 @@ class Window(QMainWindow):
 
         self._update_status_bar()
 
+    def _save_undo_state(self):
+        """Save current state to undo stack before modifying events."""
+        state = (
+            self.events_coords.copy(),
+            self.events_actions.copy(),
+            self.events_labels.copy(),
+            self.open_rearing
+        )
+        self._undo_stack.append(state)
+        if len(self._undo_stack) > self._max_history:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()  # Clear redo on new action
+
+    def _restore_state(self, state):
+        """Restore events from a saved state tuple."""
+        self.events_coords, self.events_actions, self.events_labels, self.open_rearing = (
+            state[0].copy(), state[1].copy(), state[2].copy(), state[3]
+        )
+        self.update_table()
+        self._update_status_bar()
+
+    def undo(self):
+        """Undo last event action."""
+        if not self._undo_stack:
+            self.statusLabel.setText("Nothing to undo")
+            self.statusLabel.setStyleSheet("color: gray; font-weight: bold; padding: 5px;")
+            return
+
+        # Save current state to redo stack
+        current = (
+            self.events_coords.copy(),
+            self.events_actions.copy(),
+            self.events_labels.copy(),
+            self.open_rearing
+        )
+        self._redo_stack.append(current)
+
+        # Restore previous state
+        state = self._undo_stack.pop()
+        self._restore_state(state)
+        self.write_csv()
+        self.statusLabel.setText("Undo")
+        self.statusLabel.setStyleSheet("color: blue; font-weight: bold; padding: 5px;")
+
+    def redo(self):
+        """Redo previously undone action."""
+        if not self._redo_stack:
+            self.statusLabel.setText("Nothing to redo")
+            self.statusLabel.setStyleSheet("color: gray; font-weight: bold; padding: 5px;")
+            return
+
+        # Save current state to undo stack
+        current = (
+            self.events_coords.copy(),
+            self.events_actions.copy(),
+            self.events_labels.copy(),
+            self.open_rearing
+        )
+        self._undo_stack.append(current)
+
+        # Restore redo state
+        state = self._redo_stack.pop()
+        self._restore_state(state)
+        self.write_csv()
+        self.statusLabel.setText("Redo")
+        self.statusLabel.setStyleSheet("color: blue; font-weight: bold; padding: 5px;")
+
     def _update_status_bar(self):
-        """Update all status bar indicators."""
         # Behavior
         color = self.behavior_colors.get(self.current_behavior, self.default_color)[0]
         self.sb_behavior.setText(f"Behavior: {self.current_behavior.upper()}")
@@ -669,6 +746,7 @@ class Window(QMainWindow):
             self.statusLabel.setStyleSheet("color: red; font-weight: bold; padding: 5px;")
             return
 
+        self._save_undo_state()
         frame = self.get_current_frame()
         self.events_coords.append(frame)
         self.events_actions.append('rearing_start')
@@ -685,6 +763,7 @@ class Window(QMainWindow):
             self.statusLabel.setStyleSheet("color: red; font-weight: bold; padding: 5px;")
             return
 
+        self._save_undo_state()
         frame = self.get_current_frame()
         self.events_coords.append(frame)
         self.events_actions.append('rearing_end')
