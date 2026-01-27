@@ -379,6 +379,13 @@ class Window(QMainWindow):
         self.playButton.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self.playButton.clicked.connect(self.play)
 
+        # Playback speed control
+        self.speedComboBox = QComboBox()
+        self.speedComboBox.addItems(["0.25x", "0.5x", "1x", "1.5x", "2x"])
+        self.speedComboBox.setCurrentText("1x")
+        self.speedComboBox.setFixedWidth(60)
+        self.speedComboBox.currentTextChanged.connect(self._on_speed_changed)
+
         # Time label (for display)
         self.lbl = QLabel('00:00:00')
         self.lbl.setFixedWidth(60)
@@ -512,6 +519,7 @@ class Window(QMainWindow):
         controlLayout = QHBoxLayout()
         controlLayout.addWidget(openButton)
         controlLayout.addWidget(self.playButton)
+        controlLayout.addWidget(self.speedComboBox)
         controlLayout.addWidget(self.lbl)
         controlLayout.addWidget(self.frameLabel)
         controlLayout.addWidget(self.positionSlider)
@@ -1183,6 +1191,16 @@ class Window(QMainWindow):
             self.mediaPlayer.pause()
         else:
             self.mediaPlayer.play()
+
+    def _on_speed_changed(self, speed_text: str):
+        """Handle playback speed selection change.
+
+        Args:
+            speed_text: Speed string like "0.5x", "1x", "2x"
+        """
+        speed_map = {"0.25x": 0.25, "0.5x": 0.5, "1x": 1.0, "1.5x": 1.5, "2x": 2.0}
+        rate = speed_map.get(speed_text, 1.0)
+        self.mediaPlayer.setPlaybackRate(rate)
 
     def delete(self):
         index_list = []
