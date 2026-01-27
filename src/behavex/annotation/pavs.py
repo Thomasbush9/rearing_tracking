@@ -43,13 +43,15 @@ class Window(QMainWindow):
 
         # Color palette for behavior classes (colorblind-friendly)
         self.behavior_colors = {
-            "rearing": ("#E69F00", "#CC8400"),      # Orange
-            "grooming": ("#56B4E9", "#3A9BD9"),     # Sky blue
-            "feeding": ("#009E73", "#007A59"),      # Teal
-            "drinking": ("#F0E442", "#D4C700"),     # Yellow
-            "exploring": ("#0072B2", "#005A8C"),    # Blue
-            "resting": ("#D55E00", "#B34D00"),      # Vermillion
-            "other": ("#CC79A7", "#A6628A"),        # Pink
+            "rearing": ("#E69F00", "#CC8400"),              # Orange
+            "walking": ("#56B4E9", "#3A9BD9"),              # Sky blue
+            "changing_direction": ("#009E73", "#007A59"),   # Teal
+            "approaching_target": ("#F0E442", "#D4C700"),   # Yellow
+            "interaction": ("#0072B2", "#005A8C"),          # Blue
+            "resting": ("#D55E00", "#B34D00"),              # Vermillion
+            "grooming": ("#CC79A7", "#A6628A"),             # Pink
+            "exploring": ("#882255", "#661144"),            # Wine (legacy)
+            "other": ("#999999", "#666666"),                # Gray
         }
         self.default_color = ("#999999", "#666666")  # Gray for unknown behaviors
         
@@ -104,7 +106,7 @@ class Window(QMainWindow):
 
         If not configured, defaults to common rodent behaviors (without feeding).
         """
-        default_behaviors = ["rearing", "grooming", "exploring", "resting", "other"]
+        default_behaviors = ["rearing", "walking", "changing_direction", "approaching_target", "interaction", "resting", "grooming"]
 
         if self.project is not None and hasattr(self.project, 'config'):
             # Try to get behaviors from project config

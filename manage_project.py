@@ -321,7 +321,7 @@ class BehaviorConfigDialog(QDialog):
                 behaviors = [single_behavior]
             else:
                 # Use defaults
-                behaviors = ["rearing", "grooming", "exploring", "resting", "other"]
+                behaviors = ["rearing", "walking", "changing_direction", "approaching_target", "interaction", "resting", "grooming"]
         
         for behavior in behaviors:
             self.behaviors_list.addItem(behavior)
@@ -368,16 +368,16 @@ class BehaviorConfigDialog(QDialog):
     
     def use_defaults(self):
         """Reset to default behaviors."""
+        defaults = ["rearing", "walking", "changing_direction", "approaching_target", "interaction", "resting", "grooming"]
         reply = QMessageBox.question(
             self,
             "Use Defaults",
-            "Replace current behaviors with defaults?\n"
-            "(rearing, grooming, exploring, resting, other)",
+            f"Replace current behaviors with defaults?\n({', '.join(defaults)})",
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
             self.behaviors_list.clear()
-            for behavior in ["rearing", "grooming", "exploring", "resting", "other"]:
+            for behavior in defaults:
                 self.behaviors_list.addItem(behavior)
     
     def save_behaviors(self):
