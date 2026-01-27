@@ -1001,30 +1001,56 @@ class Window(QMainWindow):
         self.statusLabel.setText(f"Updated {'start' if col == 1 else 'end'} frame to {new_value}")
         self.statusLabel.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
 
-    def update_plot(self):
-        """Update the matplotlib plot with current events (no features here)."""
-        # Get complete events with labels for color coding
-        events = self._get_complete_events(include_labels=True)
-        # Also get events without labels for backwards compatibility in some places
-        events_no_labels = [(e[0], e[1]) for e in events]
+    def _get_motion_feature(self):
+        """Get the best feature for motion intensity display.
 
-        # Legacy parsing removed - using _get_complete_events now
-        i = 0
-        if False:  # Keeping structure to minimize diff
-            pass
-        else:
-                i += 1
-        
-        # Get current frame for indicator
+        Returns:
+            Tuple of (feature_name, normalized_data) or (None, None) if unavailable
+        """
+        if self.features_df is None or len(self.features_df) == 0:
+            return None, None
+
+        # Priority order for motion features
+        motion_features = ['dist', 'dist_change', 'speed', 'velocity', 'movement', 'activity']
+        selected = None
+        for feat in motion_features:
+            matches = [c for c in self.features_df.columns if feat in c.lower()]
+            if matches:
+                selected = matches[0]
+                break
+
+        # Fallback to first numeric column
+        if selected is None:
+            for col in self.features_df.columns:
+                if self.features_df[col].dtype in [np.float64, np.float32, np.int64, np.int32]:
+                    selected = col
+                    break
+
+        if selected is None:
+            return None, None
+
+        data = self.features_df[selected].values
+        # Normalize to 0-1 range
+        valid = data[~np.isnan(data)]
+        if len(valid) == 0:
+            return None, None
+        d_min, d_max = valid.min(), valid.max()
+        if d_max == d_min:
+            return selected, np.zeros_like(data)
+        normalized = (data - d_min) / (d_max - d_min)
+        normalized = np.nan_to_num(normalized, nan=0)
+        return selected, normalized
+
+    def update_plot(self):
+        """Update the matplotlib plot with events and motion intensity strip."""
+        events = self._get_complete_events(include_labels=True)
         current_frame = self.get_current_frame()
-        
+
         # Determine x-axis limits based on zoom
         if self.plot_zoom_factor == 1.0:
-            # Full view: show all frames
             if self.frame_count > 0:
                 x_min, x_max = 0, self.frame_count
             elif events:
-                # Events can be (start, end) or (start, end, label) tuples
                 max_frame = max(event[1] for event in events if event[1] is not None)
                 x_min, x_max = 0, max(max_frame + 100, 100)
             elif self.features_df is not None and len(self.features_df) > 0:
@@ -1032,12 +1058,11 @@ class Window(QMainWindow):
             else:
                 x_min, x_max = 0, max(current_frame + 100, 100)
         else:
-            # Zoomed view: show N frames around center
             half_window = self.zoom_n_frames // 2
             x_min = max(0, self.plot_center_frame - half_window)
             x_max = self.plot_center_frame + half_window
-        
-        # Initialize plot if needed (first time)
+
+        # Initialize plot if needed
         if not hasattr(self, 'ax') or self.ax is None:
             self.fig.set_size_inches(8, 2)
             self.canvas.setMinimumHeight(150)
@@ -1050,11 +1075,28 @@ class Window(QMainWindow):
             self.event_rectangles = []
             self.frame_indicator_line = None
             self.zoom_indicator_line = None
-        
+            self._motion_fill = None
+
         # Remove old event rectangles
         for rect in self.event_rectangles:
             rect.remove()
         self.event_rectangles.clear()
+
+        # Remove old motion fill
+        if hasattr(self, '_motion_fill') and self._motion_fill is not None:
+            self._motion_fill.remove()
+            self._motion_fill = None
+
+        # Draw motion intensity strip (gray fill at bottom)
+        feat_name, motion_data = self._get_motion_feature()
+        if motion_data is not None:
+            frames = np.arange(len(motion_data))
+            # Scale to bottom 30% of plot
+            scaled = motion_data * 0.3
+            self._motion_fill = self.ax.fill_between(
+                frames, 0, scaled, color='#cccccc', alpha=0.5, linewidth=0
+            )
+            self.ax.set_ylabel(f'Events ({feat_name})')
 
         # Draw new event bars with color coding by behavior
         for event in events:
