@@ -363,6 +363,8 @@ class Window(QMainWindow):
         self.mediaPlayer = QMediaPlayer(None, QMediaPlayer.VideoSurface)
         self.tableWidget = QTableWidget()
         self.tableWidget.cellClicked.connect(self.checkTableFrame)
+        self.tableWidget.cellChanged.connect(self._on_table_cell_edited)
+        self._table_updating = False  # Flag to prevent recursive updates
 
         self.videoWidget = QVideoWidget()
         self.frameID = 0
@@ -850,62 +852,64 @@ class Window(QMainWindow):
         else:
             status_text = "No events yet"
         
-        # Clear and repopulate table
+        # Clear and repopulate table (block signals during update)
+        self._table_updating = True
         self.tableWidget.setRowCount(0)
         self.tableWidget.setRowCount(len(events))
-        
+
         for row, event_data in enumerate(events):
             if len(event_data) == 4:
                 start, end, duration, label = event_data
             else:
-                # Backward compatibility
                 start, end, duration = event_data[:3]
                 label = self.current_behavior
-            
-            # Index
+
+            # Index (not editable)
             item_idx = QTableWidgetItem(str(row + 1))
             item_idx.setFlags(item_idx.flags() & ~Qt.ItemIsEditable)
             self.tableWidget.setItem(row, 0, item_idx)
-            
-            # Start frame
+
+            # Start frame (editable for complete events)
             item_start = QTableWidgetItem(str(start))
-            item_start.setFlags(item_start.flags() & ~Qt.ItemIsEditable)
+            if end is None:
+                item_start.setFlags(item_start.flags() & ~Qt.ItemIsEditable)
             self.tableWidget.setItem(row, 1, item_start)
-            
+
             if end is not None:
-                # End frame
+                # End frame (editable)
                 item_end = QTableWidgetItem(str(end))
-                item_end.setFlags(item_end.flags() & ~Qt.ItemIsEditable)
                 self.tableWidget.setItem(row, 2, item_end)
-                
-                # Duration
+
+                # Duration (not editable, computed)
                 item_dur = QTableWidgetItem(f"{duration} frames")
                 item_dur.setFlags(item_dur.flags() & ~Qt.ItemIsEditable)
                 self.tableWidget.setItem(row, 3, item_dur)
-                
-                # Label
+
+                # Label (not editable for now)
                 item_label = QTableWidgetItem(str(label))
                 item_label.setFlags(item_label.flags() & ~Qt.ItemIsEditable)
                 self.tableWidget.setItem(row, 4, item_label)
             else:
-                # Incomplete event
+                # Incomplete event (not editable)
                 item_end = QTableWidgetItem("...")
                 item_end.setFlags(item_end.flags() & ~Qt.ItemIsEditable)
                 self.tableWidget.setItem(row, 2, item_end)
-                
+
                 item_dur = QTableWidgetItem("open")
                 item_dur.setFlags(item_dur.flags() & ~Qt.ItemIsEditable)
                 self.tableWidget.setItem(row, 3, item_dur)
-                
+
                 item_label = QTableWidgetItem(str(label))
                 item_label.setFlags(item_label.flags() & ~Qt.ItemIsEditable)
                 self.tableWidget.setItem(row, 4, item_label)
-                
+
                 # Highlight incomplete events
                 for col in range(5):
                     item = self.tableWidget.item(row, col)
                     if item:
                         item.setBackground(QBrush(QColor(255, 255, 0, 100)))
+
+        self._table_updating = False
         
         # Update plots after table update
         self.update_plot()
@@ -913,6 +917,81 @@ class Window(QMainWindow):
         if self.feature_plot_window is not None and self.feature_plot_window.isVisible():
             self._last_feature_plot_update_frame = None  # Force full redraw when events change
             self.update_feature_plot()
+
+    def _on_table_cell_edited(self, row: int, col: int):
+        """Handle manual edits to table cells (start/end frame columns).
+
+        Args:
+            row: Table row index
+            col: Table column index (1=start, 2=end)
+        """
+        if self._table_updating:
+            return
+        if col not in (1, 2):
+            return
+
+        item = self.tableWidget.item(row, col)
+        if item is None:
+            return
+
+        try:
+            new_value = int(item.text())
+            if new_value < 0:
+                raise ValueError("Frame must be non-negative")
+        except ValueError:
+            self.statusLabel.setText("Invalid frame number")
+            self.statusLabel.setStyleSheet("color: red; font-weight: bold; padding: 5px;")
+            self.update_table()  # Restore original values
+            return
+
+        # Find the event index in events_coords (pairs of start/end)
+        event_pairs = []
+        i = 0
+        while i < len(self.events_coords):
+            if i < len(self.events_actions) and self.events_actions[i] == 'rearing_start':
+                start_idx = i
+                end_idx = None
+                for j in range(i + 1, len(self.events_coords)):
+                    if j < len(self.events_actions) and self.events_actions[j] == 'rearing_end':
+                        end_idx = j
+                        break
+                if end_idx is not None:
+                    event_pairs.append((start_idx, end_idx))
+                i += 1
+            else:
+                i += 1
+
+        if row >= len(event_pairs):
+            return
+
+        start_idx, end_idx = event_pairs[row]
+
+        # Validate: start must be < end
+        if col == 1:  # Editing start frame
+            end_val = self.events_coords[end_idx]
+            if new_value >= end_val:
+                self.statusLabel.setText("Start must be before end")
+                self.statusLabel.setStyleSheet("color: red; font-weight: bold; padding: 5px;")
+                self.update_table()
+                return
+            target_idx = start_idx
+        else:  # Editing end frame
+            start_val = self.events_coords[start_idx]
+            if new_value <= start_val:
+                self.statusLabel.setText("End must be after start")
+                self.statusLabel.setStyleSheet("color: red; font-weight: bold; padding: 5px;")
+                self.update_table()
+                return
+            target_idx = end_idx
+
+        # Save undo state and apply change
+        self._save_undo_state()
+        self.events_coords[target_idx] = new_value
+        self.update_table()
+        self.write_csv()
+        self._update_status_bar()
+        self.statusLabel.setText(f"Updated {'start' if col == 1 else 'end'} frame to {new_value}")
+        self.statusLabel.setStyleSheet("color: green; font-weight: bold; padding: 5px;")
 
     def update_plot(self):
         """Update the matplotlib plot with current events (no features here)."""
