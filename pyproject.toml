@@ -20,6 +20,7 @@ dependencies = [
     "tqdm",
     "PyQt5",
     "tensorboard",
+    "opencv-python",
 ]
 
 [project.optional-dependencies]
@@ -35,3 +36,9 @@ where = ["src"]
 [tool.setuptools.package-data]
 "*" = ["*.yaml", "*.yml"]
 
+[tool.uv]
+dev-dependencies = [
+    "pytest",
+    "black",
+    "flake8",
+]

@@ -8,6 +8,7 @@ from behavex.models.train import Trainer
 from behavex.inference.inference import Inference
 from behavex.models.viz import Vizualizer
 from behavex.hpo.HPO import HPO
+from behavex.utils.validation import validate_session_consistency, validate_predictions
 import numpy as np
 
 def _deep_update(base: dict, updates: dict) -> dict:
@@ -118,6 +119,10 @@ class Project:
             "debug": {
                 "verbose": False,
                 "save_intermediate": False,
+            },
+            "validation": {
+                "enable_checks": True,
+                "strict_mode": False,
             },
         }
 
@@ -444,21 +449,45 @@ class Project:
         Run select_features(), build_windows(), build_labels(), split_data(),
         subsample_session() for each session, then merge training data.
 
+        Supports both binary and multiclass training modes:
+        - Binary: Uses build_labels() with optional behavior_filter
+        - Multiclass: Uses build_multiclass_labels() with class_names from config
+
         Ensures labels are built before attempting split_data(), per error in context.
         """
         # Always select features first (across all sessions)
         self.select_features()
-        # Get behavior filter from config (default to None for all behaviors)
-        behavior_filter = self.config.get("annotation", {}).get("behavior_filter", None)
+
+        # Determine task type from config
+        train_cfg = self.config.get("model_defaults", {}).get("training", {})
+        task_type = train_cfg.get("task_type", "binary")
+        annotation_cfg = self.config.get("annotation", {})
+
+        # Get behavior filter for binary mode
+        behavior_filter = annotation_cfg.get("behavior_filter", None)
         # Fallback to single behavior field for backward compatibility
         if behavior_filter is None:
-            behavior_filter = self.config.get("annotation", {}).get("behavior", None)
-        
+            behavior_filter = annotation_cfg.get("behavior", None)
+
+        # Get class names for multiclass mode
+        class_names = annotation_cfg.get("behaviors", [])
+        if not class_names:
+            # Fallback to single behavior
+            single_behavior = annotation_cfg.get("behavior", "rearing")
+            class_names = [single_behavior]
+
         # Then process each session stepwise
         for session in self.sessions:
             session.load_annotations()
             session.build_windows(self.config["data"]["window_size"])
-            session.build_labels(behavior_filter=behavior_filter)
+
+            if task_type == "multiclass":
+                # Multiclass: build labels with class indices
+                session.build_multiclass_labels(class_names=class_names)
+            else:
+                # Binary: build binary labels (0/1)
+                session.build_labels(behavior_filter=behavior_filter)
+
             # Ensure labels exist before split_data
             if not hasattr(session, "labels") or session.labels is None:
                 raise ValueError(f"Labels not loaded for session {session.id}. Call build_labels() first.")
@@ -537,47 +566,113 @@ class Project:
 
         return windows_scaled
     #TODO: make features consistent between training and prediction
-    def _probabilities_to_events(self, probs: np.ndarray, threshold: float = 0.8) -> pd.DataFrame:
+    def _probabilities_to_events(self, probs: np.ndarray, threshold: float = 0.8,
+                                  class_names: list = None) -> pd.DataFrame:
         """Convert probability array to events DataFrame
 
         Args:
-            probs: Probability array for each frame
-            threshold: Threshold for binary classification
+            probs: For binary: (N,) array of probabilities
+                   For multiclass: (N, K) array of class probabilities
+            threshold: Threshold for binary classification (ignored for multiclass)
+            class_names: List of class names for multiclass (index 0 = background)
 
         Returns:
             pd.DataFrame: DataFrame with columns: index, start_frame, end_frame, duration, label
         """
-        binary = (probs >= threshold).astype(int)
+        if probs.ndim == 2:
+            # Multiclass: get predicted class for each frame
+            pred_classes = np.argmax(probs, axis=1)
+            return self._classes_to_events(pred_classes, class_names)
+        else:
+            # Binary classification
+            binary = (probs >= threshold).astype(int)
 
-        # Find contiguous regions
-        events = []
-        in_event = False
-        start_frame = None
+            # Find contiguous regions
+            events = []
+            in_event = False
+            start_frame = None
+            default_label = self.config.get("annotation", {}).get("behavior", "rearing")
 
-        for i, pred in enumerate(binary):
-            if pred == 1 and not in_event:
-                start_frame = i
-                in_event = True
-            elif pred == 0 and in_event:
-                end_frame = i - 1
+            for i, pred in enumerate(binary):
+                if pred == 1 and not in_event:
+                    start_frame = i
+                    in_event = True
+                elif pred == 0 and in_event:
+                    end_frame = i - 1
+                    duration = end_frame - start_frame + 1
+                    events.append({
+                        'start_frame': start_frame,
+                        'end_frame': end_frame,
+                        'duration': duration,
+                        'label': default_label
+                    })
+                    in_event = False
+
+            # Handle event that extends to end
+            if in_event:
+                end_frame = len(binary) - 1
                 duration = end_frame - start_frame + 1
                 events.append({
                     'start_frame': start_frame,
                     'end_frame': end_frame,
                     'duration': duration,
-                    'label': 'rearing'  # or get from config
+                    'label': default_label
                 })
-                in_event = False
 
-        # Handle event that extends to end
-        if in_event:
-            end_frame = len(binary) - 1
+            df = pd.DataFrame(events)
+            if len(df) > 0:
+                df.insert(0, 'index', range(1, len(df) + 1))
+            else:
+                df = pd.DataFrame(columns=['index', 'start_frame', 'end_frame', 'duration', 'label'])
+
+            return df
+
+    def _classes_to_events(self, pred_classes: np.ndarray, class_names: list = None) -> pd.DataFrame:
+        """Convert predicted class indices to events DataFrame for multiclass
+
+        Args:
+            pred_classes: (N,) array of predicted class indices (0 = background)
+            class_names: List of class names where index 0 = background
+
+        Returns:
+            pd.DataFrame: DataFrame with columns: index, start_frame, end_frame, duration, label
+        """
+        if class_names is None:
+            # Default class names
+            behaviors = self.config.get("annotation", {}).get("behaviors", ["behavior"])
+            class_names = ["background"] + behaviors
+
+        events = []
+        current_class = 0  # Start with background
+        start_frame = 0
+
+        for i, pred_class in enumerate(pred_classes):
+            if pred_class != current_class:
+                # End previous event (if it wasn't background)
+                if current_class != 0:
+                    end_frame = i - 1
+                    duration = end_frame - start_frame + 1
+                    label = class_names[current_class] if current_class < len(class_names) else f"class_{current_class}"
+                    events.append({
+                        'start_frame': start_frame,
+                        'end_frame': end_frame,
+                        'duration': duration,
+                        'label': label
+                    })
+                # Start new event
+                current_class = pred_class
+                start_frame = i
+
+        # Handle final event
+        if current_class != 0:
+            end_frame = len(pred_classes) - 1
             duration = end_frame - start_frame + 1
+            label = class_names[current_class] if current_class < len(class_names) else f"class_{current_class}"
             events.append({
                 'start_frame': start_frame,
                 'end_frame': end_frame,
                 'duration': duration,
-                'label': 'rearing'
+                'label': label
             })
 
         df = pd.DataFrame(events)
@@ -618,16 +713,33 @@ class Project:
         # Run inference
         probs = self.inference.predict(scaled_windows, batch_size=batch_size)
 
+        # Validate predictions length
+        validation_cfg = self.config.get("validation", {})
+        enable_checks = validation_cfg.get("enable_checks", True)
+        strict_mode = validation_cfg.get("strict_mode", False)
+        
+        if enable_checks and session.features is not None:
+            source_length = session.features.shape[0]
+            validate_predictions(probs, source_length, strict_mode=strict_mode)
+        
         # Save predictions if requested
         if save:
-            events_df = self._probabilities_to_events(probs, threshold)
+            # Get class names for multiclass
+            class_names = None
+            if self.inference.task_type == "multiclass" and self.inference.class_names:
+                class_names = ["background"] + self.inference.class_names
+
+            events_df = self._probabilities_to_events(probs, threshold, class_names=class_names)
             pred_dir = session.session_root / "predictions"
             pred_dir.mkdir(parents=True, exist_ok=True)
             pred_path = pred_dir / f"{session.id}_pred.csv"
             events_df.to_csv(pred_path, index=False)
             print(f"Predictions saved: {pred_path}")
-            html_path = pred_dir / f"{session.id}_interactive.html"
-            self.viz.plot_interactive_predictions(probs, save_path=html_path, events_df=events_df, threshold=threshold)
+
+            # Only create interactive plot for binary (multiclass would need different handling)
+            if self.inference.task_type == "binary":
+                html_path = pred_dir / f"{session.id}_interactive.html"
+                self.viz.plot_interactive_predictions(probs, save_path=html_path, events_df=events_df, threshold=threshold)
         return probs
 
     def predict(self, sessions_to_predict=None, model_identifier=None, batch_size=64, threshold=0.5, save=True):
@@ -669,8 +781,17 @@ class Project:
             else:
                 session_objects.append(sess)
 
+        # Get class names for multiclass
+        class_names = None
+        if self.inference.task_type == "multiclass" and self.inference.class_names:
+            class_names = ["background"] + self.inference.class_names
+
         # Predict on each session (model already loaded, so pass None to avoid reload)
         results = {}
+        validation_cfg = self.config.get("validation", {})
+        enable_checks = validation_cfg.get("enable_checks", True)
+        strict_mode = validation_cfg.get("strict_mode", False)
+        
         for session in session_objects:
             print(f"Predicting on session: {session.id}")
             # Use the already-loaded inference instance
@@ -678,16 +799,24 @@ class Project:
             probs = self.inference.predict(scaled_windows, batch_size=batch_size)
             results[session.id] = probs
 
+            # Validate predictions length
+            if enable_checks and session.features is not None:
+                source_length = session.features.shape[0]
+                validate_predictions(probs, source_length, strict_mode=strict_mode)
+
             # Save predictions if requested
             if save:
-                events_df = self._probabilities_to_events(probs, threshold)
+                events_df = self._probabilities_to_events(probs, threshold, class_names=class_names)
                 pred_dir = session.session_root / "predictions"
                 pred_dir.mkdir(parents=True, exist_ok=True)
                 pred_path = pred_dir / f"{session.id}_pred.csv"
                 events_df.to_csv(pred_path, index=False)
                 print(f"Predictions saved: {pred_path}")
-                html_path = pred_dir / f"{session.id}_interactive.html"
-                self.viz.plot_interactive_predictions(probs, save_path=html_path, events_df=events_df, threshold=threshold)
+
+                # Only create interactive plot for binary
+                if self.inference.task_type == "binary":
+                    html_path = pred_dir / f"{session.id}_interactive.html"
+                    self.viz.plot_interactive_predictions(probs, save_path=html_path, events_df=events_df, threshold=threshold)
 
         return results
 
@@ -764,11 +893,89 @@ class Project:
                     annotation_view_path = selected_session.path_to_view(selected_session.annotation_view)
                     print(f"Starting annotation for session {selected_session.id} ({selected_session.annotation_view} view)...")
                     # Pass project and sessions for session switching capability
-                    start_app(annotation_view_path, project=self, sessions=self.sessions)
+                    # Don't run event loop since we're already in one (from dialog.exec_())
+                    start_app(annotation_view_path, project=self, sessions=self.sessions, run_event_loop=False)
                 except Exception as e:
                     print(f"Error starting annotation: {e}")
             else:
                 print("No session selected.")
+    
+    def validate_session(self, session_id: str) -> dict:
+        """Validate consistency for a single session.
+        
+        Args:
+            session_id: ID of session to validate
+            
+        Returns:
+            Dictionary with validation results
+        """
+        session = None
+        for s in self.sessions:
+            if s.id == session_id:
+                session = s
+                break
+        
+        if session is None:
+            raise ValueError(f"Session {session_id} not found in project")
+        
+        validation_cfg = self.config.get("validation", {})
+        strict_mode = validation_cfg.get("strict_mode", False)
+        enable_checks = validation_cfg.get("enable_checks", True)
+        
+        return validate_session_consistency(
+            session,
+            video_frame_count=None,
+            strict_mode=strict_mode,
+            enable_checks=enable_checks
+        )
+    
+    def validate_all_sessions(self) -> dict:
+        """Validate consistency for all sessions in project.
+        
+        Returns:
+            Dictionary mapping session_id -> validation results
+        """
+        results = {}
+        validation_cfg = self.config.get("validation", {})
+        strict_mode = validation_cfg.get("strict_mode", False)
+        enable_checks = validation_cfg.get("enable_checks", True)
+        
+        for session in self.sessions:
+            try:
+                result = validate_session_consistency(
+                    session,
+                    video_frame_count=None,
+                    strict_mode=strict_mode,
+                    enable_checks=enable_checks
+                )
+                results[session.id] = result
+            except Exception as e:
+                results[session.id] = {
+                    'is_valid': False,
+                    'messages': [f"Error during validation: {e}"],
+                    'warnings': [],
+                    'errors': [f"Error during validation: {e}"],
+                    'checks': {}
+                }
+        
+        # Print summary
+        total_sessions = len(results)
+        valid_sessions = sum(1 for r in results.values() if r.get('is_valid', False))
+        print(f"\nValidation Summary: {valid_sessions}/{total_sessions} sessions passed")
+        
+        for session_id, result in results.items():
+            if not result.get('is_valid', False):
+                print(f"  {session_id}: FAILED")
+                for msg in result.get('warnings', []):
+                    print(f"    Warning: {msg}")
+                for msg in result.get('errors', []):
+                    print(f"    Error: {msg}")
+            elif result.get('warnings'):
+                print(f"  {session_id}: PASSED (with warnings)")
+                for msg in result.get('warnings', []):
+                    print(f"    Warning: {msg}")
+        
+        return results
 
 
 if __name__ == "__main__":

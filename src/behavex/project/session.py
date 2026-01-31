@@ -4,6 +4,12 @@ import shutil
 import pandas as pd
 import numpy as np
 from behavex.utils.helpers import Helper
+from behavex.utils.validation import (
+    get_video_frame_count,
+    validate_features,
+    validate_annotations,
+    validate_labels,
+)
 
 
 class Session:
@@ -184,8 +190,28 @@ class Session:
                 raise
             raise ValueError(f"Error reading features file: {e}")
         
-        # Skip validation - allow features of any length
-        # Note: video_frame_count parameter kept for API compatibility but validation is disabled
+        # Validate features length if video frame count available
+        validation_cfg = self.project.config.get("validation", {})
+        enable_checks = validation_cfg.get("enable_checks", True)
+        strict_mode = validation_cfg.get("strict_mode", False)
+        
+        if enable_checks:
+            # Get video frame count if not provided
+            if video_frame_count is None and self.annotation_view:
+                try:
+                    video_path = self.path_to_view(self.annotation_view)
+                    video_frame_count = get_video_frame_count(video_path)
+                except (KeyError, ValueError):
+                    pass
+            
+            # Validate features length
+            if video_frame_count is not None:
+                validate_features(
+                    feature_length,
+                    video_frame_count,
+                    tolerance=0.01,
+                    strict_mode=strict_mode
+                )
         
         # Ensure session directory exists
         self.session_root.mkdir(parents=True, exist_ok=True)
@@ -236,6 +262,7 @@ class Session:
         annotation_path = self.annotation_path()
         if annotation_path.exists():
             self.annotations = pd.read_csv(annotation_path)
+            self._validate_annotations_after_load()
             return
         
         # Fall back to events_file (in video_dir) - for backward compatibility
@@ -243,6 +270,7 @@ class Session:
             events_path = self.events_file()
             if events_path.exists():
                 self.annotations = pd.read_csv(events_path)
+                self._validate_annotations_after_load()
                 return
         except (ValueError, FileNotFoundError):
             # video_dir doesn't exist, which is OK if annotation_path exists
@@ -253,9 +281,39 @@ class Session:
             f"Annotation file not found for session {self.id}. "
             f"Expected at: {annotation_path} or in video_dir"
         )
-    def build_labels(self, behavior_filter: str = None):
-        """Build labels from annotations, optionally filtered by behavior category.
+    
+    def _validate_annotations_after_load(self):
+        """Validate annotations after loading."""
+        validation_cfg = self.project.config.get("validation", {})
+        enable_checks = validation_cfg.get("enable_checks", True)
+        strict_mode = validation_cfg.get("strict_mode", False)
         
+        if not enable_checks or self.annotations is None or len(self.annotations) == 0:
+            return
+        
+        # Get data length from features if available, otherwise video
+        data_length = None
+        if self.has_features():
+            try:
+                features_df = pd.read_csv(self.features_path())
+                data_length = len(features_df)
+            except Exception:
+                pass
+        
+        if data_length is None and self.annotation_view:
+            try:
+                video_path = self.path_to_view(self.annotation_view)
+                video_frame_count = get_video_frame_count(video_path)
+                if video_frame_count is not None:
+                    data_length = video_frame_count
+            except (KeyError, ValueError):
+                pass
+        
+        if data_length is not None:
+            validate_annotations(self.annotations, data_length, strict_mode=strict_mode)
+    def build_labels(self, behavior_filter: str = None):
+        """Build binary labels from annotations, optionally filtered by behavior category.
+
         Args:
             behavior_filter: Optional behavior name to filter annotations (e.g., "rearing", "grooming").
                            If None, includes all events regardless of label.
@@ -268,17 +326,95 @@ class Session:
         y = np.zeros(self.features.shape[0])
         if "start_frame" not in self.annotations.columns or "end_frame" not in self.annotations.columns:
             raise ValueError("Annotations must contain start_frame and end_frame columns.")
-        
+
         # Filter annotations by behavior if specified and label column exists
         annotations_to_use = self.annotations
         if behavior_filter is not None and "label" in self.annotations.columns:
             annotations_to_use = self.annotations[self.annotations["label"] == behavior_filter]
             if len(annotations_to_use) == 0:
                 print(f"Warning: No events found for behavior '{behavior_filter}' in session {self.id}")
-        
+
         for s, e in annotations_to_use[["start_frame", "end_frame"]].itertuples(index=False):
             y[s:e] = 1
         self.labels = y
+        
+        # Validate labels length matches features length
+        validation_cfg = self.project.config.get("validation", {})
+        enable_checks = validation_cfg.get("enable_checks", True)
+        strict_mode = validation_cfg.get("strict_mode", False)
+        
+        if enable_checks:
+            validate_labels(self.labels, self.features.shape[0], strict_mode=strict_mode)
+
+    def build_multiclass_labels(self, class_names: list):
+        """Build multiclass labels from annotations with class indices.
+
+        Each frame is assigned a class index:
+        - 0: background (no behavior)
+        - 1..K: behavior classes in order of class_names list
+
+        Args:
+            class_names: List of behavior names defining the class order.
+                        Index 0 is reserved for background.
+                        class_names[0] -> class index 1
+                        class_names[1] -> class index 2
+                        etc.
+
+        Returns:
+            dict: Mapping from class index to class name (including background at 0)
+        """
+        if self.annotations is None:
+            raise ValueError("Annotations not loaded. Call load_annotations() first.")
+        if self.features is None:
+            raise ValueError("Features not loaded. Call select_features() first.")
+        if "start_frame" not in self.annotations.columns or "end_frame" not in self.annotations.columns:
+            raise ValueError("Annotations must contain start_frame and end_frame columns.")
+
+        # Initialize all frames as background (class 0)
+        y = np.zeros(self.features.shape[0], dtype=np.int64)
+
+        # Build class index mapping
+        # 0 = background, 1..K = behaviors
+        class_to_idx = {name: idx + 1 for idx, name in enumerate(class_names)}
+        idx_to_class = {0: "background"}
+        idx_to_class.update({idx + 1: name for idx, name in enumerate(class_names)})
+
+        # Check if label column exists
+        has_label_column = "label" in self.annotations.columns
+
+        if not has_label_column:
+            # No label column: treat all events as first class
+            print(f"Warning: No 'label' column in annotations for session {self.id}. "
+                  f"All events will be assigned to class '{class_names[0]}'.")
+            for s, e in self.annotations[["start_frame", "end_frame"]].itertuples(index=False):
+                s, e = int(s), int(e)
+                if s < len(y) and e <= len(y):
+                    y[s:e] = 1  # First class
+        else:
+            # Assign class indices based on label
+            for _, row in self.annotations.iterrows():
+                s, e = int(row["start_frame"]), int(row["end_frame"])
+                label = row["label"]
+                if label in class_to_idx:
+                    class_idx = class_to_idx[label]
+                    if s < len(y) and e <= len(y):
+                        y[s:e] = class_idx
+                else:
+                    print(f"Warning: Unknown behavior '{label}' in session {self.id}, skipping.")
+
+        self.labels = y
+        self.class_names = class_names
+        self.class_to_idx = class_to_idx
+        self.idx_to_class = idx_to_class
+
+        # Print class distribution
+        unique, counts = np.unique(y, return_counts=True)
+        print(f"Session {self.id} class distribution:")
+        for idx, count in zip(unique, counts):
+            class_name = idx_to_class.get(idx, f"unknown_{idx}")
+            print(f"  {idx}: {class_name} - {count} frames ({100*count/len(y):.1f}%)")
+
+        return idx_to_class
     
     def plot_labels(self, save_path: Path = None):
         """Plot labels with event regions
