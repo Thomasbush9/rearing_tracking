@@ -152,9 +152,24 @@ def masked_reconstruction_loss(
     pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
     """MSE on masked positions only. pred/target (B,T,F), mask (B,T) bool."""
-    pred_m = pred[mask]  # (N_masked, F)
+    pred_m = pred[mask]
     target_m = target[mask]
     return F.mse_loss(pred_m, target_m)
+
+
+def reconstruction_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    unmasked_weight: float = 0.0,
+) -> torch.Tensor:
+    """MSE on masked; optional weighted MSE on unmasked for pass-through regularization."""
+    masked_loss = F.mse_loss(pred[mask], target[mask])
+    if unmasked_weight <= 0:
+        return masked_loss
+    unmasked = ~mask
+    unmasked_loss = F.mse_loss(pred[unmasked], target[unmasked])
+    return masked_loss + unmasked_weight * unmasked_loss
 
 
 if __name__ == "__main__":
