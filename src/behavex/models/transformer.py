@@ -46,6 +46,18 @@ class RotaryPositionalEmbeddings(nn.Module):
         return torch.cat([-x[..., d_2:], x[...,  :d_2]], dim=-1) # [x_1, x_2,...x_d] -> [-x_d/2, ... -x_d, x_1, ... x_d/2]
 
 
+def create_timestep_mask(
+    batch_size: int, seq_len: int, mask_ratio: float, device: torch.device
+) -> torch.Tensor:
+    """Random mask over timesteps. Returns bool mask True = masked (predict)."""
+    n_mask = max(1, int(seq_len * mask_ratio))
+    mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+    for i in range(batch_size):
+        idx = torch.randperm(seq_len, device=device)[:n_mask]
+        mask[i, idx] = True
+    return mask
+
+
 class TemporalTransformer(nn.Module):
 
     def __init__(self, f_in:int, d_model:int, nhead:int, num_layers:int, dropout:float=0.1, output_size:int=1):
@@ -58,20 +70,101 @@ class TemporalTransformer(nn.Module):
         self.output_size = output_size
         dim_feedforward = 2 * d_model
 
-        # RMSNorm
         self.rms_norm = RMSNorm(d_model)
         self.embedding = nn.Linear(f_in, d_model)
         self.pos_encoder = RotaryPositionalEmbeddings(d_model)
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
                                                    dim_feedforward=dim_feedforward,
-                                                   dropout=dropout, activation='relu')
+                                                   dropout=dropout, activation='relu',
+                                                   batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.fc_out = nn.Linear(d_model, output_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.embedding(x)
-if __name__ == "__main__":
+        x = self.pos_encoder(x)
+        x = self.rms_norm(x)
+        x = self.transformer_encoder(x)
+        x = self.fc_out(x)
+        return x
 
-    x = torch.randn(1000, 128, 24)
-    rope_embd=RotaryPositionalEmbeddings(24)(x)
-    print(rope_embd.shape)
+
+class MaskedTemporalTransformer(nn.Module):
+    """Encoder for masked timestep prediction. Learns dynamics + latent for interpretation."""
+
+    def __init__(
+        self,
+        f_in: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dropout: float = 0.1,
+        mask_ratio: float = 0.15,
+    ):
+        super().__init__()
+        self.f_in = f_in
+        self.d_model = d_model
+        self.mask_ratio = mask_ratio
+        dim_feedforward = 2 * d_model
+
+        self.embedding = nn.Linear(f_in, d_model)
+        self.mask_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.pos_encoder = RotaryPositionalEmbeddings(d_model)
+        self.norm = RMSNorm(d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=dim_feedforward, dropout=dropout, activation='relu',
+            batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.reconstruction_head = nn.Linear(d_model, f_in)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (B, T, F) time series
+            mask: (B, T) bool, True = masked. If None, create random mask.
+        Returns:
+            recon: (B, T, F) predicted values
+            latent: (B, T, d_model) encoder hidden states for interpretation
+            mask: (B, T) bool, used mask (for loss)
+        """
+        B, T, F = x.shape
+        if mask is None:
+            mask = create_timestep_mask(B, T, self.mask_ratio, x.device)
+
+        # Embed and substitute mask tokens
+        emb = self.embedding(x)
+        emb = emb + (mask.unsqueeze(-1) * (self.mask_token - emb))
+        emb = self.pos_encoder(emb)
+        emb = self.norm(emb)
+
+        latent = self.encoder(emb)
+        recon = self.reconstruction_head(latent)
+        return recon, latent, mask
+
+
+def masked_reconstruction_loss(
+    pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
+) -> torch.Tensor:
+    """MSE on masked positions only. pred/target (B,T,F), mask (B,T) bool."""
+    pred_m = pred[mask]  # (N_masked, F)
+    target_m = target[mask]
+    return F.mse_loss(pred_m, target_m)
+
+
+if __name__ == "__main__":
+    # RoPE test
+    x = torch.randn(4, 128, 24)
+    rope_embd = RotaryPositionalEmbeddings(24)(x)
+    print("RoPE:", rope_embd.shape)
+
+    # Masked pretraining example
+    model = MaskedTemporalTransformer(f_in=24, d_model=64, nhead=2, num_layers=4, mask_ratio=0.15)
+    recon, latent, mask = model(x)
+    loss = masked_reconstruction_loss(recon, x, mask)
+    print("Recon:", recon.shape, "Latent:", latent.shape, "Loss:", loss.item())

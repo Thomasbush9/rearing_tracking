@@ -68,6 +68,26 @@ class CustomDataset(Dataset):
     def __len__(self) -> int:
         return self.X.shape[0]
 
+class MaskedTemporalDataset(Dataset):
+    """
+    Dataset for masked temporal transformer pretraining.
+    Returns windows only (no labels); target = input for reconstruction loss.
+    """
+
+    def __init__(self, X_windows: Union[np.ndarray, torch.Tensor]) -> None:
+        """
+        Args:
+            X_windows: (num_samples, window_len, num_features) time series windows
+        """
+        if not isinstance(X_windows, torch.Tensor):
+            X_windows = torch.from_numpy(np.asarray(X_windows)).float()
+        self.X = X_windows
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        return self.X[idx]
+
+    def __len__(self) -> int:
+        return self.X.shape[0]
 
 @dataclass
 class GRUTrainingArgs:
