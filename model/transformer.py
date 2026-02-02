@@ -1,4 +1,6 @@
 import math
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 class PositionalEncoding(nn.Module):
@@ -39,3 +41,4 @@ class SmallTransformerModel(nn.Module):
         x = x[-1, :, :]  # take last token's output (batch, d_model)
         out = self.fc_out(x)  # (batch, output_size)
         return out
+
