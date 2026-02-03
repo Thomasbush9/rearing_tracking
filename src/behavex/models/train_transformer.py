@@ -19,6 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
+from tqdm import tqdm
 
 
 def normalize_feature(x: np.ndarray) -> np.ndarray:
@@ -72,39 +73,52 @@ def prepare_masked_transformer_data(
 _SESSION_PATTERN = re.compile(r"^m\d+_s\d+_(cricket|object)\.(xlsx|xls)$", re.IGNORECASE)
 
 
-def _load_one_session(path: Path) -> pd.DataFrame:
-    """Load one Excel file and trim at first valid dist_head (same as original single-file logic)."""
+def _load_one_session(path: Path, trim_before_dist_head: bool = True) -> pd.DataFrame:
+    """
+    Load one Excel file. If trim_before_dist_head (default): return rows before first valid dist_head
+    (data.loc[:first_valid_index-1]); if first_valid_index==0 return empty; else full file.
+    If trim_before_dist_head=False, return full file (no trim).
+    """
     data = pd.read_excel(path)
-    first_valid = data["dist_head"].first_valid_index() if "dist_head" in data.columns else None
-    data_sub = data.loc[: first_valid - 1] if first_valid and first_valid > 0 else data
-    return data_sub
+    if not trim_before_dist_head:
+        return data
+    if "dist_head" not in data.columns:
+        return data
+    first_valid = data["dist_head"].first_valid_index()
+    if first_valid is None:
+        return data
+    if first_valid == 0:
+        return data.iloc[[]].copy()
+    return data.loc[: first_valid - 1].copy()
 
 
-def load_data_path(data_path: str) -> pd.DataFrame:
+def load_data_path(data_path: str, trim_before_dist_head: bool = True) -> pd.DataFrame:
     """
     Load from a single file or a directory. For a directory, finds all files matching
-    m{mouse}_s{session}_{cricket|object}.xlsx (or .xls) and concatenates them into one DataFrame.
+    m{mouse}_s{session}_{cricket|object}.xlsx (or .xls) and concatenates them.
+    trim_before_dist_head: if True (default), keep only rows before first valid dist_head (notebook style).
     """
     path = Path(data_path)
     if path.is_file():
-        return _load_one_session(path)
+        return _load_one_session(path, trim_before_dist_head)
     if not path.is_dir():
         raise FileNotFoundError(f"Not a file or directory: {path}")
+    matching = sorted(
+        f for f in path.iterdir()
+        if f.is_file() and f.suffix.lower() in (".xlsx", ".xls") and _SESSION_PATTERN.match(f.name)
+    )
+    if not matching:
+        raise FileNotFoundError(f"No session files (m*_s*_cricket|object.xlsx) in {path}")
     frames: list[pd.DataFrame] = []
     columns_ref: list[str] | None = None
-    for f in sorted(path.iterdir()):
-        if not f.is_file() or f.suffix.lower() not in (".xlsx", ".xls"):
-            continue
-        if not _SESSION_PATTERN.match(f.name):
-            continue
-        df = _load_one_session(f)
+    for f in tqdm(matching, desc="Loading sessions", unit="file"):
+        df = _load_one_session(f, trim_before_dist_head)
         if df.empty:
             continue
         if columns_ref is None:
             columns_ref = df.columns.tolist()
             frames.append(df)
         else:
-            # Align to first file's columns (missing -> NaN, extra dropped)
             frames.append(df.reindex(columns=columns_ref))
     if not frames:
         raise FileNotFoundError(f"No session files (m*_s*_cricket|object.xlsx) in {path}")
@@ -346,11 +360,12 @@ if __name__ == "__main__":
     parser.add_argument("--test_ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--test_loading", action="store_true", help="Only load data and print summary; do not train.")
+    parser.add_argument("--full_file", action="store_true", help="Load full file(s); do not trim at first valid dist_head (default: trim to rows before first valid dist_head, notebook style).")
     args_cli = parser.parse_args()
 
     # Load and preprocess (single file or dir of m*_s*_cricket|object.xlsx)
     try:
-        data = load_data_path(args_cli.data)
+        data = load_data_path(args_cli.data, trim_before_dist_head=not args_cli.full_file)
         windows, feature_names = prepare_masked_transformer_data(data, window_size=128, stride=1)
     except Exception as e:
         if args_cli.test_loading:
