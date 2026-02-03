@@ -17,10 +17,17 @@ import re
 import torch
 import numpy as np
 import datetime
+import random
+import warnings
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 def normalize_feature(x: np.ndarray) -> np.ndarray:
@@ -244,6 +251,20 @@ class MaskedTemporalTrainingArgs:
     unmasked_weight: float = 0.3
     n_predict_steps: int | None = None
     pred_loss_weight: float = 0.5
+    checkpoint_every: int = 0
+    resume_from: str | None = None
+    save_last: bool = True
+    save_best: bool = True
+    save_optimizer: bool = True
+    save_rng_state: bool = True
+    use_compile: bool = False
+    compile_backend: str | None = "inductor"
+    compile_mode: str | None = None
+    wandb_project: str | None = None
+    wandb_run_name: str | None = None
+    wandb_tags: list[str] | None = None
+    wandb_mode: str | None = None
+    wandb_entity: str | None = None
 
 
 class MaskedTemporalTrainer:
@@ -304,6 +325,23 @@ class MaskedTemporalTrainer:
         self.plots_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(log_dir=str(self.save_path))
         self.val_seed = 42  # Fixed seed for reproducible val masks
+        self.checkpoints_dir = self.save_path / "checkpoints"
+        self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        self._wandb_run = self._init_wandb()
+        self.start_epoch = 1
+        if training_args.resume_from:
+            resume_path = Path(training_args.resume_from).expanduser().resolve()
+            if resume_path.is_file():
+                try:
+                    last_epoch = self._load_checkpoint(resume_path)
+                    self.start_epoch = max(1, last_epoch + 1)
+                    if training_args.verbose:
+                        print(f"[trainer] Resumed from {resume_path} at epoch {last_epoch}")
+                except Exception as exc:
+                    warnings.warn(f"Failed to resume from {resume_path}: {exc}")
+            else:
+                warnings.warn(f"Resume checkpoint not found at {resume_path}")
+        self._maybe_compile_model()
 
     def _eval(self, loader: DataLoader) -> float:
         """Eval with fixed seed per batch so val masks are identical across epochs (comparable val loss)."""
@@ -397,6 +435,7 @@ class MaskedTemporalTrainer:
         plt.savefig(self.plots_dir / save_name, dpi=150, bbox_inches="tight")
         if tb_tag is not None and tb_step is not None:
             self.writer.add_figure(tb_tag, fig, tb_step)
+            self._log_wandb_image(tb_tag, fig, tb_step)
         plt.close(fig)
 
         if self.is_predictive and pred_next is not None:
@@ -430,7 +469,9 @@ class MaskedTemporalTrainer:
             plt.tight_layout()
             plt.savefig(self.plots_dir / pred_name, dpi=150, bbox_inches="tight")
             if tb_tag is not None and tb_step is not None:
-                self.writer.add_figure(f"{tb_tag}_pred", fig, tb_step)
+                pred_tag = f"{tb_tag}_pred"
+                self.writer.add_figure(pred_tag, fig, tb_step)
+                self._log_wandb_image(pred_tag, fig, tb_step)
             plt.close(fig)
 
     def _plot_validation(self, epoch: int) -> None:
@@ -443,6 +484,178 @@ class MaskedTemporalTrainer:
             tb_tag="val/gt_vs_recon",
             tb_step=epoch,
         )
+
+    def _init_wandb(self):
+        args = self.training_args
+        if args.wandb_project is None:
+            return None
+        if wandb is None:
+            warnings.warn("wandb is not installed; skipping wandb logging.")
+            return None
+        init_kwargs = {
+            "project": args.wandb_project,
+        }
+        if args.wandb_run_name:
+            init_kwargs["name"] = args.wandb_run_name
+        if args.wandb_tags:
+            init_kwargs["tags"] = args.wandb_tags
+        if args.wandb_mode:
+            init_kwargs["mode"] = args.wandb_mode
+        if args.wandb_entity:
+            init_kwargs["entity"] = args.wandb_entity
+        config = {
+            "model": "masked_predictive_transformer" if self.is_predictive else "masked_transformer",
+            "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "epochs": args.epochs,
+            "d_model": args.d_model,
+            "nhead": args.nhead,
+            "num_layers": args.num_layers,
+            "mask_ratio": args.mask_ratio,
+            "unmasked_weight": args.unmasked_weight,
+            "n_predict_steps": args.n_predict_steps,
+            "pred_loss_weight": args.pred_loss_weight,
+            "device": args.device,
+            "checkpoint_every": args.checkpoint_every,
+            "use_compile": args.use_compile,
+        }
+        init_kwargs["config"] = config
+        try:
+            return wandb.init(**init_kwargs)
+        except Exception as exc:
+            warnings.warn(f"Failed to initialize wandb: {exc}")
+            return None
+
+    def _log_wandb(self, metrics: dict[str, float], step: int | None = None) -> None:
+        if self._wandb_run is None:
+            return
+        payload = dict(metrics)
+        if step is not None and "epoch" not in payload:
+            payload["epoch"] = step
+        self._wandb_run.log(payload, step=step)
+
+    def _log_wandb_image(self, tag: str, fig: plt.Figure, step: int | None) -> None:
+        if self._wandb_run is None or wandb is None or step is None:
+            return
+        try:
+            self._wandb_run.log({tag: wandb.Image(fig)}, step=step)
+        except Exception as exc:
+            warnings.warn(f"Failed to log image to wandb ({tag}): {exc}")
+
+    def _maybe_compile_model(self) -> None:
+        if not self.training_args.use_compile:
+            return
+        compile_fn = getattr(torch, "compile", None)
+        if compile_fn is None:
+            warnings.warn("torch.compile is unavailable in this PyTorch build; skipping.")
+            return
+        try:
+            self.model = compile_fn(
+                self.model,
+                backend=self.training_args.compile_backend,
+                mode=self.training_args.compile_mode,
+            )
+            if self.training_args.verbose:
+                print(
+                    f"[trainer] torch.compile enabled "
+                    f"(backend={self.training_args.compile_backend}, mode={self.training_args.compile_mode})"
+                )
+        except Exception as exc:
+            warnings.warn(f"torch.compile failed; continuing without compile. Error: {exc}")
+
+    def _capture_rng_state(self) -> dict[str, object]:
+        state: dict[str, object] = {
+            "torch": torch.get_rng_state(),
+            "numpy": np.random.get_state(),
+            "python": random.getstate(),
+        }
+        if torch.cuda.is_available():
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def _restore_rng_state(self, state: dict[str, object]) -> None:
+        torch_state = state.get("torch")
+        if torch_state is not None:
+            torch.set_rng_state(torch_state)
+        cuda_state = state.get("cuda")
+        if cuda_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_state)
+        numpy_state = state.get("numpy")
+        if numpy_state is not None:
+            np.random.set_state(numpy_state)
+        python_state = state.get("python")
+        if python_state is not None:
+            random.setstate(python_state)
+
+    def _checkpoint_state(self, epoch: int, val_loss: float | None) -> dict[str, object]:
+        args = self.training_args
+        state: dict[str, object] = {
+            "epoch": epoch,
+            "best_loss": self.best_loss,
+            "best_epoch": self.best_epoch,
+            "patience_counter": self.patience_counter,
+            "val_loss": val_loss,
+            "train_losses": self.train_losses,
+            "val_losses": self.val_losses,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "model_state": self.model.state_dict(),
+            "training_params": {
+                "batch_size": args.batch_size,
+                "learning_rate": args.learning_rate,
+                "d_model": args.d_model,
+                "nhead": args.nhead,
+                "num_layers": args.num_layers,
+                "mask_ratio": args.mask_ratio,
+                "epochs": args.epochs,
+                "unmasked_weight": args.unmasked_weight,
+                "n_predict_steps": args.n_predict_steps,
+                "pred_loss_weight": args.pred_loss_weight,
+                "device": args.device,
+            },
+        }
+        if args.save_optimizer:
+            state["optimizer_state"] = self.optimizer.state_dict()
+        if args.save_rng_state:
+            state["rng_state"] = self._capture_rng_state()
+        return state
+
+    def _save_checkpoint(
+        self, path: Path, epoch: int, val_loss: float | None, is_best: bool = False
+    ) -> None:
+        try:
+            payload = self._checkpoint_state(epoch, val_loss)
+            payload["is_best"] = is_best
+            torch.save(payload, path)
+            if self.training_args.verbose:
+                label = "best" if is_best else path.name
+                print(f"[trainer] Saved checkpoint ({label}) at epoch {epoch} -> {path}")
+        except Exception as exc:
+            warnings.warn(f"Failed to save checkpoint at {path}: {exc}")
+
+    def _load_checkpoint(self, path: Path) -> int:
+        checkpoint = torch.load(path, map_location=self.device)
+        if not isinstance(checkpoint, dict) or "model_state" not in checkpoint:
+            # Backward compatibility: checkpoint is raw state dict.
+            self.model.load_state_dict(checkpoint)
+            warnings.warn(
+                f"Checkpoint {path} lacks trainer metadata; loaded weights only without optimizer state."
+            )
+            return 0
+        self.model.load_state_dict(checkpoint["model_state"])
+        if self.training_args.save_optimizer and "optimizer_state" in checkpoint:
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+            except Exception as exc:
+                warnings.warn(f"Could not load optimizer state from {path}: {exc}")
+        self.best_loss = checkpoint.get("best_loss", self.best_loss)
+        self.best_epoch = checkpoint.get("best_epoch", self.best_epoch)
+        self.patience_counter = checkpoint.get("patience_counter", 0)
+        self.train_losses = checkpoint.get("train_losses", self.train_losses)
+        self.val_losses = checkpoint.get("val_losses", self.val_losses)
+        rng_state = checkpoint.get("rng_state")
+        if rng_state and self.training_args.save_rng_state:
+            self._restore_rng_state(rng_state)
+        return int(checkpoint.get("epoch", 0))
 
     def learning_step(self, X: torch.Tensor) -> float:
         X = X.to(self.device)
@@ -461,7 +674,11 @@ class MaskedTemporalTrainer:
 
     def train(self) -> float:
         args = self.training_args
-        for epoch in range(1, args.epochs + 1):
+        eval_every = max(1, args.eval_every_n_epochs)
+        stop_training = False
+        final_epoch = self.start_epoch - 1
+        for epoch in range(self.start_epoch, args.epochs + 1):
+            final_epoch = epoch
             self.model.train()
             running_loss = 0.0
             for X in self.train_loader:
@@ -469,40 +686,66 @@ class MaskedTemporalTrainer:
             avg_train = running_loss / len(self.train_loader.dataset)
             self.train_losses.append(avg_train)
             self.writer.add_scalar("train/loss", avg_train, epoch)
+            self._log_wandb({"train/loss": avg_train}, step=epoch)
 
-            if epoch % args.eval_every_n_epochs == 0:
-                val_loss = self._eval(self.val_loader)
-                self.val_losses.append(val_loss)
-                self.writer.add_scalar("val/loss", val_loss, epoch)
+            epoch_val_loss: float | None = None
+            if epoch % eval_every == 0 or epoch == args.epochs:
+                epoch_val_loss = self._eval(self.val_loader)
+                self.val_losses.append(epoch_val_loss)
+                self.writer.add_scalar("val/loss", epoch_val_loss, epoch)
+                self._log_wandb({"val/loss": epoch_val_loss}, step=epoch)
                 self._plot_validation(epoch)
                 if args.verbose:
-                    print(f"Epoch {epoch}/{args.epochs} | Train: {avg_train:.4f} | Val: {val_loss:.4f}")
+                    print(
+                        f"Epoch {epoch}/{args.epochs} | "
+                        f"Train: {avg_train:.4f} | Val: {epoch_val_loss:.4f}"
+                    )
 
-                if val_loss < self.best_loss:
-                    self.best_loss = val_loss
+                if epoch_val_loss < self.best_loss:
+                    self.best_loss = epoch_val_loss
                     self.best_epoch = epoch
                     self.patience_counter = 0
-                    if args.save_model:
-                        torch.save(self.model.state_dict(), self.save_path / "best.pt")
+                    if args.save_model and args.save_best:
+                        self._save_checkpoint(self.save_path / "best.pt", epoch, epoch_val_loss, is_best=True)
+                    self._log_wandb({"best/val_loss": self.best_loss}, step=epoch)
                 else:
                     self.patience_counter += 1
 
                 if self.patience_counter >= args.patience:
                     if args.verbose:
                         print(f"Early stop at epoch {epoch}")
-                    break
+                    stop_training = True
 
-        self.writer.close()
+            checkpoint_metric = epoch_val_loss if epoch_val_loss is not None else avg_train
+            if args.save_model and args.save_last:
+                self._save_checkpoint(self.save_path / "last.pt", epoch, checkpoint_metric)
+            if args.save_model and args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
+                ckpt_name = self.checkpoints_dir / f"checkpoint_epoch{epoch}.pt"
+                self._save_checkpoint(ckpt_name, epoch, checkpoint_metric)
+
+            if stop_training:
+                break
+
         if self.test_loader is not None:
             test_loss = self._eval(self.test_loader)
+            self.writer.add_scalar("test/loss", test_loss, final_epoch)
+            self._log_wandb({"test/loss": test_loss}, step=final_epoch)
             self._plot_reconstruction(
                 self.test_loader,
                 "test_recon.png",
                 "Test set: ~15% timesteps masked (orange bars)",
                 self.val_seed + 1,
+                tb_tag="test/gt_vs_recon",
+                tb_step=final_epoch,
             )
             if args.verbose:
                 print(f"Final test loss: {test_loss:.4f}")
+        self.writer.close()
+        if self._wandb_run is not None:
+            try:
+                self._wandb_run.finish()
+            except Exception as exc:
+                warnings.warn(f"wandb finish failed: {exc}")
         return self.best_loss
 
 
@@ -520,6 +763,20 @@ if __name__ == "__main__":
     parser.add_argument("--model", choices=["masked", "predictive"], default="masked", help="Model variant: masked (recon only) or predictive (recon + multi-step prediction).")
     parser.add_argument("--n_predict_steps", type=int, default=3, help="Number of next steps to predict (used when --model predictive).")
     parser.add_argument("--pred_loss_weight", type=float, default=0.5, help="Weight for predictive loss (used when --model predictive).")
+    parser.add_argument("--checkpoint-every", type=int, default=0, help="Save an additional checkpoint every N epochs (0 disables).")
+    parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint to resume training from.")
+    parser.add_argument("--no-save-last", action="store_true", help="Disable saving last.pt after every epoch.")
+    parser.add_argument("--no-save-best", action="store_true", help="Disable saving best.pt when validation improves.")
+    parser.add_argument("--no-save-optimizer", action="store_true", help="Do not include optimizer state in checkpoints.")
+    parser.add_argument("--no-save-rng", action="store_true", help="Do not persist RNG state (PyTorch/Numpy/Python).")
+    parser.add_argument("--use-compile", action="store_true", help="Enable torch.compile for faster training (PyTorch 2.0+).")
+    parser.add_argument("--compile-backend", type=str, default="inductor", help="Backend to use with torch.compile (default: inductor).")
+    parser.add_argument("--compile-mode", type=str, default=None, help="Compilation mode for torch.compile (e.g., 'default', 'reduce-overhead').")
+    parser.add_argument("--wandb-project", type=str, default=None, help="Weights & Biases project name to enable logging.")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="Weights & Biases run display name.")
+    parser.add_argument("--wandb-tags", nargs="+", default=None, help="Optional list of W&B tags to attach to the run.")
+    parser.add_argument("--wandb-mode", type=str, default=None, help="W&B mode: online, offline, disabled.")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity (team/user) to log under.")
     args_cli = parser.parse_args()
 
     # Load and preprocess (single file or dir of m*_s*_cricket|object.xlsx)
@@ -570,6 +827,20 @@ if __name__ == "__main__":
         feature_names=feature_names,
         n_predict_steps=n_predict_steps,
         pred_loss_weight=pred_loss_weight,
+        checkpoint_every=args_cli.checkpoint_every,
+        resume_from=args_cli.resume_from,
+        save_last=not args_cli.no_save_last,
+        save_best=not args_cli.no_save_best,
+        save_optimizer=not args_cli.no_save_optimizer,
+        save_rng_state=not args_cli.no_save_rng,
+        use_compile=args_cli.use_compile,
+        compile_backend=args_cli.compile_backend,
+        compile_mode=args_cli.compile_mode,
+        wandb_project=args_cli.wandb_project,
+        wandb_run_name=args_cli.wandb_run_name,
+        wandb_tags=args_cli.wandb_tags,
+        wandb_mode=args_cli.wandb_mode,
+        wandb_entity=args_cli.wandb_entity,
     )
     trainer = MaskedTemporalTrainer(args)
     best = trainer.train()
