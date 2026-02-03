@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from behavex.models.data import MaskedTemporalDataset
 from typing import Union, Optional
 from pathlib import Path
+import re
 import torch
 import numpy as np
 import datetime
@@ -65,6 +66,49 @@ def prepare_masked_transformer_data(
     numeric = numeric.interpolate(method="linear", limit_direction="both")
     feature_names = numeric.columns.tolist()
     return make_windows(numeric.values, window_size, stride), feature_names
+
+
+# Filename pattern: m{mouse}_s{session}_{cricket|object}.xlsx / .xls
+_SESSION_PATTERN = re.compile(r"^m\d+_s\d+_(cricket|object)\.(xlsx|xls)$", re.IGNORECASE)
+
+
+def _load_one_session(path: Path) -> pd.DataFrame:
+    """Load one Excel file and trim at first valid dist_head (same as original single-file logic)."""
+    data = pd.read_excel(path)
+    first_valid = data["dist_head"].first_valid_index() if "dist_head" in data.columns else None
+    data_sub = data.loc[: first_valid - 1] if first_valid and first_valid > 0 else data
+    return data_sub
+
+
+def load_data_path(data_path: str) -> pd.DataFrame:
+    """
+    Load from a single file or a directory. For a directory, finds all files matching
+    m{mouse}_s{session}_{cricket|object}.xlsx (or .xls) and concatenates them into one DataFrame.
+    """
+    path = Path(data_path)
+    if path.is_file():
+        return _load_one_session(path)
+    if not path.is_dir():
+        raise FileNotFoundError(f"Not a file or directory: {path}")
+    frames: list[pd.DataFrame] = []
+    columns_ref: list[str] | None = None
+    for f in sorted(path.iterdir()):
+        if not f.is_file() or f.suffix.lower() not in (".xlsx", ".xls"):
+            continue
+        if not _SESSION_PATTERN.match(f.name):
+            continue
+        df = _load_one_session(f)
+        if df.empty:
+            continue
+        if columns_ref is None:
+            columns_ref = df.columns.tolist()
+            frames.append(df)
+        else:
+            # Align to first file's columns (missing -> NaN, extra dropped)
+            frames.append(df.reindex(columns=columns_ref))
+    if not frames:
+        raise FileNotFoundError(f"No session files (m*_s*_cricket|object.xlsx) in {path}")
+    return pd.concat(frames, ignore_index=True)
 
 
 @dataclass
@@ -158,12 +202,20 @@ class MaskedTemporalTrainer:
         self.model.train()
         return total / n if n else 0.0
 
-    def _plot_validation(self, epoch: int) -> None:
-        """Plot GT vs reconstruction for all features. Uses fixed mask; highlights masked positions."""
+    def _plot_reconstruction(
+        self,
+        loader: DataLoader,
+        save_name: str,
+        title: str,
+        seed: int,
+        tb_tag: str | None = None,
+        tb_step: int | None = None,
+    ) -> None:
+        """Plot GT vs reconstruction for one batch. Fixed seed for comparable masks."""
         self.model.eval()
-        X = next(iter(self.val_loader)).to(self.device)
+        X = next(iter(loader)).to(self.device)
         B, T, _ = X.shape
-        torch.manual_seed(self.val_seed)
+        torch.manual_seed(seed)
         mask = create_timestep_mask(B, T, self.training_args.mask_ratio, X.device)
         with torch.no_grad():
             recon, _, mask = self.model(X, mask=mask)
@@ -186,7 +238,6 @@ class MaskedTemporalTrainer:
         masked_idx = np.where(m)[0]
 
         for i in range(n_plot):
-            # Left: full sequence, GT vs recon, vertical bars at masked positions
             ax = axes[i, 0]
             ax.plot(t, gt[:, i], label="GT", alpha=0.8)
             ax.plot(t, pred[:, i], label="Recon", alpha=0.8, linestyle="--")
@@ -197,7 +248,6 @@ class MaskedTemporalTrainer:
             ax.grid(True, alpha=0.3)
             ax.set_title("Full seq (| = masked)" if i == 0 else None, fontsize=7)
 
-            # Right: pred vs GT ONLY at masked positions (actual task)
             ax = axes[i, 1]
             if len(masked_idx) > 0:
                 gt_m = gt[masked_idx, i]
@@ -212,12 +262,23 @@ class MaskedTemporalTrainer:
             ax.set_title("Masked only" if i == 0 else None, fontsize=7)
 
         axes[-1, 0].set_xlabel("Time")
-        fig.suptitle(f"Validation epoch {epoch}: ~15% timesteps masked (orange bars)")
+        fig.suptitle(title)
         plt.tight_layout()
-        save_path = self.plots_dir / f"val_recon_epoch{epoch}.png"
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        self.writer.add_figure("val/gt_vs_recon", fig, epoch)
+        plt.savefig(self.plots_dir / save_name, dpi=150, bbox_inches="tight")
+        if tb_tag is not None and tb_step is not None:
+            self.writer.add_figure(tb_tag, fig, tb_step)
         plt.close(fig)
+
+    def _plot_validation(self, epoch: int) -> None:
+        """Plot GT vs reconstruction on validation set."""
+        self._plot_reconstruction(
+            self.val_loader,
+            f"val_recon_epoch{epoch}.png",
+            f"Validation epoch {epoch}: ~15% timesteps masked (orange bars)",
+            self.val_seed,
+            tb_tag="val/gt_vs_recon",
+            tb_step=epoch,
+        )
 
     def learning_step(self, X: torch.Tensor) -> float:
         X = X.to(self.device)
@@ -265,6 +326,12 @@ class MaskedTemporalTrainer:
         self.writer.close()
         if self.test_loader is not None:
             test_loss = self._eval(self.test_loader)
+            self._plot_reconstruction(
+                self.test_loader,
+                "test_recon.png",
+                "Test set: ~15% timesteps masked (orange bars)",
+                self.val_seed + 1,
+            )
             if args.verbose:
                 print(f"Final test loss: {test_loss:.4f}")
         return self.best_loss
@@ -272,24 +339,36 @@ class MaskedTemporalTrainer:
 
 if __name__ == "__main__":
     import argparse
+    import sys
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="/Users/thomasbush/Downloads/shared WithTWB/m001_s001_cricket.xlsx")
     parser.add_argument("--val_ratio", type=float, default=0.15)
     parser.add_argument("--test_ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--test_loading", action="store_true", help="Only load data and print summary; do not train.")
     args_cli = parser.parse_args()
 
-    # Load and preprocess
+    # Load and preprocess (single file or dir of m*_s*_cricket|object.xlsx)
     try:
-        data = pd.read_excel(args_cli.data)
-        first_valid = data["dist_head"].first_valid_index()
-        data_sub = data.loc[: first_valid - 1] if first_valid and first_valid > 0 else data
-        windows, feature_names = prepare_masked_transformer_data(data_sub, window_size=128, stride=1)
+        data = load_data_path(args_cli.data)
+        windows, feature_names = prepare_masked_transformer_data(data, window_size=128, stride=1)
     except Exception as e:
+        if args_cli.test_loading:
+            print(f"Load failed: {e}")
+            sys.exit(1)
         print(f"Could not load {args_cli.data}: {e}. Using dummy data.")
         windows = np.random.randn(1000, 128, 24).astype(np.float32)
         feature_names = None
     f_in = windows.shape[-1]
+
+    if args_cli.test_loading:
+        path = Path(args_cli.data)
+        kind = "file" if path.is_file() else "dir"
+        print(f"Load OK: {kind} -> {args_cli.data}")
+        print(f"  data: {data.shape[0]} rows, {data.shape[1]} cols")
+        print(f"  windows: {windows.shape} (N, T, F)")
+        print(f"  features: {len(feature_names) if feature_names else f_in}")
+        sys.exit(0)
 
     # Split: train / val / test
     train_w, temp_w = train_test_split(
