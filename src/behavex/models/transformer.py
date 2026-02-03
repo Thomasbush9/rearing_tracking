@@ -148,6 +148,59 @@ class MaskedTemporalTransformer(nn.Module):
         return recon, latent, mask
 
 
+class MaskedPredictiveTemporalTransformer(MaskedTemporalTransformer):
+    """Masked transformer with multi-step-ahead prediction head. Returns (recon, latent, mask, pred_next)."""
+
+    def __init__(
+        self,
+        f_in: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dropout: float = 0.1,
+        mask_ratio: float = 0.15,
+        n_predict_steps: int = 3,
+    ):
+        super().__init__(
+            f_in=f_in,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dropout=dropout,
+            mask_ratio=mask_ratio,
+        )
+        self.n_predict_steps = n_predict_steps
+        self.prediction_head = nn.Linear(d_model, n_predict_steps * f_in)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        recon, latent, mask = super().forward(x, mask)
+        B, T, F = x.shape
+        K = self.n_predict_steps
+        pred_flat = self.prediction_head(latent)
+        pred_next = pred_flat.view(B, T, K, F)
+        return recon, latent, mask, pred_next
+
+
+def predictive_loss(
+    pred_next: torch.Tensor,
+    x: torch.Tensor,
+    n_predict_steps: int,
+) -> torch.Tensor:
+    """MSE on valid next-step predictions. pred_next (B,T,K,F), x (B,T,F). Only t in 0..T-K used."""
+    B, T, n_f = x.shape
+    K = n_predict_steps
+    if T <= K:
+        return pred_next.new_zeros(1).squeeze()
+    valid_len = T - K
+    pred_valid = pred_next[:, :valid_len, :, :]
+    target = torch.stack([x[:, 1 + k : 1 + k + valid_len, :] for k in range(K)], dim=2)
+    return F.mse_loss(pred_valid, target)
+
+
 def masked_reconstruction_loss(
     pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
