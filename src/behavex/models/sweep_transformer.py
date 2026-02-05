@@ -23,7 +23,7 @@ DEFAULT_SWEEP_CONFIG: dict[str, Any] = {
         "nhead": {"values": [2, 4]},
         "num_layers": {"values": [2, 4, 6]},
         "mask_ratio": {"values": [0.10, 0.15, 0.20]},
-        "unmasked_weight": {"values": [0.0, 0.3, 0.5]},
+        "unmasked_weight": {"values": [0.1, 0.3, 0.5]},
         "batch_size": {"values": [16, 32, 64]},
         "pred_loss_weight": {"values": [0.3, 0.5, 0.7]},
         "data": {"value": None},
@@ -57,6 +57,7 @@ def main() -> None:
     parser.add_argument("--entity", type=str, default=None, help="WandB entity")
     parser.add_argument("--data", type=str, default=None, help="Raw data path (overrides config)")
     parser.add_argument("--preprocessed-data", type=str, default=None, help="Preprocessed .npz path (faster; overrides config)")
+    parser.add_argument("--mmap", action="store_true", help="Load preprocessed .npz with memory-mapping (requires uncompressed file)")
     parser.add_argument("--name", type=str, default=None, help="Sweep name")
     args = parser.parse_args()
 
@@ -79,6 +80,7 @@ def main() -> None:
             sweep_config["parameters"] = {}
         sweep_config["parameters"]["preprocessed_data"] = {"value": args.preprocessed_data}
         sweep_config["parameters"]["data"] = {"value": None}
+        sweep_config["parameters"]["mmap"] = {"value": args.mmap}
     elif args.data:
         if "parameters" not in sweep_config:
             sweep_config["parameters"] = {}

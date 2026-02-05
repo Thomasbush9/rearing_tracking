@@ -101,8 +101,9 @@ def save_preprocessed_dataset(
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
     window_size: int = 128,
+    compressed: bool = True,
 ) -> None:
-    """Save preprocessed train/val/test windows to .npz for fast subsequent loading."""
+    """Save preprocessed train/val/test windows to .npz. Use compressed=False for mmap-compatible files."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     arrays = {
@@ -111,19 +112,22 @@ def save_preprocessed_dataset(
         "test_windows": test_windows,
     }
     meta = {"val_ratio": val_ratio, "test_ratio": test_ratio, "window_size": window_size}
-    np.savez_compressed(
-        path,
-        **arrays,
-        feature_names=np.array(feature_names, dtype=object) if feature_names else np.array([]),
-        **meta,
-    )
+    fn_arr = np.array(feature_names, dtype=object) if feature_names else np.array([])
+    if compressed:
+        np.savez_compressed(path, **arrays, feature_names=fn_arr, **meta)
+    else:
+        np.savez(path, **arrays, feature_names=fn_arr, **meta)
 
 
 def load_preprocessed_dataset(
     path: str | Path,
+    mmap_mode: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str] | None]:
-    """Load preprocessed train/val/test from .npz. Returns (train_w, val_w, test_w, feature_names)."""
-    data = np.load(path, allow_pickle=True)
+    """Load preprocessed train/val/test from .npz. Use mmap_mode='r' for uncompressed npz (no full load)."""
+    load_kw: dict = {"allow_pickle": True}
+    if mmap_mode is not None:
+        load_kw["mmap_mode"] = mmap_mode
+    data = np.load(path, **load_kw)
     train_w = data["train_windows"]
     val_w = data["val_windows"]
     test_w = data["test_windows"]
@@ -140,8 +144,9 @@ def prepare_and_save_dataset(
     window_size: int = 128,
     trim_before_dist_head: bool = True,
     start_times_path: str | Path | None = None,
+    compressed: bool = True,
 ) -> None:
-    """Load raw data, preprocess, split, and save. Run once to create dataset for fast training."""
+    """Load raw data, preprocess, split, and save. Use compressed=False for mmap-compatible files."""
     data = load_data_path(
         str(data_path),
         trim_before_dist_head=trim_before_dist_head,
@@ -152,7 +157,8 @@ def prepare_and_save_dataset(
     )
     train_w, val_w, test_w = temporal_train_val_test_split(windows, val_ratio, test_ratio)
     save_preprocessed_dataset(
-        out_path, train_w, val_w, test_w, feature_names, val_ratio, test_ratio, window_size
+        out_path, train_w, val_w, test_w, feature_names,
+        val_ratio, test_ratio, window_size, compressed=compressed,
     )
 
 
@@ -309,7 +315,7 @@ class MaskedTemporalTrainingArgs:
     patience: int = 5
     verbose: bool = False
     save_model: bool = True
-    save_path: str = field(default_factory=lambda: f"/Users/thomasbush/Downloads/models/masked_transformer_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    save_path: str = field(default_factory=lambda: str(Path("models") / f"masked_transformer_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"))
     eval_every_n_epochs: int = 1
     feature_names: Optional[list[str]] = None
     unmasked_weight: float = 0.3
@@ -876,9 +882,11 @@ def run_train(config: dict) -> float:
 
     # Prefer preprocessed .npz for fast loading
     load_path = preprocessed_path or (data_path if data_path and str(data_path).endswith(".npz") else None)
+    use_mmap = bool(cfg.get("mmap", False))
     if load_path:
         try:
-            train_w, val_w, test_w, feature_names = load_preprocessed_dataset(load_path)
+            mmap_mode = "r" if use_mmap else None
+            train_w, val_w, test_w, feature_names = load_preprocessed_dataset(load_path, mmap_mode=mmap_mode)
         except Exception as e:
             print(f"Load preprocessed failed: {e}. Falling back to raw data.")
             load_path = None
@@ -921,9 +929,14 @@ def run_train(config: dict) -> float:
     )
     pred_loss_weight = _scalar(cfg.get("pred_loss_weight"), 0.5, float) if n_predict_steps else 0.5
 
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     save_path = cfg.get("save_path")
     if not save_path:
-        save_path = f"/Users/thomasbush/Downloads/models/masked_transformer_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        output_dir = cfg.get("output_dir")
+        if output_dir:
+            save_path = str(Path(output_dir) / f"masked_transformer_{ts}")
+        else:
+            save_path = str(Path("models") / f"masked_transformer_{ts}")
 
     args = MaskedTemporalTrainingArgs(
         batch_size=_scalar(cfg.get("batch_size"), 32, int),
@@ -945,7 +958,7 @@ def run_train(config: dict) -> float:
         save_path=str(save_path),
         eval_every_n_epochs=_scalar(cfg.get("eval_every_n_epochs"), 1, int),
         feature_names=feature_names,
-        unmasked_weight=_scalar(cfg.get("unmasked_weight"), 0.3, float),
+        unmasked_weight=max(1e-6, _scalar(cfg.get("unmasked_weight"), 0.3, float)),
         n_predict_steps=n_predict_steps,
         pred_loss_weight=pred_loss_weight,
         checkpoint_every=_scalar(cfg.get("checkpoint_every"), 0, int),
@@ -972,7 +985,9 @@ if __name__ == "__main__":
     import argparse
     import sys
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default="/Users/thomasbush/Downloads/shared WithTWB/m001_s001_cricket.xlsx")
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config for single-run training (all params in file).")
+    parser.add_argument("--output-dir", type=str, default=None, help="Output directory for checkpoints/logs. With --config overrides config; without --config used as save_path.")
+    parser.add_argument("--data", default=None, help="Data path (file, dir, or .npz). With --config overrides config; without --config required unless using --preprocessed-data.")
     parser.add_argument("--val_ratio", type=float, default=0.15)
     parser.add_argument("--test_ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42, help="Random seed for split and training (if set before load).")
@@ -999,23 +1014,44 @@ if __name__ == "__main__":
     parser.add_argument("--preprocessed-data", type=str, default=None, help="Path to preprocessed .npz (skips raw load; faster).")
     parser.add_argument("--save-dataset", type=str, default=None, help="Save preprocessed data to .npz for future --preprocessed-data.")
     parser.add_argument("--save-dataset-only", action="store_true", help="Save preprocessed dataset and exit (no training).")
+    parser.add_argument("--no-compress", action="store_true", help="Save uncompressed .npz for mmap (larger file, fast load).")
+    parser.add_argument("--mmap", action="store_true", help="Load preprocessed .npz with memory-mapping (requires uncompressed file).")
     args_cli = parser.parse_args()
 
+    if args_cli.config:
+        import yaml
+        with open(args_cli.config) as f:
+            cfg = yaml.safe_load(f) or {}
+        if args_cli.data is not None:
+            cfg["data"] = args_cli.data
+        if args_cli.preprocessed_data is not None:
+            cfg["preprocessed_data"] = args_cli.preprocessed_data
+        if args_cli.output_dir is not None:
+            cfg["output_dir"] = args_cli.output_dir
+        best = run_train(cfg)
+        print(f"Best val loss: {best:.4f}")
+        sys.exit(0)
+
+    data_default = "/Users/thomasbush/Downloads/shared WithTWB/m001_s001_cricket.xlsx"
     torch.manual_seed(args_cli.seed)
     np.random.seed(args_cli.seed)
     random.seed(args_cli.seed)
 
     # Load: preprocessed .npz (fast) or raw data
+    data_path = args_cli.data if args_cli.data is not None else data_default
     if args_cli.preprocessed_data:
         try:
-            train_w, val_w, test_w, feature_names = load_preprocessed_dataset(args_cli.preprocessed_data)
+            mmap_mode = "r" if args_cli.mmap else None
+            train_w, val_w, test_w, feature_names = load_preprocessed_dataset(
+                args_cli.preprocessed_data, mmap_mode=mmap_mode
+            )
         except Exception as e:
             print(f"Load preprocessed failed: {e}", file=sys.stderr)
             sys.exit(1)
     else:
         try:
             data = load_data_path(
-                args_cli.data,
+                data_path,
                 trim_before_dist_head=not args_cli.full_file,
                 start_times_path=None if args_cli.full_file else args_cli.start_times,
             )
@@ -1024,13 +1060,13 @@ if __name__ == "__main__":
             if args_cli.test_loading:
                 print(f"Load failed: {e}")
                 sys.exit(1)
-            print(f"Could not load {args_cli.data}: {e}. Using dummy data.")
+            print(f"Could not load {data_path}: {e}. Using dummy data.")
             windows = np.random.randn(1000, 128, 24).astype(np.float32)
             feature_names = None
         if args_cli.test_loading:
-            path = Path(args_cli.data)
+            path = Path(data_path)
             kind = "file" if path.is_file() else "dir"
-            print(f"Load OK: {kind} -> {args_cli.data}")
+            print(f"Load OK: {kind} -> {data_path}")
             print(f"  data: {data.shape[0]} rows, {data.shape[1]} cols")
             print(f"  windows: {windows.shape} (N, T, F)")
             print(f"  features: {len(feature_names) if feature_names else windows.shape[-1]}")
@@ -1043,6 +1079,7 @@ if __name__ == "__main__":
             save_preprocessed_dataset(
                 out, train_w, val_w, test_w, feature_names,
                 args_cli.val_ratio, args_cli.test_ratio, 128,
+                compressed=not args_cli.no_compress,
             )
             print(f"Saved preprocessed dataset to {out}")
             if args_cli.save_dataset_only:
@@ -1052,6 +1089,10 @@ if __name__ == "__main__":
 
     n_predict_steps = args_cli.n_predict_steps if args_cli.model == "predictive" else None
     pred_loss_weight = args_cli.pred_loss_weight if args_cli.model == "predictive" else 0.5
+
+    save_path = args_cli.output_dir
+    if not save_path:
+        save_path = str(Path("models") / f"masked_transformer_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
     args = MaskedTemporalTrainingArgs(
         batch_size=32,
@@ -1069,6 +1110,7 @@ if __name__ == "__main__":
         pred_loss_weight=pred_loss_weight,
         checkpoint_every=args_cli.checkpoint_every,
         resume_from=args_cli.resume_from,
+        save_path=save_path,
         save_last=not args_cli.no_save_last,
         save_best=not args_cli.no_save_best,
         save_optimizer=not args_cli.no_save_optimizer,

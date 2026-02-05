@@ -216,10 +216,9 @@ def reconstruction_loss(
     mask: torch.Tensor,
     unmasked_weight: float = 0.0,
 ) -> torch.Tensor:
-    """MSE on masked; optional weighted MSE on unmasked for pass-through regularization."""
+    """MSE on masked; weighted MSE on unmasked for pass-through regularization. unmasked_weight clamped to avoid 0."""
+    unmasked_weight = max(1e-6, unmasked_weight)
     masked_loss = F.mse_loss(pred[mask], target[mask])
-    if unmasked_weight <= 0:
-        return masked_loss
     unmasked = ~mask
     unmasked_loss = F.mse_loss(pred[unmasked], target[unmasked])
     return masked_loss + unmasked_weight * unmasked_loss

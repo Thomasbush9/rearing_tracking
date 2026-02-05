@@ -72,6 +72,7 @@ class MaskedTemporalDataset(Dataset):
     """
     Dataset for masked temporal transformer pretraining.
     Returns windows only (no labels); target = input for reconstruction loss.
+    Uses lazy tensor conversion to avoid loading full data into GPU-ready tensors at init.
     """
 
     def __init__(self, X_windows: Union[np.ndarray, torch.Tensor]) -> None:
@@ -79,12 +80,18 @@ class MaskedTemporalDataset(Dataset):
         Args:
             X_windows: (num_samples, window_len, num_features) time series windows
         """
-        if not isinstance(X_windows, torch.Tensor):
-            X_windows = torch.from_numpy(np.asarray(X_windows)).float()
-        self.X = X_windows
+        if isinstance(X_windows, torch.Tensor):
+            self.X = X_windows
+            self._is_tensor = True
+        else:
+            self.X = X_windows  # keep as numpy/mmapped, no copy
+            self._is_tensor = False
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        return self.X[idx]
+        if self._is_tensor:
+            return self.X[idx].clone()
+        x = np.asarray(self.X[idx], dtype=np.float32)
+        return torch.from_numpy(x).clone()
 
     def __len__(self) -> int:
         return self.X.shape[0]
