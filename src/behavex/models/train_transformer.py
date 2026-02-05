@@ -854,7 +854,14 @@ def run_train(config: dict) -> float:
     # Optional: convert wandb config to plain dict for .get()
     cfg = dict(config) if hasattr(config, "items") else config
 
-    seed = int(cfg.get("seed", 42))
+    def _scalar(v, default, conv):
+        if v is None:
+            return conv(default)
+        if isinstance(v, (list, tuple)) and len(v) > 0:
+            v = v[0]
+        return conv(v)
+
+    seed = _scalar(cfg.get("seed"), 42, int)
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -863,9 +870,9 @@ def run_train(config: dict) -> float:
     data_path = cfg.get("data")
     full_file = bool(cfg.get("full_file", False))
     start_times = cfg.get("start_times")
-    val_ratio = float(cfg.get("val_ratio", 0.15))
-    test_ratio = float(cfg.get("test_ratio", 0.15))
-    window_size = int(cfg.get("window_size", 128))
+    val_ratio = _scalar(cfg.get("val_ratio"), 0.15, float)
+    test_ratio = _scalar(cfg.get("test_ratio"), 0.15, float)
+    window_size = _scalar(cfg.get("window_size"), 128, int)
 
     # Prefer preprocessed .npz for fast loading
     load_path = preprocessed_path or (data_path if data_path and str(data_path).endswith(".npz") else None)
@@ -907,40 +914,42 @@ def run_train(config: dict) -> float:
     f_in = int(train_w.shape[-1])
 
     model_type = cfg.get("model", "masked")
+    if isinstance(model_type, (list, tuple)):
+        model_type = model_type[0] if model_type else "masked"
     n_predict_steps = (
-        int(cfg.get("n_predict_steps", 3)) if model_type == "predictive" else None
+        _scalar(cfg.get("n_predict_steps"), 3, int) if model_type == "predictive" else None
     )
-    pred_loss_weight = float(cfg.get("pred_loss_weight", 0.5)) if n_predict_steps else 0.5
+    pred_loss_weight = _scalar(cfg.get("pred_loss_weight"), 0.5, float) if n_predict_steps else 0.5
 
     save_path = cfg.get("save_path")
     if not save_path:
         save_path = f"/Users/thomasbush/Downloads/models/masked_transformer_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     args = MaskedTemporalTrainingArgs(
-        batch_size=int(cfg.get("batch_size", 32)),
-        device=str(cfg.get("device", "mps")),
-        learning_rate=float(cfg.get("learning_rate", 1e-3)),
+        batch_size=_scalar(cfg.get("batch_size"), 32, int),
+        device=str(_scalar(cfg.get("device"), "mps", str)),
+        learning_rate=_scalar(cfg.get("learning_rate"), 1e-3, float),
         f_in=f_in,
         train_windows=train_w,
         val_windows=val_w,
         test_windows=test_w,
-        d_model=int(cfg.get("d_model", 64)),
-        nhead=int(cfg.get("nhead", 2)),
-        num_layers=int(cfg.get("num_layers", 4)),
-        mask_ratio=float(cfg.get("mask_ratio", 0.15)),
-        epochs=int(cfg.get("epochs", 25)),
-        weight_decay=float(cfg.get("weight_decay", 1e-5)),
-        patience=int(cfg.get("patience", 5)),
+        d_model=_scalar(cfg.get("d_model"), 64, int),
+        nhead=_scalar(cfg.get("nhead"), 2, int),
+        num_layers=_scalar(cfg.get("num_layers"), 4, int),
+        mask_ratio=_scalar(cfg.get("mask_ratio"), 0.15, float),
+        epochs=_scalar(cfg.get("epochs"), 25, int),
+        weight_decay=_scalar(cfg.get("weight_decay"), 1e-5, float),
+        patience=_scalar(cfg.get("patience"), 5, int),
         verbose=bool(cfg.get("verbose", False)),
         save_model=bool(cfg.get("save_model", True)),
         save_path=str(save_path),
-        eval_every_n_epochs=int(cfg.get("eval_every_n_epochs", 1)),
+        eval_every_n_epochs=_scalar(cfg.get("eval_every_n_epochs"), 1, int),
         feature_names=feature_names,
-        unmasked_weight=float(cfg.get("unmasked_weight", 0.3)),
+        unmasked_weight=_scalar(cfg.get("unmasked_weight"), 0.3, float),
         n_predict_steps=n_predict_steps,
         pred_loss_weight=pred_loss_weight,
-        checkpoint_every=int(cfg.get("checkpoint_every", 0)),
-        max_checkpoints_to_keep=int(cfg.get("max_checkpoints_to_keep", 1)),
+        checkpoint_every=_scalar(cfg.get("checkpoint_every"), 0, int),
+        max_checkpoints_to_keep=_scalar(cfg.get("max_checkpoints_to_keep"), 1, int),
         resume_from=cfg.get("resume_from"),
         save_last=bool(cfg.get("save_last", True)),
         save_best=bool(cfg.get("save_best", True)),
