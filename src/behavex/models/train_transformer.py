@@ -92,6 +92,70 @@ def temporal_train_val_test_split(
     )
 
 
+def save_preprocessed_dataset(
+    path: str | Path,
+    train_windows: np.ndarray,
+    val_windows: np.ndarray,
+    test_windows: np.ndarray,
+    feature_names: list[str] | None = None,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    window_size: int = 128,
+) -> None:
+    """Save preprocessed train/val/test windows to .npz for fast subsequent loading."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arrays = {
+        "train_windows": train_windows,
+        "val_windows": val_windows,
+        "test_windows": test_windows,
+    }
+    meta = {"val_ratio": val_ratio, "test_ratio": test_ratio, "window_size": window_size}
+    np.savez_compressed(
+        path,
+        **arrays,
+        feature_names=np.array(feature_names, dtype=object) if feature_names else np.array([]),
+        **meta,
+    )
+
+
+def load_preprocessed_dataset(
+    path: str | Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str] | None]:
+    """Load preprocessed train/val/test from .npz. Returns (train_w, val_w, test_w, feature_names)."""
+    data = np.load(path, allow_pickle=True)
+    train_w = data["train_windows"]
+    val_w = data["val_windows"]
+    test_w = data["test_windows"]
+    fn = data.get("feature_names")
+    feature_names = fn.tolist() if fn.size > 0 else None
+    return train_w, val_w, test_w, feature_names
+
+
+def prepare_and_save_dataset(
+    data_path: str | Path,
+    out_path: str | Path,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    window_size: int = 128,
+    trim_before_dist_head: bool = True,
+    start_times_path: str | Path | None = None,
+) -> None:
+    """Load raw data, preprocess, split, and save. Run once to create dataset for fast training."""
+    data = load_data_path(
+        str(data_path),
+        trim_before_dist_head=trim_before_dist_head,
+        start_times_path=start_times_path,
+    )
+    windows, feature_names = prepare_masked_transformer_data(
+        data, window_size=window_size, stride=1
+    )
+    train_w, val_w, test_w = temporal_train_val_test_split(windows, val_ratio, test_ratio)
+    save_preprocessed_dataset(
+        out_path, train_w, val_w, test_w, feature_names, val_ratio, test_ratio, window_size
+    )
+
+
 # Filename pattern: m{mouse}_s{session}_{cricket|object}.xlsx / .xls
 _SESSION_PATTERN = re.compile(r"^m\d+_s\d+_(cricket|object)\.(xlsx|xls)$", re.IGNORECASE)
 
@@ -252,6 +316,7 @@ class MaskedTemporalTrainingArgs:
     n_predict_steps: int | None = None
     pred_loss_weight: float = 0.5
     checkpoint_every: int = 0
+    max_checkpoints_to_keep: int = 1
     resume_from: str | None = None
     save_last: bool = True
     save_best: bool = True
@@ -489,10 +554,13 @@ class MaskedTemporalTrainer:
 
     def _init_wandb(self):
         args = self.training_args
-        if args.wandb_project is None:
-            return None
         if wandb is None:
             warnings.warn("wandb is not installed; skipping wandb logging.")
+            return None
+        # Use active run (e.g. from wandb sweep agent) when wandb_project not set
+        if args.wandb_project is None and getattr(wandb, "run", None) is not None:
+            return wandb.run
+        if args.wandb_project is None:
             return None
         init_kwargs = {
             "project": args.wandb_project,
@@ -634,6 +702,29 @@ class MaskedTemporalTrainer:
         except Exception as exc:
             warnings.warn(f"Failed to save checkpoint at {path}: {exc}")
 
+    def _clean_old_checkpoints(self) -> None:
+        """Remove older periodic checkpoints; keep only the max_checkpoints_to_keep most recent."""
+        max_keep = self.training_args.max_checkpoints_to_keep
+        if max_keep <= 0:
+            return
+        pattern = re.compile(r"^checkpoint_epoch(\d+)\.pt$")
+        candidates: list[tuple[int, Path]] = []
+        for p in self.checkpoints_dir.iterdir():
+            if not p.is_file():
+                continue
+            m = pattern.match(p.name)
+            if m:
+                candidates.append((int(m.group(1)), p))
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for _, p in candidates[max_keep:]:
+            if p.exists():
+                try:
+                    p.unlink()
+                    if self.training_args.verbose:
+                        print(f"[trainer] Removed old checkpoint {p.name}")
+                except OSError as exc:
+                    warnings.warn(f"Could not remove {p}: {exc}")
+
     def _load_checkpoint(self, path: Path) -> int:
         checkpoint = torch.load(path, map_location=self.device)
         if not isinstance(checkpoint, dict) or "model_state" not in checkpoint:
@@ -727,6 +818,7 @@ class MaskedTemporalTrainer:
             if args.save_model and args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
                 ckpt_name = self.checkpoints_dir / f"checkpoint_epoch{epoch}.pt"
                 self._save_checkpoint(ckpt_name, epoch, checkpoint_metric)
+                self._clean_old_checkpoints()
 
             if stop_training:
                 break
@@ -752,6 +844,119 @@ class MaskedTemporalTrainer:
             except Exception as exc:
                 warnings.warn(f"wandb finish failed: {exc}")
         return self.best_loss
+
+
+def run_train(config: dict) -> float:
+    """
+    Run masked transformer training from a config dict (e.g. from wandb.config).
+    Config keys map to MaskedTemporalTrainingArgs and data loading; see __main__ for defaults.
+    """
+    # Optional: convert wandb config to plain dict for .get()
+    cfg = dict(config) if hasattr(config, "items") else config
+
+    seed = int(cfg.get("seed", 42))
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    preprocessed_path = cfg.get("preprocessed_data")
+    data_path = cfg.get("data")
+    full_file = bool(cfg.get("full_file", False))
+    start_times = cfg.get("start_times")
+    val_ratio = float(cfg.get("val_ratio", 0.15))
+    test_ratio = float(cfg.get("test_ratio", 0.15))
+    window_size = int(cfg.get("window_size", 128))
+
+    # Prefer preprocessed .npz for fast loading
+    load_path = preprocessed_path or (data_path if data_path and str(data_path).endswith(".npz") else None)
+    if load_path:
+        try:
+            train_w, val_w, test_w, feature_names = load_preprocessed_dataset(load_path)
+        except Exception as e:
+            print(f"Load preprocessed failed: {e}. Falling back to raw data.")
+            load_path = None
+
+    if not load_path:
+        if data_path and not str(data_path).endswith(".npz"):
+            try:
+                data = load_data_path(
+                    data_path,
+                    trim_before_dist_head=not full_file,
+                    start_times_path=None if full_file else start_times,
+                )
+                windows, feature_names = prepare_masked_transformer_data(
+                    data, window_size=window_size, stride=1
+                )
+                train_w, val_w, test_w = temporal_train_val_test_split(
+                    windows, val_ratio, test_ratio
+                )
+            except Exception as e:
+                print(f"Load failed: {e}. Using dummy data.")
+                windows = np.random.randn(1000, window_size, 24).astype(np.float32)
+                feature_names = None
+                train_w, val_w, test_w = temporal_train_val_test_split(
+                    windows, val_ratio, test_ratio
+                )
+        else:
+            windows = np.random.randn(1000, window_size, 24).astype(np.float32)
+            feature_names = None
+            train_w, val_w, test_w = temporal_train_val_test_split(
+                windows, val_ratio, test_ratio
+            )
+
+    f_in = int(train_w.shape[-1])
+
+    model_type = cfg.get("model", "masked")
+    n_predict_steps = (
+        int(cfg.get("n_predict_steps", 3)) if model_type == "predictive" else None
+    )
+    pred_loss_weight = float(cfg.get("pred_loss_weight", 0.5)) if n_predict_steps else 0.5
+
+    save_path = cfg.get("save_path")
+    if not save_path:
+        save_path = f"/Users/thomasbush/Downloads/models/masked_transformer_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    args = MaskedTemporalTrainingArgs(
+        batch_size=int(cfg.get("batch_size", 32)),
+        device=str(cfg.get("device", "mps")),
+        learning_rate=float(cfg.get("learning_rate", 1e-3)),
+        f_in=f_in,
+        train_windows=train_w,
+        val_windows=val_w,
+        test_windows=test_w,
+        d_model=int(cfg.get("d_model", 64)),
+        nhead=int(cfg.get("nhead", 2)),
+        num_layers=int(cfg.get("num_layers", 4)),
+        mask_ratio=float(cfg.get("mask_ratio", 0.15)),
+        epochs=int(cfg.get("epochs", 25)),
+        weight_decay=float(cfg.get("weight_decay", 1e-5)),
+        patience=int(cfg.get("patience", 5)),
+        verbose=bool(cfg.get("verbose", False)),
+        save_model=bool(cfg.get("save_model", True)),
+        save_path=str(save_path),
+        eval_every_n_epochs=int(cfg.get("eval_every_n_epochs", 1)),
+        feature_names=feature_names,
+        unmasked_weight=float(cfg.get("unmasked_weight", 0.3)),
+        n_predict_steps=n_predict_steps,
+        pred_loss_weight=pred_loss_weight,
+        checkpoint_every=int(cfg.get("checkpoint_every", 0)),
+        max_checkpoints_to_keep=int(cfg.get("max_checkpoints_to_keep", 1)),
+        resume_from=cfg.get("resume_from"),
+        save_last=bool(cfg.get("save_last", True)),
+        save_best=bool(cfg.get("save_best", True)),
+        save_optimizer=bool(cfg.get("save_optimizer", True)),
+        save_rng_state=bool(cfg.get("save_rng_state", True)),
+        use_compile=bool(cfg.get("use_compile", False)),
+        compile_backend=cfg.get("compile_backend"),
+        compile_mode=cfg.get("compile_mode"),
+        wandb_project=cfg.get("wandb_project"),
+        wandb_run_name=cfg.get("wandb_run_name"),
+        wandb_tags=cfg.get("wandb_tags"),
+        wandb_mode=cfg.get("wandb_mode"),
+        wandb_entity=cfg.get("wandb_entity"),
+    )
+    trainer = MaskedTemporalTrainer(args)
+    return trainer.train()
 
 
 if __name__ == "__main__":
@@ -782,42 +987,59 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-tags", nargs="+", default=None, help="Optional list of W&B tags to attach to the run.")
     parser.add_argument("--wandb-mode", type=str, default=None, help="W&B mode: online, offline, disabled.")
     parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity (team/user) to log under.")
+    parser.add_argument("--preprocessed-data", type=str, default=None, help="Path to preprocessed .npz (skips raw load; faster).")
+    parser.add_argument("--save-dataset", type=str, default=None, help="Save preprocessed data to .npz for future --preprocessed-data.")
+    parser.add_argument("--save-dataset-only", action="store_true", help="Save preprocessed dataset and exit (no training).")
     args_cli = parser.parse_args()
 
     torch.manual_seed(args_cli.seed)
     np.random.seed(args_cli.seed)
     random.seed(args_cli.seed)
 
-    # Load and preprocess (single file or dir of m*_s*_cricket|object.xlsx)
-    try:
-        data = load_data_path(
-            args_cli.data,
-            trim_before_dist_head=not args_cli.full_file,
-            start_times_path=None if args_cli.full_file else args_cli.start_times,
-        )
-        windows, feature_names = prepare_masked_transformer_data(data, window_size=128, stride=1)
-    except Exception as e:
-        if args_cli.test_loading:
-            print(f"Load failed: {e}")
+    # Load: preprocessed .npz (fast) or raw data
+    if args_cli.preprocessed_data:
+        try:
+            train_w, val_w, test_w, feature_names = load_preprocessed_dataset(args_cli.preprocessed_data)
+        except Exception as e:
+            print(f"Load preprocessed failed: {e}", file=sys.stderr)
             sys.exit(1)
-        print(f"Could not load {args_cli.data}: {e}. Using dummy data.")
-        windows = np.random.randn(1000, 128, 24).astype(np.float32)
-        feature_names = None
-    f_in = windows.shape[-1]
+    else:
+        try:
+            data = load_data_path(
+                args_cli.data,
+                trim_before_dist_head=not args_cli.full_file,
+                start_times_path=None if args_cli.full_file else args_cli.start_times,
+            )
+            windows, feature_names = prepare_masked_transformer_data(data, window_size=128, stride=1)
+        except Exception as e:
+            if args_cli.test_loading:
+                print(f"Load failed: {e}")
+                sys.exit(1)
+            print(f"Could not load {args_cli.data}: {e}. Using dummy data.")
+            windows = np.random.randn(1000, 128, 24).astype(np.float32)
+            feature_names = None
+        if args_cli.test_loading:
+            path = Path(args_cli.data)
+            kind = "file" if path.is_file() else "dir"
+            print(f"Load OK: {kind} -> {args_cli.data}")
+            print(f"  data: {data.shape[0]} rows, {data.shape[1]} cols")
+            print(f"  windows: {windows.shape} (N, T, F)")
+            print(f"  features: {len(feature_names) if feature_names else windows.shape[-1]}")
+            sys.exit(0)
+        train_w, val_w, test_w = temporal_train_val_test_split(
+            windows, args_cli.val_ratio, args_cli.test_ratio
+        )
+        if args_cli.save_dataset or args_cli.save_dataset_only:
+            out = args_cli.save_dataset or "dataset_preprocessed.npz"
+            save_preprocessed_dataset(
+                out, train_w, val_w, test_w, feature_names,
+                args_cli.val_ratio, args_cli.test_ratio, 128,
+            )
+            print(f"Saved preprocessed dataset to {out}")
+            if args_cli.save_dataset_only:
+                sys.exit(0)
 
-    if args_cli.test_loading:
-        path = Path(args_cli.data)
-        kind = "file" if path.is_file() else "dir"
-        print(f"Load OK: {kind} -> {args_cli.data}")
-        print(f"  data: {data.shape[0]} rows, {data.shape[1]} cols")
-        print(f"  windows: {windows.shape} (N, T, F)")
-        print(f"  features: {len(feature_names) if feature_names else f_in}")
-        sys.exit(0)
-
-    # Temporal split: contiguous train / val / test (preserves temporal dependencies)
-    train_w, val_w, test_w = temporal_train_val_test_split(
-        windows, args_cli.val_ratio, args_cli.test_ratio
-    )
+    f_in = train_w.shape[-1]
 
     n_predict_steps = args_cli.n_predict_steps if args_cli.model == "predictive" else None
     pred_loss_weight = args_cli.pred_loss_weight if args_cli.model == "predictive" else 0.5
