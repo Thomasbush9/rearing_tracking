@@ -366,7 +366,7 @@ class MaskedTemporalTrainer:
                 total += batch_loss * X.size(0)
                 n += X.size(0)
         self.model.train()
-        return total / n if n else 0.0
+        return total / n if n else float("inf")
 
     def _plot_reconstruction(
         self,
@@ -378,6 +378,8 @@ class MaskedTemporalTrainer:
         tb_step: int | None = None,
     ) -> None:
         """Plot GT vs reconstruction for one batch. Fixed seed for comparable masks."""
+        if len(loader.dataset) == 0:
+            return
         self.model.eval()
         X = next(iter(loader)).to(self.device)
         B, T, _ = X.shape
@@ -681,9 +683,12 @@ class MaskedTemporalTrainer:
             final_epoch = epoch
             self.model.train()
             running_loss = 0.0
+            n_train = len(self.train_loader.dataset)
+            if n_train == 0:
+                raise ValueError("Train dataset is empty; cannot train.")
             for X in self.train_loader:
                 running_loss += self.learning_step(X) * X.size(0)
-            avg_train = running_loss / len(self.train_loader.dataset)
+            avg_train = running_loss / n_train
             self.train_losses.append(avg_train)
             self.writer.add_scalar("train/loss", avg_train, epoch)
             self._log_wandb({"train/loss": avg_train}, step=epoch)
@@ -756,7 +761,7 @@ if __name__ == "__main__":
     parser.add_argument("--data", default="/Users/thomasbush/Downloads/shared WithTWB/m001_s001_cricket.xlsx")
     parser.add_argument("--val_ratio", type=float, default=0.15)
     parser.add_argument("--test_ratio", type=float, default=0.15)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for split and training (if set before load).")
     parser.add_argument("--test_loading", action="store_true", help="Only load data and print summary; do not train.")
     parser.add_argument("--full_file", action="store_true", help="Load full file(s); no trim.")
     parser.add_argument("--start_times", type=str, default=None, help="Path to startTimes.xlsx (Experiment, CricketEntersTime, ObjectEntersTime). Default: data dir/startTimes.xlsx when loading a dir.")
@@ -778,6 +783,10 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-mode", type=str, default=None, help="W&B mode: online, offline, disabled.")
     parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity (team/user) to log under.")
     args_cli = parser.parse_args()
+
+    torch.manual_seed(args_cli.seed)
+    np.random.seed(args_cli.seed)
+    random.seed(args_cli.seed)
 
     # Load and preprocess (single file or dir of m*_s*_cricket|object.xlsx)
     try:
