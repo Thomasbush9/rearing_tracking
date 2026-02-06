@@ -45,6 +45,7 @@ def train_fn() -> None:
         raise RuntimeError("wandb is required for sweeps. Install with: pip install wandb")
     with wandb.init() as run:
         config = dict(wandb.config)
+        config["run_id"] = run.id  # unique dir per run so concurrent sweeps don't overwrite best.pt
         best_loss = run_train(config)
         wandb.log({"best/val_loss": best_loss})
 

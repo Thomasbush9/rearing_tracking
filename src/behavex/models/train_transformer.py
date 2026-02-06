@@ -512,24 +512,28 @@ class MaskedTemporalTrainer:
         plt.close(fig)
 
         if self.is_predictive and pred_next is not None:
-            k_max = min(self.training_args.n_predict_steps, 3)
+            k_max = self.training_args.n_predict_steps
             fig, pred_axes = plt.subplots(
                 n_plot, 1, figsize=(12, 1.5 * n_plot), sharex=True
             )
             if n_plot == 1:
                 pred_axes = [pred_axes]
             t = np.arange(gt.shape[0])
+            # Alpha ramps down for later steps so all lines stay visible
+            base_alpha = 0.9
             for i, ax in enumerate(pred_axes):
-                ax.plot(t, gt[:, i], label="GT", alpha=0.7)
+                ax.plot(t, gt[:, i], label="GT", alpha=0.9)
                 for k in range(k_max):
                     valid_len = gt.shape[0] - (k + 1)
                     if valid_len <= 0:
                         continue
+                    alpha = base_alpha * (1.0 - 0.5 * k / max(k_max, 1))
+                    alpha = max(0.25, alpha)
                     ax.plot(
                         t[:valid_len],
                         pred_next[:valid_len, k, i],
                         linestyle="--",
-                        alpha=0.8,
+                        alpha=alpha,
                         label=f"Pred t+{k+1}" if i == 0 else None,
                     )
                 ax.set_ylabel(names[i], fontsize=6)
@@ -929,7 +933,11 @@ def run_train(config: dict) -> float:
     )
     pred_loss_weight = _scalar(cfg.get("pred_loss_weight"), 0.5, float) if n_predict_steps else 0.5
 
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = cfg.get("run_id")
+    if run_id is not None:
+        ts = str(run_id)  # unique per sweep run
+    else:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{random.randint(0, 0xFFFF):04x}"
     save_path = cfg.get("save_path")
     if not save_path:
         output_dir = cfg.get("output_dir")
