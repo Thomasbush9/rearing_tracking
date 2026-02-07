@@ -90,7 +90,11 @@ class TemporalTransformer(nn.Module):
 
 
 class MaskedTemporalTransformer(nn.Module):
-    """Encoder for masked timestep prediction. Learns dynamics + latent for interpretation."""
+    """Encoder for masked timestep prediction. Learns dynamics + latent for interpretation.
+
+    Deterministic extraction: pass mask=torch.zeros(B,T,dtype=bool) for no-masking
+    to get consistent latents per timestep for downstream HMM analysis.
+    """
 
     def __init__(
         self,
@@ -100,11 +104,13 @@ class MaskedTemporalTransformer(nn.Module):
         num_layers: int,
         dropout: float = 0.1,
         mask_ratio: float = 0.15,
+        return_layer_mean: bool = False,
     ):
         super().__init__()
         self.f_in = f_in
         self.d_model = d_model
         self.mask_ratio = mask_ratio
+        self.return_layer_mean = return_layer_mean
         dim_feedforward = 2 * d_model
 
         self.embedding = nn.Linear(f_in, d_model)
@@ -128,6 +134,7 @@ class MaskedTemporalTransformer(nn.Module):
         Args:
             x: (B, T, F) time series
             mask: (B, T) bool, True = masked. If None, create random mask.
+                   Pass mask=torch.zeros(B,T,dtype=bool) for unmasked extraction.
         Returns:
             recon: (B, T, F) predicted values
             latent: (B, T, d_model) encoder hidden states for interpretation
@@ -143,7 +150,15 @@ class MaskedTemporalTransformer(nn.Module):
         emb = self.pos_encoder(emb)
         emb = self.norm(emb)
 
-        latent = self.encoder(emb)
+        if self.return_layer_mean:
+            layer_outs: list[torch.Tensor] = []
+            h = emb
+            for layer in self.encoder.layers:
+                h = layer(h)
+                layer_outs.append(h)
+            latent = torch.stack(layer_outs, dim=0).mean(dim=0)
+        else:
+            latent = self.encoder(emb)
         recon = self.reconstruction_head(latent)
         return recon, latent, mask
 
@@ -160,6 +175,7 @@ class MaskedPredictiveTemporalTransformer(MaskedTemporalTransformer):
         dropout: float = 0.1,
         mask_ratio: float = 0.15,
         n_predict_steps: int = 3,
+        return_layer_mean: bool = False,
     ):
         super().__init__(
             f_in=f_in,
@@ -168,6 +184,7 @@ class MaskedPredictiveTemporalTransformer(MaskedTemporalTransformer):
             num_layers=num_layers,
             dropout=dropout,
             mask_ratio=mask_ratio,
+            return_layer_mean=return_layer_mean,
         )
         self.n_predict_steps = n_predict_steps
         self.prediction_head = nn.Linear(d_model, n_predict_steps * f_in)
