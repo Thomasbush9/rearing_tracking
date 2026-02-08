@@ -22,13 +22,35 @@ from .train_transformer import (
 )
 
 
+def load_single_session_windows(
+    session_path: str | Path,
+    start_times_path: str | Path | None = None,
+    window_size: int = 128,
+    stride: int = 1,
+) -> tuple[np.ndarray, list[str] | None]:
+    """Load one session (cropped by start time if start_times_path given) and build windows.
+
+    Returns:
+        windows: (N, window_size, F) float32
+        feature_names: list or None
+    """
+    data = load_data_path(
+        str(session_path),
+        trim_before_dist_head=True,
+        start_times_path=Path(start_times_path) if start_times_path else None,
+    )
+    return prepare_masked_transformer_data(
+        data, window_size=window_size, stride=stride
+    )
+
+
 def _load_model_from_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
     return_layer_mean: bool = False,
 ):
     """Load model from checkpoint. Infers architecture from state_dict and training_params."""
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model_state = ckpt.get("model_state", ckpt)
     tp = ckpt.get("training_params", {})
 
