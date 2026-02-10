@@ -34,14 +34,15 @@ def load_single_session_windows(
         windows: (N, window_size, F) float32
         feature_names: list or None
     """
-    data = load_data_path(
+    data, _ = load_data_path(
         str(session_path),
         trim_before_dist_head=True,
         start_times_path=Path(start_times_path) if start_times_path else None,
     )
-    return prepare_masked_transformer_data(
+    windows, feature_names, _ = prepare_masked_transformer_data(
         data, window_size=window_size, stride=stride
     )
+    return windows, feature_names
 
 
 def _load_model_from_checkpoint(
@@ -58,7 +59,9 @@ def _load_model_from_checkpoint(
     nhead = tp.get("nhead", 2)
     num_layers = tp.get("num_layers", 4)
     mask_ratio = tp.get("mask_ratio", 0.15)
+    value_mask_ratio = tp.get("value_mask_ratio", 0.0)
     n_predict_steps = tp.get("n_predict_steps")
+    causal = tp.get("causal", False)
 
     f_in = model_state["embedding.weight"].shape[1]
 
@@ -69,8 +72,10 @@ def _load_model_from_checkpoint(
             nhead=nhead,
             num_layers=num_layers,
             mask_ratio=mask_ratio,
+            value_mask_ratio=value_mask_ratio,
             n_predict_steps=n_predict_steps,
             return_layer_mean=return_layer_mean,
+            causal=causal,
         )
     else:
         model = MaskedTemporalTransformer(
@@ -79,7 +84,9 @@ def _load_model_from_checkpoint(
             nhead=nhead,
             num_layers=num_layers,
             mask_ratio=mask_ratio,
+            value_mask_ratio=value_mask_ratio,
             return_layer_mean=return_layer_mean,
+            causal=causal,
         )
     model.load_state_dict(model_state, strict=True)
     return model.to(device)
@@ -146,18 +153,18 @@ def main():
     # Load data
     if args.preprocessed_data:
         mmap_mode = "r" if args.mmap else None
-        train_w, val_w, test_w, feature_names = load_preprocessed_dataset(
+        train_w, val_w, test_w, feature_names, _, _, _ = load_preprocessed_dataset(
             args.preprocessed_data, mmap_mode=mmap_mode
         )
         with np.load(args.preprocessed_data, allow_pickle=True) as npz:
             window_size = int(npz["window_size"]) if "window_size" in npz else args.window_size
     elif args.data:
-        data = load_data_path(
+        data, _ = load_data_path(
             args.data,
             trim_before_dist_head=not args.full_file,
             start_times_path=args.start_times,
         )
-        windows, feature_names = prepare_masked_transformer_data(
+        windows, feature_names, _ = prepare_masked_transformer_data(
             data, window_size=args.window_size, stride=1
         )
         train_w, val_w, test_w = temporal_train_val_test_split(

@@ -1,0 +1,9 @@
+Data summary
+-------------
+train_windows: 700
+val_windows:   150
+test_windows:  150
+window_size:   128
+n_features:   24
+event_mask:   False
+causal_attention: False

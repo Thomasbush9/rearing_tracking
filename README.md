@@ -206,6 +206,28 @@ project.process_sessions_for_training()
 project.train()
 ```
 
+### Transformer Training Script (Masked Modeling)
+
+For large-scale masked modeling experiments, use the standalone trainer at [`src/behavex/models/train_transformer.py`](src/behavex/models/train_transformer.py):
+
+```bash
+python src/behavex/models/train_transformer.py \
+  --data /path/to/m001_s001_cricket.xlsx \
+  --checkpoint-every 5 \
+  --resume-from /runs/masked_transformer_20260202/best.pt \
+  --use-compile \
+  --wandb-project rearing-transformer \
+  --wandb-tags long_run apples
+```
+
+Highlights:
+- `best.pt`, `last.pt`, and optional `checkpoints/checkpoint_epochN.pt` store model, optimizer, epoch, patience, and RNG state so `--resume-from` can recover full training context.
+- `--use-compile` (plus `--compile-backend` / `--compile-mode`) leverages `torch.compile` for faster throughput on PyTorch 2.x.
+- W&B logging is opt-in via `--wandb-project`; metrics, reconstruction plots, and config sync automatically (install with `pip install wandb`). Use `--wandb-mode offline` for air-gapped runs.
+- TensorBoard logging remains enabled inside each run directory.
+
+Run `python src/behavex/models/train_transformer.py --help` for the full list of arguments.
+
 ---
 
 ### 8. Run Predictions

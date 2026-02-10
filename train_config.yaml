@@ -1,0 +1,71 @@
+# Single-run training config for masked temporal transformer.
+# Usage: python -m behavex.models.train_transformer --config train_config.yaml
+# Override paths: --config train_config.yaml --data /path/to/data --output-dir ./runs/exp1
+# For sweeps use sweep_config.yaml and: python -m behavex.models.sweep_transformer --config sweep_config.yaml --data /path
+
+# --- Data ---
+data: /Users/thomasbush/Downloads/shared WithTWB/m001_s001_cricket.xlsx  # path to file, dir, or .npz (override with --data)
+preprocessed_data: null  # path to .npz for fast load (override with --preprocessed-data)
+full_file: true  # load full file(s); no trim
+start_times: /Users/thomasbush/Downloads/shared WithTWB/startTimes.xlsx  # path to startTimes.xlsx
+use_event_mask: true  # when full_file and start_times, mask loss on pre-event positions (set false to disable)
+angular_cols: null  # list of angular feature names for sin/cos; null = use extended default (facing_angle, rel_bearing, rel_angle_target)
+drop_cols: [height]  # columns to drop before processing (e.g. keep only height_scaled, drop raw height)
+val_ratio: 0.15
+test_ratio: 0.15
+window_size: 128
+mmap: false  # memory-map preprocessed .npz (requires uncompressed)
+
+# --- Output ---
+output_dir: /Users/thomasbush/Downloads/models/  # base dir; run dir will be output_dir/masked_transformer_YYYYMMDD_HHMMSS
+# save_path: null  # optional: exact path (overrides output_dir)
+
+# --- Model ---
+model: predictive  # masked | predictive
+n_predict_steps: 3  # for predictive only
+pred_loss_weight: 0.5  # for predictive only
+causal: true  # true = causal attention (mask future); false = bidirectional (default)
+
+# --- Training ---
+batch_size: 32
+device: mps  # cuda, cpu, mps
+learning_rate: 0.001
+d_model: 64
+nhead: 2
+num_layers: 4
+# Full-timestep masking: 5-10% when value masking on (e.g. 0.08); else often 0.15
+timestep_mask_ratio: 0.08
+# value_mask_ratio > 0 enables per-feature masking (25-35%); 0 = timestep-only
+value_mask_ratio: 0.3
+mask_ratio: 0.15  # fallback if timestep_mask_ratio not set
+unmasked_weight: 0.3
+epochs: 25
+weight_decay: 0.00001
+patience: 5
+verbose: true
+save_model: true
+eval_every_n_epochs: 1
+
+# --- Checkpoints ---
+checkpoint_every: 0  # save extra checkpoint every N epochs (0 = off)
+max_checkpoints_to_keep: 1
+resume_from: null
+save_last: true
+save_best: true
+save_optimizer: true
+save_rng_state: true
+
+# --- Optional: torch.compile ---
+use_compile: false
+compile_backend: inductor
+compile_mode: null
+
+# --- Optional: Weights & Biases ---
+wandb_project: null
+wandb_run_name: null
+wandb_tags: null
+wandb_mode: null
+wandb_entity: null
+
+# --- Misc ---
+seed: 42

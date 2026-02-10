@@ -58,6 +58,35 @@ def create_timestep_mask(
     return mask
 
 
+def create_value_mask(
+    batch_size: int,
+    seq_len: int,
+    num_features: int,
+    value_mask_ratio: float,
+    device: torch.device,
+    exclude_timestep_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """(B, T, F) bool, True = value masked. At each (b,t) where not excluded, mask ~value_mask_ratio of features.
+    When exclude_timestep_mask (B, T) is given, only (b,t) with exclude_timestep_mask[b,t]==False get value masking."""
+    n_value = max(1, int(num_features * value_mask_ratio))
+    value_mask = torch.zeros(batch_size, seq_len, num_features, dtype=torch.bool, device=device)
+    for b in range(batch_size):
+        for t in range(seq_len):
+            if exclude_timestep_mask is not None and exclude_timestep_mask[b, t]:
+                continue
+            idx = torch.randperm(num_features, device=device)[:n_value]
+            value_mask[b, t, idx] = True
+    return value_mask
+
+
+def get_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+    """(T, T) additive mask for causal attention: position i cannot attend to j when j > i. 0 allowed, -inf masked."""
+    return torch.triu(
+        torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=torch.float32),
+        diagonal=1,
+    )
+
+
 class TemporalTransformer(nn.Module):
 
     def __init__(self, f_in:int, d_model:int, nhead:int, num_layers:int, dropout:float=0.1, output_size:int=1):
@@ -104,13 +133,17 @@ class MaskedTemporalTransformer(nn.Module):
         num_layers: int,
         dropout: float = 0.1,
         mask_ratio: float = 0.15,
+        value_mask_ratio: float = 0.0,
         return_layer_mean: bool = False,
+        causal: bool = False,
     ):
         super().__init__()
         self.f_in = f_in
         self.d_model = d_model
         self.mask_ratio = mask_ratio
+        self.value_mask_ratio = value_mask_ratio
         self.return_layer_mean = return_layer_mean
+        self.causal = causal
         dim_feedforward = 2 * d_model
 
         self.embedding = nn.Linear(f_in, d_model)
@@ -129,38 +162,47 @@ class MaskedTemporalTransformer(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Args:
             x: (B, T, F) time series
-            mask: (B, T) bool, True = masked. If None, create random mask.
-                   Pass mask=torch.zeros(B,T,dtype=bool) for unmasked extraction.
+            mask: (B, T) bool, True = timestep masked. If None, create random timestep mask.
         Returns:
-            recon: (B, T, F) predicted values
-            latent: (B, T, d_model) encoder hidden states for interpretation
-            mask: (B, T) bool, used mask (for loss)
+            recon: (B, T, F)
+            latent: (B, T, d_model)
+            timestep_mask: (B, T) bool
+            value_mask: (B, T, F) bool or None when value_mask_ratio=0
         """
         B, T, F = x.shape
         if mask is None:
-            mask = create_timestep_mask(B, T, self.mask_ratio, x.device)
+            timestep_mask = create_timestep_mask(B, T, self.mask_ratio, x.device)
+        else:
+            timestep_mask = mask
 
-        # Embed and substitute mask tokens
+        value_mask: torch.Tensor | None = None
+        if self.value_mask_ratio > 0:
+            value_mask = create_value_mask(
+                B, T, F, self.value_mask_ratio, x.device, exclude_timestep_mask=timestep_mask
+            )
+            x = x.masked_fill(value_mask, 0.0)
+
         emb = self.embedding(x)
-        emb = emb + (mask.unsqueeze(-1) * (self.mask_token - emb))
+        emb = emb + (timestep_mask.unsqueeze(-1) * (self.mask_token - emb))
         emb = self.pos_encoder(emb)
         emb = self.norm(emb)
 
+        src_mask = get_causal_mask(T, emb.device) if self.causal else None
         if self.return_layer_mean:
             layer_outs: list[torch.Tensor] = []
             h = emb
             for layer in self.encoder.layers:
-                h = layer(h)
+                h = layer(h, src_mask=src_mask)
                 layer_outs.append(h)
             latent = torch.stack(layer_outs, dim=0).mean(dim=0)
         else:
-            latent = self.encoder(emb)
+            latent = self.encoder(emb, mask=src_mask)
         recon = self.reconstruction_head(latent)
-        return recon, latent, mask
+        return recon, latent, timestep_mask, value_mask
 
 
 class MaskedPredictiveTemporalTransformer(MaskedTemporalTransformer):
@@ -174,8 +216,10 @@ class MaskedPredictiveTemporalTransformer(MaskedTemporalTransformer):
         num_layers: int,
         dropout: float = 0.1,
         mask_ratio: float = 0.15,
+        value_mask_ratio: float = 0.0,
         n_predict_steps: int = 3,
         return_layer_mean: bool = False,
+        causal: bool = False,
     ):
         super().__init__(
             f_in=f_in,
@@ -184,7 +228,9 @@ class MaskedPredictiveTemporalTransformer(MaskedTemporalTransformer):
             num_layers=num_layers,
             dropout=dropout,
             mask_ratio=mask_ratio,
+            value_mask_ratio=value_mask_ratio,
             return_layer_mean=return_layer_mean,
+            causal=causal,
         )
         self.n_predict_steps = n_predict_steps
         self.prediction_head = nn.Linear(d_model, n_predict_steps * f_in)
@@ -193,21 +239,23 @@ class MaskedPredictiveTemporalTransformer(MaskedTemporalTransformer):
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        recon, latent, mask = super().forward(x, mask)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        recon, latent, timestep_mask, value_mask = super().forward(x, mask)
         B, T, F = x.shape
         K = self.n_predict_steps
         pred_flat = self.prediction_head(latent)
         pred_next = pred_flat.view(B, T, K, F)
-        return recon, latent, mask, pred_next
+        return recon, latent, timestep_mask, value_mask, pred_next
 
 
 def predictive_loss(
     pred_next: torch.Tensor,
     x: torch.Tensor,
     n_predict_steps: int,
+    valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """MSE on valid next-step predictions. pred_next (B,T,K,F), x (B,T,F). Only t in 0..T-K used."""
+    """MSE on valid next-step predictions. pred_next (B,T,K,F), x (B,T,F). Only t in 0..T-K used.
+    If valid_mask (B,T) is given, only positions where valid_mask is True contribute."""
     B, T, n_f = x.shape
     K = n_predict_steps
     if T <= K:
@@ -215,7 +263,17 @@ def predictive_loss(
     valid_len = T - K
     pred_valid = pred_next[:, :valid_len, :, :]
     target = torch.stack([x[:, 1 + k : 1 + k + valid_len, :] for k in range(K)], dim=2)
-    return F.mse_loss(pred_valid, target)
+    if valid_mask is None:
+        return F.mse_loss(pred_valid, target)
+    # (B, valid_len) for pred pos; for each k, target at t+1+k: (B, valid_len)
+    pred_pos_valid = valid_mask[:, :valid_len].unsqueeze(2).unsqueeze(3)
+    target_pos_valid = torch.stack(
+        [valid_mask[:, 1 + k : 1 + k + valid_len] for k in range(K)], dim=2
+    ).unsqueeze(3)
+    valid_btk = (pred_pos_valid & target_pos_valid).squeeze(3)
+    if not valid_btk.any():
+        return pred_next.new_zeros(1).squeeze()
+    return F.mse_loss(pred_valid[valid_btk], target[valid_btk])
 
 
 def masked_reconstruction_loss(
@@ -227,17 +285,44 @@ def masked_reconstruction_loss(
     return F.mse_loss(pred_m, target_m)
 
 
+def value_reconstruction_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    value_mask: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """MSE on value-masked (b,t,f) positions. value_mask (B,T,F), optional valid_mask (B,T)."""
+    if valid_mask is not None:
+        value_mask = value_mask & valid_mask.unsqueeze(2)
+    if not value_mask.any():
+        return pred.new_zeros(1).squeeze()
+    return F.mse_loss(pred[value_mask], target[value_mask])
+
+
 def reconstruction_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
     unmasked_weight: float = 0.0,
+    valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """MSE on masked; weighted MSE on unmasked for pass-through regularization. unmasked_weight clamped to avoid 0."""
+    """MSE on masked; weighted MSE on unmasked for pass-through regularization. unmasked_weight clamped to avoid 0.
+    If valid_mask (B,T) is given, only positions where valid_mask is True contribute."""
     unmasked_weight = max(1e-6, unmasked_weight)
-    masked_loss = F.mse_loss(pred[mask], target[mask])
-    unmasked = ~mask
-    unmasked_loss = F.mse_loss(pred[unmasked], target[unmasked])
+    if valid_mask is not None:
+        masked_pos = mask & valid_mask
+        unmasked_pos = ~mask & valid_mask
+    else:
+        masked_pos = mask
+        unmasked_pos = ~mask
+    if masked_pos.any():
+        masked_loss = F.mse_loss(pred[masked_pos], target[masked_pos])
+    else:
+        masked_loss = pred.new_zeros(1).squeeze()
+    if unmasked_pos.any():
+        unmasked_loss = F.mse_loss(pred[unmasked_pos], target[unmasked_pos])
+    else:
+        unmasked_loss = pred.new_zeros(1).squeeze()
     return masked_loss + unmasked_weight * unmasked_loss
 
 
@@ -249,6 +334,6 @@ if __name__ == "__main__":
 
     # Masked pretraining example
     model = MaskedTemporalTransformer(f_in=24, d_model=64, nhead=2, num_layers=4, mask_ratio=0.15)
-    recon, latent, mask = model(x)
-    loss = masked_reconstruction_loss(recon, x, mask)
+    recon, latent, timestep_mask, value_mask = model(x)
+    loss = masked_reconstruction_loss(recon, x, timestep_mask)
     print("Recon:", recon.shape, "Latent:", latent.shape, "Loss:", loss.item())

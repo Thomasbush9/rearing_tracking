@@ -1,0 +1,44 @@
+# Example wandb sweep config for masked transformer fine-tuning
+# Usage: python -m behavex.models.sweep_transformer --config sweep_config.yaml --data /path/to/data --count 20
+
+method: bayes
+metric:
+  name: val/loss
+  goal: minimize
+parameters:
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.01
+  d_model:
+    values: [32, 64, 128]
+  nhead:
+    values: [2, 4]
+  num_layers:
+    values: [2, 4, 6]
+  mask_ratio:
+    values: [0.10, 0.15, 0.20]
+  unmasked_weight:
+    values: [0.1, 0.3, 0.5]
+  batch_size:
+    values: [16, 32, 64]
+  pred_loss_weight:
+    values: [0.3, 0.5, 0.7]
+  data:
+    value: null  # override with --data
+  val_ratio:
+    value: 0.15
+  test_ratio:
+    value: 0.15
+  epochs:
+    value: 25
+  patience:
+    value: 5
+  device:
+    value: mps
+  model:
+    value: predictive
+  n_predict_steps:
+    value: 3
+  seed:
+    value: 42
