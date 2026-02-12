@@ -37,8 +37,16 @@ def normalize_feature(x: np.ndarray) -> np.ndarray:
 
 def make_windows(X: np.ndarray, window_size: int, stride: int = 1) -> np.ndarray:
     """Create sliding windows. X: (T, F) -> (N, window_size, F)."""
-    windows = [X[i : i + window_size] for i in range(0, len(X) - window_size + 1, stride)]
-    return np.stack(windows).astype(np.float32)
+    X = np.ascontiguousarray(X, dtype=np.float32)
+    T, F = X.shape
+    n_windows = (T - window_size) // stride + 1
+    byte_stride = X.strides  # (T-stride bytes, F-stride bytes)
+    windows = np.lib.stride_tricks.as_strided(
+        X,
+        shape=(n_windows, window_size, F),
+        strides=(byte_stride[0] * stride, byte_stride[0], byte_stride[1]),
+    )
+    return np.ascontiguousarray(windows)
 
 
 def _default_angular_cols() -> list[str]:
@@ -441,21 +449,30 @@ class MaskedTemporalTrainer:
                 causal=training_args.causal,
             ).to(self.device)
         self._has_event_mask = training_args.train_event_mask is not None
+        _use_cuda = self.device.type == "cuda"
+        _loader_kwargs = dict(
+            pin_memory=_use_cuda,
+            num_workers=4 if _use_cuda else 0,
+            persistent_workers=_use_cuda,
+        )
         self.train_loader = DataLoader(
             MaskedTemporalDataset(training_args.train_windows, event_masks=training_args.train_event_mask),
             batch_size=training_args.batch_size,
             shuffle=True,
+            **_loader_kwargs,
         )
         self.val_loader = DataLoader(
             MaskedTemporalDataset(training_args.val_windows, event_masks=training_args.val_event_mask),
             batch_size=training_args.batch_size,
             shuffle=False,
+            **_loader_kwargs,
         )
         self.test_loader = (
             DataLoader(
                 MaskedTemporalDataset(training_args.test_windows, event_masks=training_args.test_event_mask),
                 batch_size=training_args.batch_size,
                 shuffle=False,
+                **_loader_kwargs,
             )
             if training_args.test_windows is not None
             else None

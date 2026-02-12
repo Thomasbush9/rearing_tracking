@@ -87,26 +87,23 @@ class MaskedTemporalDataset(Dataset):
             event_masks: optional (num_samples, window_len) bool; when set, __getitem__ returns (X, event_mask)
         """
         if isinstance(X_windows, torch.Tensor):
-            self.X = X_windows
-            self._is_tensor = True
+            self.X = X_windows.contiguous()
         else:
-            self.X = X_windows  # keep as numpy/mmapped, no copy
-            self._is_tensor = False
-        self.event_masks = event_masks
-        if event_masks is not None and event_masks.shape[0] != X_windows.shape[0]:
-            raise ValueError("event_masks length must match X_windows length")
+            self.X = torch.from_numpy(np.ascontiguousarray(X_windows, dtype=np.float32))
+        if event_masks is not None:
+            if event_masks.shape[0] != X_windows.shape[0]:
+                raise ValueError("event_masks length must match X_windows length")
+            if isinstance(event_masks, torch.Tensor):
+                self.event_masks = event_masks.contiguous()
+            else:
+                self.event_masks = torch.from_numpy(np.ascontiguousarray(event_masks, dtype=bool))
+        else:
+            self.event_masks = None
 
     def __getitem__(self, idx: int) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self._is_tensor:
-            x = self.X[idx].clone()
-        else:
-            x = torch.from_numpy(np.asarray(self.X[idx], dtype=np.float32)).clone()
+        x = self.X[idx]
         if self.event_masks is not None:
-            if isinstance(self.event_masks, torch.Tensor):
-                em = self.event_masks[idx].clone()
-            else:
-                em = torch.from_numpy(np.asarray(self.event_masks[idx], dtype=bool))
-            return x, em
+            return x, self.event_masks[idx]
         return x
 
     def __len__(self) -> int:
