@@ -51,10 +51,10 @@ def create_timestep_mask(
 ) -> torch.Tensor:
     """Random mask over timesteps. Returns bool mask True = masked (predict)."""
     n_mask = max(1, int(seq_len * mask_ratio))
+    noise = torch.rand(batch_size, seq_len, device=device)
+    _, indices = noise.topk(n_mask, dim=1)
     mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
-    for i in range(batch_size):
-        idx = torch.randperm(seq_len, device=device)[:n_mask]
-        mask[i, idx] = True
+    mask.scatter_(1, indices, True)
     return mask
 
 
@@ -69,13 +69,12 @@ def create_value_mask(
     """(B, T, F) bool, True = value masked. At each (b,t) where not excluded, mask ~value_mask_ratio of features.
     When exclude_timestep_mask (B, T) is given, only (b,t) with exclude_timestep_mask[b,t]==False get value masking."""
     n_value = max(1, int(num_features * value_mask_ratio))
+    noise = torch.rand(batch_size, seq_len, num_features, device=device)
+    _, indices = noise.topk(n_value, dim=2)
     value_mask = torch.zeros(batch_size, seq_len, num_features, dtype=torch.bool, device=device)
-    for b in range(batch_size):
-        for t in range(seq_len):
-            if exclude_timestep_mask is not None and exclude_timestep_mask[b, t]:
-                continue
-            idx = torch.randperm(num_features, device=device)[:n_value]
-            value_mask[b, t, idx] = True
+    value_mask.scatter_(2, indices, True)
+    if exclude_timestep_mask is not None:
+        value_mask[exclude_timestep_mask] = False
     return value_mask
 
 
