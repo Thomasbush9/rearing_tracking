@@ -10,42 +10,6 @@ if TYPE_CHECKING:
     from behavex.models.transformer import MaskedTemporalTransformer
 
 
-def _encoder_forward_with_attention(
-    encoder: nn.TransformerEncoder,
-    src: torch.Tensor,
-    *,
-    average_attn_weights: bool = True,
-) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """Run encoder layer-by-layer, calling self_attn with need_weights=True.
-
-    Matches the standard TransformerEncoder forward (no encoder-level norm).
-    Returns (output, list of attention tensors per layer).
-    Each attention tensor: (B, T, T) if average_attn_weights else (B, nhead, T, T).
-    """
-    attention_list: list[torch.Tensor] = []
-    output = src
-    for layer in encoder.layers:
-        # Self-attention with weights
-        attn_out, attn_weights = layer.self_attn(
-            output,
-            output,
-            output,
-            need_weights=True,
-            average_attn_weights=average_attn_weights,
-        )
-        if attn_weights is not None:
-            attention_list.append(attn_weights.detach())
-        output = output + layer.dropout1(attn_out)
-        output = layer.norm1(output)
-        output = output + layer.dropout2(
-            layer.linear2(layer.activation(layer.linear1(output)))
-        )
-        output = layer.norm2(output)
-    if encoder.norm is not None:
-        output = encoder.norm(output)
-    return output, attention_list
-
-
 def forward_with_attention(
     model: "MaskedTemporalTransformer",
     x: torch.Tensor,
@@ -55,8 +19,8 @@ def forward_with_attention(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
     """Full forward pass returning recon, latent, mask, and per-layer attention.
 
-    Uses the same embedding + mask + RoPE + norm as the model, then runs the
-    encoder with need_weights=True per layer. Output latent matches model(x)[1].
+    Replicates the model's embedding + mask + encoder logic, but runs each
+    RoPETransformerEncoderLayer with need_weights=True to capture attention maps.
 
     Args:
         model: MaskedTemporalTransformer or MaskedPredictiveTemporalTransformer.
@@ -76,37 +40,29 @@ def forward_with_attention(
 
     emb = model.embedding(x)
     emb = emb + (mask.unsqueeze(-1) * (model.mask_token - emb))
-    emb = model.pos_encoder(emb)
-    emb = model.norm(emb)
+
+    attention_per_layer: list[torch.Tensor] = []
 
     if model.return_layer_mean:
-        # Same as in transformer: manual layer loop, then mean
         layer_outs: list[torch.Tensor] = []
-        attn_all: list[torch.Tensor] = []
         h = emb
-        for layer in model.encoder.layers:
-            attn_out, attn_weights = layer.self_attn(
-                h, h, h,
-                need_weights=True,
-                average_attn_weights=average_attn_weights,
-            )
+        for layer in model.layers:
+            h, attn_weights = layer(h, is_causal=model.causal, need_weights=True)
             if attn_weights is not None:
-                attn_all.append(attn_weights.detach())
-            h = h + layer.dropout1(attn_out)
-            h = layer.norm1(h)
-            h = h + layer.dropout2(
-                layer.linear2(layer.activation(layer.linear1(h)))
-            )
-            h = layer.norm2(h)
+                if average_attn_weights:
+                    attn_weights = attn_weights.mean(dim=1)  # (B, H, T, T) -> (B, T, T)
+                attention_per_layer.append(attn_weights)
             layer_outs.append(h)
-        latent = torch.stack(layer_outs, dim=0).mean(dim=0)
-        if model.encoder.norm is not None:
-            latent = model.encoder.norm(latent)
-        attention_per_layer = attn_all
+        latent = model.norm(torch.stack(layer_outs, dim=0).mean(dim=0))
     else:
-        latent, attention_per_layer = _encoder_forward_with_attention(
-            model.encoder, emb, average_attn_weights=average_attn_weights
-        )
+        h = emb
+        for layer in model.layers:
+            h, attn_weights = layer(h, is_causal=model.causal, need_weights=True)
+            if attn_weights is not None:
+                if average_attn_weights:
+                    attn_weights = attn_weights.mean(dim=1)
+                attention_per_layer.append(attn_weights)
+        latent = model.norm(h)
 
     recon = model.reconstruction_head(latent)
     return recon, latent, mask, attention_per_layer

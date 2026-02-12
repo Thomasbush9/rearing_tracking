@@ -1,4 +1,4 @@
-import torch 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -16,7 +16,7 @@ class RotaryPositionalEmbeddings(nn.Module):
     def __init__(self, d:int, base:int=10_000):
 
         super().__init__()
-        self.base = base 
+        self.base = base
         self.d = d
         self.cos_cached = None
         self.sin_cached = None
@@ -42,8 +42,93 @@ class RotaryPositionalEmbeddings(nn.Module):
         x_rope = (x * cos) + (neg_half * sin)
         return x_rope
     def _neg_half(self, x:torch.Tensor):
-        d_2 = self.d //2 
+        d_2 = self.d //2
         return torch.cat([-x[..., d_2:], x[...,  :d_2]], dim=-1) # [x_1, x_2,...x_d] -> [-x_d/2, ... -x_d, x_1, ... x_d/2]
+
+
+class RoPEMultiHeadAttention(nn.Module):
+    """Multi-head attention with Rotary Position Embeddings applied to Q and K only."""
+
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0):
+        super().__init__()
+        assert d_model % nhead == 0
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.d_model = d_model
+        self.W_qkv = nn.Linear(d_model, 3 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_dropout = dropout
+        self.rope = RotaryPositionalEmbeddings(self.head_dim)
+
+    def forward(
+        self, x: torch.Tensor, is_causal: bool = False, need_weights: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        B, T, D = x.shape
+        qkv = self.W_qkv(x).reshape(B, T, 3, self.nhead, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, T, Dh)
+        Q, K, V = qkv.unbind(0)  # each (B, H, T, Dh)
+
+        # Apply RoPE to Q and K per head
+        Q = self._apply_rope(Q)
+        K = self._apply_rope(K)
+
+        if need_weights:
+            # Manual attention to capture weights (for inspection)
+            scale = self.head_dim ** -0.5
+            attn_scores = (Q @ K.transpose(-2, -1)) * scale  # (B, H, T, T)
+            if is_causal:
+                causal = torch.triu(
+                    torch.full((T, T), float("-inf"), device=x.device, dtype=attn_scores.dtype),
+                    diagonal=1,
+                )
+                attn_scores = attn_scores + causal
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            drop_weights = F.dropout(attn_weights, p=self.attn_dropout, training=self.training)
+            out = drop_weights @ V
+            out = out.transpose(1, 2).contiguous().reshape(B, T, D)
+            return self.out_proj(out), attn_weights.detach()
+
+        # Fast path: scaled_dot_product_attention (Flash Attention when available)
+        out = F.scaled_dot_product_attention(
+            Q, K, V,
+            is_causal=is_causal,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+        )
+        out = out.transpose(1, 2).contiguous().reshape(B, T, D)
+        return self.out_proj(out), None
+
+    def _apply_rope(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RoPE. x: (B, H, T, Dh) -> merge B,H for RoPE -> reshape back."""
+        B, H, T, Dh = x.shape
+        return self.rope(x.reshape(B * H, T, Dh)).reshape(B, H, T, Dh)
+
+
+class RoPETransformerEncoderLayer(nn.Module):
+    """Pre-norm transformer encoder layer with RoPE applied inside attention."""
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float = 0.1):
+        super().__init__()
+        self.self_attn = RoPEMultiHeadAttention(d_model, nhead, dropout)
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self, x: torch.Tensor, is_causal: bool = False, need_weights: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None] | torch.Tensor:
+        normed = self.norm1(x)
+        attn_out, attn_weights = self.self_attn(normed, is_causal=is_causal, need_weights=need_weights)
+        x = x + attn_out
+        x = x + self.ffn(self.norm2(x))
+        if need_weights:
+            return x, attn_weights
+        return x
 
 
 def create_timestep_mask(
@@ -78,14 +163,6 @@ def create_value_mask(
     return value_mask
 
 
-def get_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
-    """(T, T) additive mask for causal attention: position i cannot attend to j when j > i. 0 allowed, -inf masked."""
-    return torch.triu(
-        torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=torch.float32),
-        diagonal=1,
-    )
-
-
 class TemporalTransformer(nn.Module):
 
     def __init__(self, f_in:int, d_model:int, nhead:int, num_layers:int, dropout:float=0.1, output_size:int=1):
@@ -98,21 +175,19 @@ class TemporalTransformer(nn.Module):
         self.output_size = output_size
         dim_feedforward = 2 * d_model
 
-        self.rms_norm = RMSNorm(d_model)
         self.embedding = nn.Linear(f_in, d_model)
-        self.pos_encoder = RotaryPositionalEmbeddings(d_model)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
-                                                   dim_feedforward=dim_feedforward,
-                                                   dropout=dropout, activation='relu',
-                                                   batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.layers = nn.ModuleList([
+            RoPETransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout)
+            for _ in range(num_layers)
+        ])
+        self.norm = RMSNorm(d_model)
         self.fc_out = nn.Linear(d_model, output_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.embedding(x)
-        x = self.pos_encoder(x)
-        x = self.rms_norm(x)
-        x = self.transformer_encoder(x)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
         x = self.fc_out(x)
         return x
 
@@ -147,14 +222,11 @@ class MaskedTemporalTransformer(nn.Module):
 
         self.embedding = nn.Linear(f_in, d_model)
         self.mask_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-        self.pos_encoder = RotaryPositionalEmbeddings(d_model)
+        self.layers = nn.ModuleList([
+            RoPETransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout)
+            for _ in range(num_layers)
+        ])
         self.norm = RMSNorm(d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead,
-            dim_feedforward=dim_feedforward, dropout=dropout, activation='relu',
-            batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.reconstruction_head = nn.Linear(d_model, f_in)
 
     def forward(
@@ -187,19 +259,19 @@ class MaskedTemporalTransformer(nn.Module):
 
         emb = self.embedding(x)
         emb = emb + (timestep_mask.unsqueeze(-1) * (self.mask_token - emb))
-        emb = self.pos_encoder(emb)
-        emb = self.norm(emb)
 
-        src_mask = get_causal_mask(T, emb.device) if self.causal else None
         if self.return_layer_mean:
             layer_outs: list[torch.Tensor] = []
             h = emb
-            for layer in self.encoder.layers:
-                h = layer(h, src_mask=src_mask)
+            for layer in self.layers:
+                h = layer(h, is_causal=self.causal)
                 layer_outs.append(h)
-            latent = torch.stack(layer_outs, dim=0).mean(dim=0)
+            latent = self.norm(torch.stack(layer_outs, dim=0).mean(dim=0))
         else:
-            latent = self.encoder(emb, mask=src_mask)
+            h = emb
+            for layer in self.layers:
+                h = layer(h, is_causal=self.causal)
+            latent = self.norm(h)
         recon = self.reconstruction_head(latent)
         return recon, latent, timestep_mask, value_mask
 
@@ -326,13 +398,27 @@ def reconstruction_loss(
 
 
 if __name__ == "__main__":
-    # RoPE test
+    # RoPE rotation test
     x = torch.randn(4, 128, 24)
     rope_embd = RotaryPositionalEmbeddings(24)(x)
-    print("RoPE:", rope_embd.shape)
+    print("RoPE rotation:", rope_embd.shape)
+
+    # RoPE attention test
+    attn = RoPEMultiHeadAttention(d_model=64, nhead=2)
+    h = torch.randn(4, 128, 64)
+    out, _ = attn(h)
+    print("RoPE attention:", out.shape)
+
+    out_w, weights = attn(h, need_weights=True)
+    print("Attention weights:", weights.shape)
 
     # Masked pretraining example
     model = MaskedTemporalTransformer(f_in=24, d_model=64, nhead=2, num_layers=4, mask_ratio=0.15)
     recon, latent, timestep_mask, value_mask = model(x)
     loss = masked_reconstruction_loss(recon, x, timestep_mask)
     print("Recon:", recon.shape, "Latent:", latent.shape, "Loss:", loss.item())
+
+    # Predictive model test
+    pred_model = MaskedPredictiveTemporalTransformer(f_in=24, d_model=64, nhead=2, num_layers=4, causal=True)
+    recon, latent, mask, vmask, pred_next = pred_model(x)
+    print("Predictive recon:", recon.shape, "pred_next:", pred_next.shape)
