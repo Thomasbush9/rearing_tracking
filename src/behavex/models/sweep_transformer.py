@@ -33,6 +33,7 @@ DEFAULT_SWEEP_CONFIG: dict[str, Any] = {
         "patience": {"value": 5},
         "device": {"value": "mps"},
         "model": {"value": "predictive"},
+        "patch_length": {"value": 4},
         "n_predict_steps": {"value": 3},
         "seed": {"value": 42},
     },

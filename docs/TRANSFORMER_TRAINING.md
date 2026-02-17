@@ -82,8 +82,15 @@ python -m src.behavex.models.train_transformer \
 1. Create a sweep from YAML:
 
 ```bash
+# Timestep-level (masked/predictive)
 python -m src.behavex.models.sweep_transformer \
   --config sweep_config.yaml \
+  --preprocessed-data /path/to/data_transformer.npz \
+  --project my-project --count 20
+
+# Patched sweep
+python -m src.behavex.models.sweep_transformer \
+  --config sweep_config_patched.yaml \
   --preprocessed-data /path/to/data_transformer.npz \
   --project my-project --count 20
 ```

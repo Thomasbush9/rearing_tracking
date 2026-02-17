@@ -1,0 +1,48 @@
+# W&B sweep config for patched masked temporal transformer
+# Usage: python -m src.behavex.models.sweep_transformer --config sweep_config_patched.yaml --preprocessed-data /path/to/data.npz --count 20
+
+method: bayes
+metric:
+  name: val/loss
+  goal: minimize
+parameters:
+  model:
+    value: patched
+  patch_length:
+    value: 4
+  n_predict_steps:
+    value: 3
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.01
+  d_model:
+    values: [32, 64, 128]
+  nhead:
+    values: [2, 4]
+  num_layers:
+    values: [2, 4, 6]
+  mask_ratio:
+    values: [0.10, 0.15, 0.20]
+  unmasked_weight:
+    values: [0.1, 0.3, 0.5]
+  batch_size:
+    values: [16, 32, 64]
+  pred_loss_weight:
+    values: [0.3, 0.5, 0.7]
+  data:
+    value: null
+  preprocessed_data:
+    value: null
+  val_ratio:
+    value: 0.15
+  test_ratio:
+    value: 0.15
+  epochs:
+    value: 25
+  patience:
+    value: 5
+  device:
+    value: mps
+  seed:
+    value: 42
