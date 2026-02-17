@@ -9,6 +9,9 @@ joblib
 tqdm
 PyQt5
 tensorboard
+opencv-python
+openpyxl
+xlrd
 
 [dev]
 pytest

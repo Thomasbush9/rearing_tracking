@@ -21,6 +21,8 @@ dependencies = [
     "PyQt5",
     "tensorboard",
     "opencv-python",
+    "openpyxl",
+    "xlrd",
 ]
 
 [project.optional-dependencies]
