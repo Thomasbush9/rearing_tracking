@@ -11,7 +11,15 @@ def main():
     parser.add_argument("--stride", type=int, default=1, help="Stride")
     parser.add_argument("--drop_cols", type=str, nargs="+", default=[], help="Columns to drop")
     args = parser.parse_args()
-    prepare_and_save_dataset(args.data, args.output, args.val_ratio, args.test_ratio, args.window_size, args.stride, args.drop_cols)
+    prepare_and_save_dataset(
+        args.data,
+        args.output,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
+        window_size=args.window_size,
+        stride=args.stride,
+        drop_cols=args.drop_cols if args.drop_cols else None,
+    )
 
 if __name__ == "__main__":
     main()

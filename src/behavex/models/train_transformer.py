@@ -190,6 +190,7 @@ def prepare_and_save_dataset(
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
     window_size: int = 128,
+    stride: int = 1,
     trim_before_dist_head: bool = True,
     start_times_path: str | Path | None = None,
     compressed: bool = True,
@@ -205,7 +206,7 @@ def prepare_and_save_dataset(
         use_dist_head_event=use_dist_head_event,
     )
     windows, feature_names, event_mask_windows = prepare_masked_transformer_data(
-        data, window_size=window_size, stride=1, valid_mask=valid_mask,
+        data, window_size=window_size, stride=stride, valid_mask=valid_mask,
         angular_cols=angular_cols, drop_cols=drop_cols,
     )
     train_w, val_w, test_w = temporal_train_val_test_split(windows, val_ratio, test_ratio)
@@ -1235,6 +1236,7 @@ def run_train(config: dict) -> float:
         args = PatchedTrainingArgs(
             **_common,
             patch_length=patch_length,
+            causal=bool(cfg.get("causal", False)),
             dropout=_scalar(cfg.get("dropout"), 0.1, float),
         )
         trainer = PatchedMaskedTemporalTrainer(args)
@@ -1277,6 +1279,7 @@ class PatchedTrainingArgs:
     unmasked_weight: float = 0.3
     n_predict_steps: int | None = None
     pred_loss_weight: float = 0.5
+    causal: bool = False
     dropout: float = 0.1
     checkpoint_every: int = 0
     max_checkpoints_to_keep: int = 1
@@ -1322,7 +1325,7 @@ class PatchedMaskedTemporalTrainer:
                 mask_ratio=training_args.mask_ratio,
                 value_mask_ratio=training_args.value_mask_ratio,
                 n_predict_steps=training_args.n_predict_steps,
-                causal=False,
+                causal=training_args.causal,
             ).to(self.device)
         else:
             self.model = PatchedMaskedTemporalTransformer(
@@ -1334,7 +1337,7 @@ class PatchedMaskedTemporalTrainer:
                 dropout=training_args.dropout,
                 mask_ratio=training_args.mask_ratio,
                 value_mask_ratio=training_args.value_mask_ratio,
-                causal=False,
+                causal=training_args.causal,
             ).to(self.device)
 
         self._has_event_mask = training_args.train_event_mask is not None
@@ -1668,6 +1671,7 @@ class PatchedMaskedTemporalTrainer:
     def _init_wandb(self):
         args = self.args
         if wandb is None:
+            warnings.warn("wandb is not installed; skipping wandb logging.")
             return None, False
         if args.wandb_project is None and getattr(wandb, "run", None) is not None:
             return wandb.run, False
@@ -1691,9 +1695,15 @@ class PatchedMaskedTemporalTrainer:
             "nhead": args.nhead,
             "num_layers": args.num_layers,
             "mask_ratio": args.mask_ratio,
+            "value_mask_ratio": args.value_mask_ratio,
             "unmasked_weight": args.unmasked_weight,
             "n_predict_steps": args.n_predict_steps,
             "pred_loss_weight": args.pred_loss_weight,
+            "epochs": args.epochs,
+            "checkpoint_every": args.checkpoint_every,
+            "use_compile": args.use_compile,
+            "device": args.device,
+            "causal": args.causal,
         }
         try:
             return wandb.init(**init_kwargs), True
@@ -1736,7 +1746,7 @@ class PatchedMaskedTemporalTrainer:
             f"n_patches:     {self.n_patches}",
             f"n_features:    {args.f_in}",
             f"event_mask:    {args.train_event_mask is not None}",
-            f"bidirectional: True",
+            f"causal_attention: {args.causal}",
         ]
         if args.feature_names:
             lines.append(f"features: {', '.join(args.feature_names)}")
@@ -1849,8 +1859,9 @@ if __name__ == "__main__":
     parser.add_argument("--start_times", type=str, default=None, help="Path to startTimes.xlsx (Experiment, CricketEntersTime, ObjectEntersTime). Default: data dir/startTimes.xlsx when loading a dir.")
     parser.add_argument("--no-event-mask", action="store_true", help="Disable event validity mask (all positions valid). Default: use mask when full_file and start_times.")
     parser.add_argument("--use-dist-head-event", action="store_true", help="Use first non-NaN dist_head row as event start (more accurate than start_times). Loads full files and creates event mask.")
-    parser.add_argument("--model", choices=["masked", "predictive"], default="masked", help="Model variant: masked (recon only) or predictive (recon + multi-step prediction).")
-    parser.add_argument("--n_predict_steps", type=int, default=3, help="Number of next steps to predict (used when --model predictive).")
+    parser.add_argument("--model", choices=["masked", "predictive", "patched"], default="masked", help="Model variant: masked, predictive (recon+prediction), or patched (patch-level; use --patch-length).")
+    parser.add_argument("--patch-length", type=int, default=4, help="Patch size (used when --model patched). window_size must be divisible by this.")
+    parser.add_argument("--n_predict_steps", type=int, default=3, help="Number of next steps to predict (used when --model predictive or patched). 0 = recon only.")
     parser.add_argument("--pred_loss_weight", type=float, default=0.5, help="Weight for predictive loss (used when --model predictive).")
     parser.add_argument("--causal", action="store_true", help="Use causal attention (mask future timesteps). Default: bidirectional.")
     parser.add_argument("--checkpoint-every", type=int, default=0, help="Save an additional checkpoint every N epochs (0 disables).")
@@ -1954,49 +1965,97 @@ if __name__ == "__main__":
                 sys.exit(0)
 
     f_in = train_w.shape[-1]
+    window_size = train_w.shape[1]
+    is_patched = args_cli.model == "patched"
 
-    n_predict_steps = args_cli.n_predict_steps if args_cli.model == "predictive" else None
-    pred_loss_weight = args_cli.pred_loss_weight if args_cli.model == "predictive" else 0.5
+    if is_patched:
+        patch_length = args_cli.patch_length
+        if window_size % patch_length != 0:
+            print(f"Error: window_size {window_size} must be divisible by patch_length {patch_length}", file=sys.stderr)
+            sys.exit(1)
+        n_predict_steps = args_cli.n_predict_steps if args_cli.n_predict_steps > 0 else None
+    else:
+        n_predict_steps = args_cli.n_predict_steps if args_cli.model == "predictive" else None
+    pred_loss_weight = args_cli.pred_loss_weight if n_predict_steps else 0.5
 
+    prefix = "patched_transformer" if is_patched else "masked_transformer"
     save_path = args_cli.output_dir
     if not save_path:
-        save_path = str(Path("models") / f"masked_transformer_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        save_path = str(Path("models") / f"{prefix}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
-    args = MaskedTemporalTrainingArgs(
-        batch_size=32,
-        device="mps",
-        learning_rate=1e-3,
-        f_in=f_in,
-        train_windows=train_w,
-        val_windows=val_w,
-        test_windows=test_w,
-        train_event_mask=train_em,
-        val_event_mask=val_em,
-        test_event_mask=test_em,
-        epochs=25,
-        eval_every_n_epochs=1,
-        verbose=True,
-        feature_names=feature_names,
-        n_predict_steps=n_predict_steps,
-        pred_loss_weight=pred_loss_weight,
-        causal=getattr(args_cli, "causal", False),
-        checkpoint_every=args_cli.checkpoint_every,
-        resume_from=args_cli.resume_from,
-        save_path=save_path,
-        save_last=not args_cli.no_save_last,
-        save_best=not args_cli.no_save_best,
-        save_optimizer=not args_cli.no_save_optimizer,
-        save_rng_state=not args_cli.no_save_rng,
-        use_compile=args_cli.use_compile,
-        compile_backend=args_cli.compile_backend,
-        compile_mode=args_cli.compile_mode,
-        wandb_project=args_cli.wandb_project,
-        wandb_run_name=args_cli.wandb_run_name,
-        wandb_tags=args_cli.wandb_tags,
-        wandb_mode=args_cli.wandb_mode,
-        wandb_entity=args_cli.wandb_entity,
-    )
-    trainer = MaskedTemporalTrainer(args)
+    if is_patched:
+        args = PatchedTrainingArgs(
+            batch_size=32,
+            device="mps",
+            learning_rate=1e-3,
+            f_in=f_in,
+            patch_length=patch_length,
+            train_windows=train_w,
+            val_windows=val_w,
+            test_windows=test_w,
+            train_event_mask=train_em,
+            val_event_mask=val_em,
+            test_event_mask=test_em,
+            epochs=25,
+            eval_every_n_epochs=1,
+            verbose=True,
+            feature_names=feature_names,
+            n_predict_steps=n_predict_steps,
+            pred_loss_weight=pred_loss_weight,
+            causal=getattr(args_cli, "causal", False),
+            checkpoint_every=args_cli.checkpoint_every,
+            resume_from=args_cli.resume_from,
+            save_path=save_path,
+            save_last=not args_cli.no_save_last,
+            save_best=not args_cli.no_save_best,
+            save_optimizer=not args_cli.no_save_optimizer,
+            save_rng_state=not args_cli.no_save_rng,
+            use_compile=args_cli.use_compile,
+            compile_backend=args_cli.compile_backend,
+            compile_mode=args_cli.compile_mode,
+            wandb_project=args_cli.wandb_project,
+            wandb_run_name=args_cli.wandb_run_name,
+            wandb_tags=args_cli.wandb_tags,
+            wandb_mode=args_cli.wandb_mode,
+            wandb_entity=args_cli.wandb_entity,
+        )
+        trainer = PatchedMaskedTemporalTrainer(args)
+    else:
+        args = MaskedTemporalTrainingArgs(
+            batch_size=32,
+            device="mps",
+            learning_rate=1e-3,
+            f_in=f_in,
+            train_windows=train_w,
+            val_windows=val_w,
+            test_windows=test_w,
+            train_event_mask=train_em,
+            val_event_mask=val_em,
+            test_event_mask=test_em,
+            epochs=25,
+            eval_every_n_epochs=1,
+            verbose=True,
+            feature_names=feature_names,
+            n_predict_steps=n_predict_steps,
+            pred_loss_weight=pred_loss_weight,
+            causal=getattr(args_cli, "causal", False),
+            checkpoint_every=args_cli.checkpoint_every,
+            resume_from=args_cli.resume_from,
+            save_path=save_path,
+            save_last=not args_cli.no_save_last,
+            save_best=not args_cli.no_save_best,
+            save_optimizer=not args_cli.no_save_optimizer,
+            save_rng_state=not args_cli.no_save_rng,
+            use_compile=args_cli.use_compile,
+            compile_backend=args_cli.compile_backend,
+            compile_mode=args_cli.compile_mode,
+            wandb_project=args_cli.wandb_project,
+            wandb_run_name=args_cli.wandb_run_name,
+            wandb_tags=args_cli.wandb_tags,
+            wandb_mode=args_cli.wandb_mode,
+            wandb_entity=args_cli.wandb_entity,
+        )
+        trainer = MaskedTemporalTrainer(args)
     best = trainer.train()
     print(f"Best val loss: {best:.4f}")
 
