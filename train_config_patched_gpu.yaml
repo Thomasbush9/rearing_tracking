@@ -1,0 +1,68 @@
+# Training config for PATCHED masked temporal transformer on GPU.
+# Usage: python -m behavex.models.train_transformer --config train_config_patched_gpu.yaml
+# Override: --config train_config_patched_gpu.yaml --data /path/to/data --output-dir ./runs/exp1
+
+# --- Data ---
+data: /path/to/shared WithTWB/  # directory of session xlsx files (or single file / .npz)
+preprocessed_data: null  # set to .npz path for instant reload after first run
+use_dist_head_event: true  # crop at first non-NaN dist_head per session (more accurate than start_times)
+use_event_mask: true  # mask loss on pre-event positions
+angular_cols: null  # null = use default angular columns for sin/cos encoding
+drop_cols: [height]
+val_ratio: 0.15
+test_ratio: 0.15
+window_size: 128
+mmap: false
+
+# --- Output ---
+output_dir: ./runs/patched/
+
+# --- Model (patched) ---
+model: patched  # signals PatchedMaskedTemporalTrainer
+patch_length: 4  # P=4: 128/4 = 32 tokens per window (best compression/quality tradeoff)
+
+# --- Training ---
+batch_size: 64  # GPU can handle larger batches
+device: cuda
+learning_rate: 0.001
+d_model: 128  # larger than point-wise model since each token carries P*F values
+nhead: 4
+num_layers: 4
+mask_ratio: 0.15
+value_mask_ratio: 0.0
+unmasked_weight: 0.3
+epochs: 50
+weight_decay: 0.00001
+patience: 10
+dropout: 0.1
+verbose: true
+save_model: true
+eval_every_n_epochs: 1
+
+# --- Predictive head (optional, set to null for recon-only) ---
+n_predict_steps: 3
+pred_loss_weight: 0.5
+
+# --- Checkpoints ---
+checkpoint_every: 10
+max_checkpoints_to_keep: 3
+resume_from: null
+save_last: true
+save_best: true
+save_optimizer: true
+save_rng_state: true
+
+# --- torch.compile (recommended on GPU with PyTorch 2.0+) ---
+use_compile: true
+compile_backend: inductor
+compile_mode: null  # or "reduce-overhead" for small models
+
+# --- Weights & Biases (optional) ---
+wandb_project: null  # set to project name to enable, e.g. "behavex-patched"
+wandb_run_name: null
+wandb_tags: [patched, P4, d128]
+wandb_mode: null
+wandb_entity: null
+
+# --- Misc ---
+seed: 42

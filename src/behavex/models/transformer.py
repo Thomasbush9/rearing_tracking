@@ -276,6 +276,245 @@ class MaskedTemporalTransformer(nn.Module):
         return recon, latent, timestep_mask, value_mask
 
 
+class PatchEmbedding(nn.Module):
+    """Converts (B, T, F) time series into non-overlapping patch tokens (B, N, d_model).
+
+    Each patch groups P consecutive timesteps across all F features into a single token,
+    which is then linearly projected to d_model. T must be divisible by patch_len.
+    """
+
+    def __init__(self, f_in: int, patch_len: int, d_model: int):
+        super().__init__()
+        self.patch_len = patch_len
+        self.f_in = f_in
+        self.proj = nn.Linear(patch_len * f_in, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, F) -> (B, N, d_model) where N = T // patch_len."""
+        B, T, F = x.shape
+        P = self.patch_len
+        assert T % P == 0, f"Sequence length {T} must be divisible by patch_len {P}"
+        N = T // P
+        x = x.reshape(B, N, P * F)
+        return self.proj(x)
+
+
+def create_patch_mask(
+    batch_size: int, n_patches: int, mask_ratio: float, device: torch.device
+) -> torch.Tensor:
+    """Random mask over patches. Returns bool mask (B, N), True = masked (predict)."""
+    n_mask = max(1, int(n_patches * mask_ratio))
+    noise = torch.rand(batch_size, n_patches, device=device)
+    _, indices = noise.topk(n_mask, dim=1)
+    mask = torch.zeros(batch_size, n_patches, dtype=torch.bool, device=device)
+    mask.scatter_(1, indices, True)
+    return mask
+
+
+class PatchedMaskedTemporalTransformer(nn.Module):
+    """Patch-based masked temporal transformer for learning latent representations.
+
+    Input (B, T, F) is divided into non-overlapping patches of length P, producing
+    N = T/P patch tokens. Masking operates at patch level — entire patches are replaced
+    with a learnable mask token. Reconstruction maps back to full (B, T, F) resolution.
+
+    The latent output is (B, N, d_model) at patch resolution, where each token captures
+    local temporal dynamics within P timesteps and attention models inter-patch dependencies.
+    """
+
+    def __init__(
+        self,
+        f_in: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        patch_len: int = 8,
+        dropout: float = 0.1,
+        mask_ratio: float = 0.15,
+        value_mask_ratio: float = 0.0,
+        return_layer_mean: bool = False,
+        causal: bool = False,
+    ):
+        super().__init__()
+        self.f_in = f_in
+        self.d_model = d_model
+        self.patch_len = patch_len
+        self.mask_ratio = mask_ratio
+        self.value_mask_ratio = value_mask_ratio
+        self.return_layer_mean = return_layer_mean
+        self.causal = causal
+        dim_feedforward = 2 * d_model
+
+        self.patch_embedding = PatchEmbedding(f_in, patch_len, d_model)
+        self.mask_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.layers = nn.ModuleList([
+            RoPETransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout)
+            for _ in range(num_layers)
+        ])
+        self.norm = RMSNorm(d_model)
+        self.reconstruction_head = nn.Linear(d_model, patch_len * f_in)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """
+        Args:
+            x: (B, T, F) time series
+            mask: (B, N) bool patch mask, True = masked. If None, create random.
+        Returns:
+            recon: (B, T, F) full-resolution reconstruction
+            latent: (B, N, d_model) patch-level latent
+            timestep_mask: (B, T) bool expanded to timestep level for loss
+            value_mask: (B, T, F) bool or None
+        """
+        B, T, F = x.shape
+        P = self.patch_len
+        assert T % P == 0, f"Sequence length {T} must be divisible by patch_len {P}"
+        N = T // P
+
+        if mask is None:
+            patch_mask = create_patch_mask(B, N, self.mask_ratio, x.device)
+        else:
+            patch_mask = mask
+
+        value_mask: torch.Tensor | None = None
+        if self.value_mask_ratio > 0:
+            timestep_exclude = patch_mask.repeat_interleave(P, dim=1)
+            value_mask = create_value_mask(
+                B, T, F, self.value_mask_ratio, x.device,
+                exclude_timestep_mask=timestep_exclude,
+            )
+            x = x.masked_fill(value_mask, 0.0)
+
+        emb = self.patch_embedding(x)  # (B, N, d_model)
+        emb = emb + (patch_mask.unsqueeze(-1) * (self.mask_token - emb))
+
+        if self.return_layer_mean:
+            layer_outs: list[torch.Tensor] = []
+            h = emb
+            for layer in self.layers:
+                h = layer(h, is_causal=self.causal)
+                layer_outs.append(h)
+            latent = self.norm(torch.stack(layer_outs, dim=0).mean(dim=0))
+        else:
+            h = emb
+            for layer in self.layers:
+                h = layer(h, is_causal=self.causal)
+            latent = self.norm(h)
+
+        recon_patches = self.reconstruction_head(latent)  # (B, N, P*F)
+        recon = recon_patches.reshape(B, N, P, F).reshape(B, T, F)
+        timestep_mask = patch_mask.repeat_interleave(P, dim=1)  # (B, T)
+        return recon, latent, timestep_mask, value_mask
+
+
+class PatchedMaskedPredictiveTemporalTransformer(PatchedMaskedTemporalTransformer):
+    """Patched transformer with multi-step-ahead prediction at patch level.
+
+    Each patch token predicts the next K patches. Returns pred_next (B, T, K, F)
+    by expanding patch-level predictions back to timestep resolution.
+    """
+
+    def __init__(
+        self,
+        f_in: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        patch_len: int = 8,
+        dropout: float = 0.1,
+        mask_ratio: float = 0.15,
+        value_mask_ratio: float = 0.0,
+        n_predict_steps: int = 3,
+        return_layer_mean: bool = False,
+        causal: bool = False,
+    ):
+        super().__init__(
+            f_in=f_in, d_model=d_model, nhead=nhead, num_layers=num_layers,
+            patch_len=patch_len, dropout=dropout, mask_ratio=mask_ratio,
+            value_mask_ratio=value_mask_ratio, return_layer_mean=return_layer_mean,
+            causal=causal,
+        )
+        self.n_predict_steps = n_predict_steps
+        # Each patch predicts next K patches: K * P * F values
+        self.prediction_head = nn.Linear(d_model, n_predict_steps * patch_len * f_in)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        recon, latent, timestep_mask, value_mask = super().forward(x, mask)
+        B, T, F = x.shape
+        P = self.patch_len
+        N = T // P
+        K = self.n_predict_steps
+
+        pred_flat = self.prediction_head(latent)  # (B, N, K*P*F)
+        # Reshape: each patch n predicts K future patches -> expand to timestep level
+        # (B, N, K, P, F) -> repeat each patch P times along T -> (B, T, K, F)
+        pred_patches = pred_flat.reshape(B, N, K, P, F)
+        # Expand to timestep level: for timestep t in patch n, predict K*P future timesteps
+        # grouped as K steps of P timesteps each. To match predictive_loss (B, T, K, F),
+        # we interleave: timestep t predicts t+1, t+2, ..., t+K
+        # Since all timesteps in a patch share the same latent, we repeat.
+        pred_next = pred_patches.repeat_interleave(P, dim=1)  # (B, T, K, P, F)
+        # Collapse the inner P dim: for step k, predict the k-th future patch center timestep
+        # Take the mean over the P timesteps within each predicted patch
+        pred_next = pred_next.mean(dim=3)  # (B, T, K, F)
+        return recon, latent, timestep_mask, value_mask, pred_next
+
+
+def patched_predictive_loss(
+    pred_next: torch.Tensor,
+    x: torch.Tensor,
+    n_predict_steps: int,
+    patch_len: int,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Predictive loss for patched models. Operates at patch level for clean alignment.
+
+    pred_next: (B, T, K, F) from PatchedMaskedPredictiveTemporalTransformer.
+    Computes loss using patch-averaged targets for each future step k:
+    target for step k from patch n = mean of x over timesteps in patch (n+k+1).
+    """
+    B, T, n_f = x.shape
+    P = patch_len
+    N = T // P
+    K = n_predict_steps
+    if N <= K:
+        return pred_next.new_zeros(1).squeeze()
+
+    # Average x into patch-level representations: (B, N, n_f)
+    x_patches = x.reshape(B, N, P, n_f).mean(dim=2)
+
+    valid_len = N - K
+    # Predictions at patch level: take one timestep per patch (e.g., first)
+    pred_patch = pred_next[:, ::P, :, :]  # (B, N, K, n_f)
+    pred_valid = pred_patch[:, :valid_len, :, :]  # (B, valid_len, K, n_f)
+
+    # Targets: for patch n, step k, target is x_patches[:, n+1+k, :]
+    target = torch.stack(
+        [x_patches[:, 1 + k : 1 + k + valid_len, :] for k in range(K)], dim=2
+    )  # (B, valid_len, K, n_f)
+
+    if valid_mask is None:
+        return F.mse_loss(pred_valid, target)
+
+    # valid_mask (B, T) -> patch level (B, N): a patch is valid if all its timesteps are valid
+    vm_patches = valid_mask.reshape(B, N, P).all(dim=2)  # (B, N)
+    pred_pos_valid = vm_patches[:, :valid_len].unsqueeze(2).unsqueeze(3)
+    target_pos_valid = torch.stack(
+        [vm_patches[:, 1 + k : 1 + k + valid_len] for k in range(K)], dim=2
+    ).unsqueeze(3)
+    valid_btk = (pred_pos_valid & target_pos_valid).squeeze(3)
+    if not valid_btk.any():
+        return pred_next.new_zeros(1).squeeze()
+    return F.mse_loss(pred_valid[valid_btk], target[valid_btk])
+
+
 class MaskedPredictiveTemporalTransformer(MaskedTemporalTransformer):
     """Masked transformer with multi-step-ahead prediction head. Returns (recon, latent, mask, pred_next)."""
 
@@ -422,3 +661,22 @@ if __name__ == "__main__":
     pred_model = MaskedPredictiveTemporalTransformer(f_in=24, d_model=64, nhead=2, num_layers=4, causal=True)
     recon, latent, mask, vmask, pred_next = pred_model(x)
     print("Predictive recon:", recon.shape, "pred_next:", pred_next.shape)
+
+    # Patched model tests
+    print("\n--- Patched models ---")
+    patch_len = 8
+    patched = PatchedMaskedTemporalTransformer(f_in=24, d_model=64, nhead=2, num_layers=4, patch_len=patch_len)
+    recon_p, latent_p, tmask_p, vmask_p = patched(x)
+    n_patches = 128 // patch_len
+    print(f"Patched recon: {recon_p.shape}, latent: {latent_p.shape} (N={n_patches} patches)")
+    print(f"  timestep_mask: {tmask_p.shape}, masked timesteps: {tmask_p[0].sum().item()}")
+    loss_p = masked_reconstruction_loss(recon_p, x, tmask_p)
+    print(f"  Patched recon loss: {loss_p.item():.4f}")
+
+    patched_pred = PatchedMaskedPredictiveTemporalTransformer(
+        f_in=24, d_model=64, nhead=2, num_layers=4, patch_len=patch_len, causal=True
+    )
+    recon_pp, latent_pp, tmask_pp, vmask_pp, pred_next_pp = patched_pred(x)
+    print(f"Patched predictive recon: {recon_pp.shape}, pred_next: {pred_next_pp.shape}")
+    ploss = patched_predictive_loss(pred_next_pp, x, 3, patch_len)
+    print(f"  Patched predictive loss: {ploss.item():.4f}")

@@ -1,10 +1,14 @@
 from behavex.models.transformer import (
     MaskedTemporalTransformer,
     MaskedPredictiveTemporalTransformer,
+    PatchedMaskedTemporalTransformer,
+    PatchedMaskedPredictiveTemporalTransformer,
     reconstruction_loss,
     value_reconstruction_loss,
     predictive_loss,
+    patched_predictive_loss,
     create_timestep_mask,
+    create_patch_mask,
 )
 import pandas as pd
 from torch.utils.tensorboard import SummaryWriter
@@ -191,12 +195,14 @@ def prepare_and_save_dataset(
     compressed: bool = True,
     angular_cols: list[str] | None = None,
     drop_cols: list[str] | None = None,
+    use_dist_head_event: bool = False,
 ) -> None:
     """Load raw data, preprocess, split, and save. When trim_before_dist_head=False and start_times_path set, saves event masks."""
     data, valid_mask = load_data_path(
         str(data_path),
         trim_before_dist_head=trim_before_dist_head,
         start_times_path=start_times_path,
+        use_dist_head_event=use_dist_head_event,
     )
     windows, feature_names, event_mask_windows = prepare_masked_transformer_data(
         data, window_size=window_size, stride=1, valid_mask=valid_mask,
@@ -249,6 +255,16 @@ def _event_row_from_dataframe(data: pd.DataFrame, start_time: float) -> int:
     if not np.any(after):
         return 0
     return int(np.argmax(after))
+
+
+def _dist_head_event_row(data: pd.DataFrame) -> int:
+    """First row where dist_head is not NaN. Returns 0 if column missing or all NaN."""
+    if "dist_head" not in data.columns:
+        return 0
+    first_valid = data["dist_head"].first_valid_index()
+    if first_valid is None:
+        return 0
+    return int(data.index.get_loc(first_valid))
 
 
 def _load_one_session(
@@ -306,16 +322,63 @@ def load_data_path(
     data_path: str,
     trim_before_dist_head: bool = True,
     start_times_path: str | Path | None = None,
+    use_dist_head_event: bool = False,
 ) -> Tuple[pd.DataFrame, Optional[np.ndarray]]:
     """
     Load from a single file or a directory. For a directory, finds all files matching
     m{mouse}_s{session}_{cricket|object}.xlsx (or .xls) and concatenates them.
-    Returns (data, valid_mask). valid_mask is None unless loading full file(s) with start_times;
-    then it is bool (len(data),) with True = row is after event (timestamp >= event time).
-    trim_before_dist_head: if True (default), when not using start times, keep rows before first valid dist_head.
-    start_times_path: path to startTimes.xlsx (Experiment, CricketEntersTime, ObjectEntersTime).
+
+    Returns (data, valid_mask). valid_mask is bool (len(data),) with True = valid row.
+
+    Event detection priority (first match wins):
+      1. use_dist_head_event=True: load full files, mark rows from first non-NaN dist_head
+         onward as valid. More accurate than start_times.
+      2. start_times_path with trim_before_dist_head=False: load full files, use timestamp-based
+         event boundary from startTimes.xlsx.
+      3. trim_before_dist_head=True: keep only rows before first valid dist_head (legacy).
+      4. Otherwise: return full file, no mask.
     """
     path = Path(data_path)
+
+    # ── use_dist_head_event: load full file(s), valid_mask from first non-NaN dist_head ──
+    if use_dist_head_event:
+        if path.is_file():
+            data = pd.read_excel(path)
+            event_row = _dist_head_event_row(data)
+            valid_mask = np.zeros(len(data), dtype=bool)
+            valid_mask[event_row:] = True
+            return data, valid_mask
+        if not path.is_dir():
+            raise FileNotFoundError(f"Not a file or directory: {path}")
+        matching = sorted(
+            f for f in path.iterdir()
+            if f.is_file() and f.suffix.lower() in (".xlsx", ".xls") and _SESSION_PATTERN.match(f.name)
+        )
+        if not matching:
+            raise FileNotFoundError(f"No session files (m*_s*_cricket|object.xlsx) in {path}")
+        frames: list[pd.DataFrame] = []
+        valid_chunks: list[np.ndarray] = []
+        columns_ref: list[str] | None = None
+        for f in tqdm(matching, desc="Loading sessions", unit="file"):
+            df = pd.read_excel(f)
+            if df.empty:
+                continue
+            if columns_ref is None:
+                columns_ref = df.columns.tolist()
+            else:
+                df = df.reindex(columns=columns_ref)
+            event_row = _dist_head_event_row(df)
+            vm = np.zeros(len(df), dtype=bool)
+            vm[event_row:] = True
+            frames.append(df)
+            valid_chunks.append(vm)
+        if not frames:
+            raise FileNotFoundError(f"No session files (m*_s*_cricket|object.xlsx) in {path}")
+        data = pd.concat(frames, ignore_index=True)
+        valid_mask = np.concatenate(valid_chunks)
+        return data, valid_mask
+
+    # ── Legacy paths (start_times / trim_before_dist_head) ───────────────
     if path.is_file():
         start_path = Path(start_times_path) if start_times_path else path.parent / "startTimes.xlsx"
         start_df = _load_start_times(start_path) if start_path.is_file() else None
@@ -336,9 +399,9 @@ def load_data_path(
     start_times_df: pd.DataFrame | None = None
     if start_path.is_file():
         start_times_df = _load_start_times(start_path)
-    frames: list[pd.DataFrame] = []
-    valid_chunks: list[np.ndarray] = []
-    columns_ref: list[str] | None = None
+    frames = []
+    valid_chunks = []
+    columns_ref = None
     matching = sorted(
         f for f in path.iterdir()
         if f.is_file() and f.suffix.lower() in (".xlsx", ".xls") and _SESSION_PATTERN.match(f.name)
@@ -495,7 +558,7 @@ class MaskedTemporalTrainer:
         self.val_seed = 42  # Fixed seed for reproducible val masks
         self.checkpoints_dir = self.save_path / "checkpoints"
         self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
-        self._wandb_run = self._init_wandb()
+        self._wandb_run, self._owns_wandb_run = self._init_wandb()
         self.start_epoch = 1
         if training_args.resume_from:
             resume_path = Path(training_args.resume_from).expanduser().resolve()
@@ -669,15 +732,16 @@ class MaskedTemporalTrainer:
         )
 
     def _init_wandb(self):
+        """Returns (run, owns_run) tuple. owns_run is False when reusing an external run."""
         args = self.training_args
         if wandb is None:
             warnings.warn("wandb is not installed; skipping wandb logging.")
-            return None
+            return None, False
         # Use active run (e.g. from wandb sweep agent) when wandb_project not set
         if args.wandb_project is None and getattr(wandb, "run", None) is not None:
-            return wandb.run
+            return wandb.run, False
         if args.wandb_project is None:
-            return None
+            return None, False
         init_kwargs = {
             "project": args.wandb_project,
         }
@@ -708,10 +772,10 @@ class MaskedTemporalTrainer:
         }
         init_kwargs["config"] = config
         try:
-            return wandb.init(**init_kwargs)
+            return wandb.init(**init_kwargs), True
         except Exception as exc:
             warnings.warn(f"Failed to initialize wandb: {exc}")
-            return None
+            return None, False
 
     def _log_wandb(self, metrics: dict[str, float], step: int | None = None) -> None:
         if self._wandb_run is None:
@@ -1008,7 +1072,7 @@ class MaskedTemporalTrainer:
             if args.verbose:
                 print(f"Final test loss: {test_loss:.4f}")
         self.writer.close()
-        if self._wandb_run is not None:
+        if self._wandb_run is not None and self._owns_wandb_run:
             try:
                 self._wandb_run.finish()
             except Exception as exc:
@@ -1040,7 +1104,8 @@ def run_train(config: dict) -> float:
     data_path = cfg.get("data")
     full_file = bool(cfg.get("full_file", False))
     start_times = cfg.get("start_times")
-    use_event_mask = cfg.get("use_event_mask", bool(full_file and start_times))
+    use_dist_head_event = bool(cfg.get("use_dist_head_event", False))
+    use_event_mask = cfg.get("use_event_mask", bool(use_dist_head_event or (full_file and start_times)))
     angular_cols = cfg.get("angular_cols")
     drop_cols = cfg.get("drop_cols", ["height"])
     val_ratio = _scalar(cfg.get("val_ratio"), 0.15, float)
@@ -1065,8 +1130,9 @@ def run_train(config: dict) -> float:
             try:
                 data, valid_mask = load_data_path(
                     data_path,
-                    trim_before_dist_head=not full_file,
-                    start_times_path=None if full_file else start_times,
+                    trim_before_dist_head=not full_file and not use_dist_head_event,
+                    start_times_path=None if (full_file or use_dist_head_event) else start_times,
+                    use_dist_head_event=use_dist_head_event,
                 )
                 valid_mask = valid_mask if use_event_mask else None
                 windows, feature_names, event_mask_windows = prepare_masked_transformer_data(
@@ -1097,9 +1163,12 @@ def run_train(config: dict) -> float:
     model_type = cfg.get("model", "masked")
     if isinstance(model_type, (list, tuple)):
         model_type = model_type[0] if model_type else "masked"
-    n_predict_steps = (
-        _scalar(cfg.get("n_predict_steps"), 3, int) if model_type == "predictive" else None
-    )
+    is_patched = model_type == "patched"
+    n_predict_steps_raw = cfg.get("n_predict_steps")
+    if model_type == "predictive" or (is_patched and n_predict_steps_raw is not None):
+        n_predict_steps = _scalar(n_predict_steps_raw, 3, int)
+    else:
+        n_predict_steps = None
     pred_loss_weight = _scalar(cfg.get("pred_loss_weight"), 0.5, float) if n_predict_steps else 0.5
 
     run_id = cfg.get("run_id")
@@ -1107,15 +1176,17 @@ def run_train(config: dict) -> float:
         ts = str(run_id)  # unique per sweep run
     else:
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{random.randint(0, 0xFFFF):04x}"
+    prefix = "patched_transformer" if is_patched else "masked_transformer"
     save_path = cfg.get("save_path")
     if not save_path:
         output_dir = cfg.get("output_dir")
         if output_dir:
-            save_path = str(Path(output_dir) / f"masked_transformer_{ts}")
+            save_path = str(Path(output_dir) / f"{prefix}_{ts}")
         else:
-            save_path = str(Path("models") / f"masked_transformer_{ts}")
+            save_path = str(Path("models") / f"{prefix}_{ts}")
 
-    args = MaskedTemporalTrainingArgs(
+    # Shared config values
+    _common = dict(
         batch_size=_scalar(cfg.get("batch_size"), 32, int),
         device=str(_scalar(cfg.get("device"), "mps", str)),
         learning_rate=_scalar(cfg.get("learning_rate"), 1e-3, float),
@@ -1142,7 +1213,6 @@ def run_train(config: dict) -> float:
         unmasked_weight=max(1e-6, _scalar(cfg.get("unmasked_weight"), 0.3, float)),
         n_predict_steps=n_predict_steps,
         pred_loss_weight=pred_loss_weight,
-        causal=bool(cfg.get("causal", False)),
         checkpoint_every=_scalar(cfg.get("checkpoint_every"), 0, int),
         max_checkpoints_to_keep=_scalar(cfg.get("max_checkpoints_to_keep"), 1, int),
         resume_from=cfg.get("resume_from"),
@@ -1159,8 +1229,609 @@ def run_train(config: dict) -> float:
         wandb_mode=cfg.get("wandb_mode"),
         wandb_entity=cfg.get("wandb_entity"),
     )
-    trainer = MaskedTemporalTrainer(args)
+
+    if is_patched:
+        patch_length = _scalar(cfg.get("patch_length"), 4, int)
+        args = PatchedTrainingArgs(
+            **_common,
+            patch_length=patch_length,
+            dropout=_scalar(cfg.get("dropout"), 0.1, float),
+        )
+        trainer = PatchedMaskedTemporalTrainer(args)
+    else:
+        args = MaskedTemporalTrainingArgs(
+            **_common,
+            causal=bool(cfg.get("causal", False)),
+        )
+        trainer = MaskedTemporalTrainer(args)
     return trainer.train()
+
+
+@dataclass
+class PatchedTrainingArgs:
+    """Arguments for training a patched masked temporal transformer."""
+    batch_size: int
+    device: str
+    learning_rate: float
+    f_in: int
+    patch_length: int
+    train_windows: Union[np.ndarray, torch.Tensor]
+    val_windows: Union[np.ndarray, torch.Tensor]
+    test_windows: Union[np.ndarray, torch.Tensor] | None = None
+    train_event_mask: Optional[Union[np.ndarray, torch.Tensor]] = None
+    val_event_mask: Optional[Union[np.ndarray, torch.Tensor]] = None
+    test_event_mask: Optional[Union[np.ndarray, torch.Tensor]] = None
+    d_model: int = 64
+    nhead: int = 2
+    num_layers: int = 4
+    mask_ratio: float = 0.15
+    value_mask_ratio: float = 0.0
+    epochs: int = 25
+    weight_decay: float = 1e-5
+    patience: int = 5
+    verbose: bool = False
+    save_model: bool = True
+    save_path: str = field(default_factory=lambda: str(Path("models") / f"patched_transformer_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"))
+    eval_every_n_epochs: int = 1
+    feature_names: Optional[list[str]] = None
+    unmasked_weight: float = 0.3
+    n_predict_steps: int | None = None
+    pred_loss_weight: float = 0.5
+    dropout: float = 0.1
+    checkpoint_every: int = 0
+    max_checkpoints_to_keep: int = 1
+    resume_from: str | None = None
+    save_last: bool = True
+    save_best: bool = True
+    save_optimizer: bool = True
+    save_rng_state: bool = True
+    use_compile: bool = False
+    compile_backend: str | None = "inductor"
+    compile_mode: str | None = None
+    wandb_project: str | None = None
+    wandb_run_name: str | None = None
+    wandb_tags: list[str] | None = None
+    wandb_mode: str | None = None
+    wandb_entity: str | None = None
+
+
+class PatchedMaskedTemporalTrainer:
+    """Trainer for patched masked temporal transformers (bidirectional reconstruction)."""
+
+    def __init__(self, training_args: PatchedTrainingArgs):
+        self.args = training_args
+        self.device = torch.device(training_args.device)
+        self.is_predictive = training_args.n_predict_steps is not None
+        self.patch_length = training_args.patch_length
+
+        # Validate that window size is divisible by patch length
+        window_size = training_args.train_windows.shape[1]
+        assert window_size % self.patch_length == 0, (
+            f"Window size {window_size} must be divisible by patch_length {self.patch_length}"
+        )
+        self.n_patches = window_size // self.patch_length
+
+        if self.is_predictive:
+            self.model = PatchedMaskedPredictiveTemporalTransformer(
+                f_in=training_args.f_in,
+                d_model=training_args.d_model,
+                nhead=training_args.nhead,
+                num_layers=training_args.num_layers,
+                patch_len=training_args.patch_length,
+                dropout=training_args.dropout,
+                mask_ratio=training_args.mask_ratio,
+                value_mask_ratio=training_args.value_mask_ratio,
+                n_predict_steps=training_args.n_predict_steps,
+                causal=False,
+            ).to(self.device)
+        else:
+            self.model = PatchedMaskedTemporalTransformer(
+                f_in=training_args.f_in,
+                d_model=training_args.d_model,
+                nhead=training_args.nhead,
+                num_layers=training_args.num_layers,
+                patch_len=training_args.patch_length,
+                dropout=training_args.dropout,
+                mask_ratio=training_args.mask_ratio,
+                value_mask_ratio=training_args.value_mask_ratio,
+                causal=False,
+            ).to(self.device)
+
+        self._has_event_mask = training_args.train_event_mask is not None
+        _use_cuda = self.device.type == "cuda"
+        _loader_kwargs = dict(
+            pin_memory=_use_cuda,
+            num_workers=4 if _use_cuda else 0,
+            persistent_workers=_use_cuda,
+        )
+        self.train_loader = DataLoader(
+            MaskedTemporalDataset(training_args.train_windows, event_masks=training_args.train_event_mask),
+            batch_size=training_args.batch_size,
+            shuffle=True,
+            **_loader_kwargs,
+        )
+        self.val_loader = DataLoader(
+            MaskedTemporalDataset(training_args.val_windows, event_masks=training_args.val_event_mask),
+            batch_size=training_args.batch_size,
+            shuffle=False,
+            **_loader_kwargs,
+        )
+        self.test_loader = (
+            DataLoader(
+                MaskedTemporalDataset(training_args.test_windows, event_masks=training_args.test_event_mask),
+                batch_size=training_args.batch_size,
+                shuffle=False,
+                **_loader_kwargs,
+            )
+            if training_args.test_windows is not None
+            else None
+        )
+        self.optimizer = Adam(
+            self.model.parameters(),
+            lr=training_args.learning_rate,
+            weight_decay=training_args.weight_decay,
+        )
+        self.best_loss = float("inf")
+        self.best_epoch = 0
+        self.patience_counter = 0
+        self.train_losses: list[float] = []
+        self.val_losses: list[float] = []
+        self.save_path = Path(training_args.save_path)
+        self.save_path.mkdir(parents=True, exist_ok=True)
+        self.plots_dir = self.save_path / "plots"
+        self.plots_dir.mkdir(parents=True, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=str(self.save_path))
+        self.val_seed = 42
+        self.checkpoints_dir = self.save_path / "checkpoints"
+        self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        self._wandb_run, self._owns_wandb_run = self._init_wandb()
+        self.start_epoch = 1
+        if training_args.resume_from:
+            resume_path = Path(training_args.resume_from).expanduser().resolve()
+            if resume_path.is_file():
+                try:
+                    last_epoch = self._load_checkpoint(resume_path)
+                    self.start_epoch = max(1, last_epoch + 1)
+                    if training_args.verbose:
+                        print(f"[patched-trainer] Resumed from {resume_path} at epoch {last_epoch}")
+                except Exception as exc:
+                    warnings.warn(f"Failed to resume from {resume_path}: {exc}")
+            else:
+                warnings.warn(f"Resume checkpoint not found at {resume_path}")
+        if training_args.use_compile:
+            compile_fn = getattr(torch, "compile", None)
+            if compile_fn is not None:
+                try:
+                    self.model = compile_fn(
+                        self.model,
+                        backend=training_args.compile_backend,
+                        mode=training_args.compile_mode,
+                    )
+                except Exception as exc:
+                    warnings.warn(f"torch.compile failed: {exc}")
+
+    # ── Training step ────────────────────────────────────────────────────────
+
+    def learning_step(self, batch: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]) -> float:
+        if isinstance(batch, (list, tuple)) and len(batch) == 2:
+            X, event_mask_batch = batch[0].to(self.device), batch[1].to(self.device)
+        else:
+            X = batch.to(self.device)
+            event_mask_batch = None
+        self.model.train()
+        self.optimizer.zero_grad()
+        out = self.model(X)
+        recon, timestep_mask, value_mask = out[0], out[2], out[3]
+        loss = reconstruction_loss(
+            recon, X, timestep_mask, self.args.unmasked_weight, valid_mask=event_mask_batch
+        )
+        if value_mask is not None:
+            loss = loss + value_reconstruction_loss(recon, X, value_mask, valid_mask=event_mask_batch)
+        if self.is_predictive:
+            pred_next = out[4]
+            loss = loss + self.args.pred_loss_weight * patched_predictive_loss(
+                pred_next, X, self.args.n_predict_steps, self.patch_length,
+                valid_mask=event_mask_batch,
+            )
+        loss.backward()
+        self.optimizer.step()
+        return loss.item()
+
+    # ── Evaluation ───────────────────────────────────────────────────────────
+
+    def _eval(self, loader: DataLoader) -> float:
+        """Evaluate with fixed seed per batch for reproducible patch masks."""
+        self.model.eval()
+        total, n = 0.0, 0
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(loader):
+                if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                    X, event_mask_batch = batch[0].to(self.device), batch[1].to(self.device)
+                else:
+                    X = batch.to(self.device)
+                    event_mask_batch = None
+                B = X.size(0)
+                torch.manual_seed(self.val_seed + batch_idx)
+                mask = create_patch_mask(B, self.n_patches, self.args.mask_ratio, X.device)
+                out = self.model(X, mask=mask)
+                recon, timestep_mask, value_mask = out[0], out[2], out[3]
+                batch_loss = reconstruction_loss(
+                    recon, X, timestep_mask, self.args.unmasked_weight, valid_mask=event_mask_batch
+                ).item()
+                if value_mask is not None:
+                    batch_loss += value_reconstruction_loss(
+                        recon, X, value_mask, valid_mask=event_mask_batch
+                    ).item()
+                if self.is_predictive:
+                    pred_next = out[4]
+                    batch_loss += self.args.pred_loss_weight * patched_predictive_loss(
+                        pred_next, X, self.args.n_predict_steps, self.patch_length,
+                        valid_mask=event_mask_batch,
+                    ).item()
+                total += batch_loss * B
+                n += B
+        self.model.train()
+        return total / n if n else float("inf")
+
+    # ── Plotting ─────────────────────────────────────────────────────────────
+
+    def _plot_reconstruction(
+        self, loader: DataLoader, save_name: str, title: str, seed: int,
+        tb_tag: str | None = None, tb_step: int | None = None,
+    ) -> None:
+        if len(loader.dataset) == 0:
+            return
+        self.model.eval()
+        batch = next(iter(loader))
+        X = (batch[0] if isinstance(batch, (list, tuple)) and len(batch) == 2 else batch).to(self.device)
+        B = X.size(0)
+        torch.manual_seed(seed)
+        mask = create_patch_mask(B, self.n_patches, self.args.mask_ratio, X.device)
+        with torch.no_grad():
+            out = self.model(X, mask=mask)
+            recon, timestep_mask = out[0], out[2]
+        self.model.train()
+
+        gt = X[0].cpu().numpy()
+        pred = recon[0].cpu().numpy()
+        m = timestep_mask[0].cpu().numpy()
+        n_plot = gt.shape[1]
+        names = self.args.feature_names
+        if names is None or len(names) != n_plot:
+            names = [f"Feat {i}" for i in range(n_plot)]
+
+        row_h = 1.0
+        fig, axes = plt.subplots(n_plot, 2, figsize=(12, row_h * n_plot), sharex="col")
+        if n_plot == 1:
+            axes = axes.reshape(1, -1)
+        t = np.arange(gt.shape[0])
+        masked_idx = np.where(m)[0]
+
+        for i in range(n_plot):
+            ax = axes[i, 0]
+            ax.plot(t, gt[:, i], label="GT", alpha=0.8)
+            ax.plot(t, pred[:, i], label="Recon", alpha=0.8, linestyle="--")
+            for ti in masked_idx:
+                ax.axvline(ti, color="orange", alpha=0.4, linewidth=0.8)
+            ax.set_ylabel(names[i], fontsize=6)
+            ax.legend(loc="upper right", fontsize=5)
+            ax.grid(True, alpha=0.3)
+            ax.set_title(f"Full seq (| = masked, P={self.patch_length})" if i == 0 else None, fontsize=7)
+
+            ax = axes[i, 1]
+            if len(masked_idx) > 0:
+                gt_m = gt[masked_idx, i]
+                pred_m = pred[masked_idx, i]
+                ax.scatter(gt_m, pred_m, alpha=0.6, s=15)
+                mi, mx = min(gt_m.min(), pred_m.min()), max(gt_m.max(), pred_m.max())
+                ax.plot([mi, mx], [mi, mx], "k--", alpha=0.5, label="y=x")
+            ax.set_xlabel("GT", fontsize=6)
+            ax.set_ylabel("Pred", fontsize=6)
+            ax.legend(loc="upper right", fontsize=5)
+            ax.grid(True, alpha=0.3)
+            ax.set_title("Masked only" if i == 0 else None, fontsize=7)
+
+        axes[-1, 0].set_xlabel("Time")
+        fig.suptitle(title)
+        plt.tight_layout()
+        plt.savefig(self.plots_dir / save_name, dpi=150, bbox_inches="tight")
+        if tb_tag is not None and tb_step is not None:
+            self.writer.add_figure(tb_tag, fig, tb_step)
+            self._log_wandb_image(tb_tag, fig, tb_step)
+        plt.close(fig)
+
+    def _plot_validation(self, epoch: int) -> None:
+        self._plot_reconstruction(
+            self.val_loader,
+            f"val_recon_epoch{epoch}.png",
+            f"Validation epoch {epoch}: ~{self.args.mask_ratio*100:.0f}% patches masked (P={self.patch_length})",
+            self.val_seed,
+            tb_tag="val/gt_vs_recon",
+            tb_step=epoch,
+        )
+
+    # ── Checkpointing ────────────────────────────────────────────────────────
+
+    def _capture_rng_state(self) -> dict[str, object]:
+        state: dict[str, object] = {
+            "torch": torch.get_rng_state(),
+            "numpy": np.random.get_state(),
+            "python": random.getstate(),
+        }
+        if torch.cuda.is_available():
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def _restore_rng_state(self, state: dict[str, object]) -> None:
+        torch_state = state.get("torch")
+        if torch_state is not None:
+            torch.set_rng_state(torch_state)
+        cuda_state = state.get("cuda")
+        if cuda_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(cuda_state)
+        numpy_state = state.get("numpy")
+        if numpy_state is not None:
+            np.random.set_state(numpy_state)
+        python_state = state.get("python")
+        if python_state is not None:
+            random.setstate(python_state)
+
+    def _checkpoint_state(self, epoch: int, val_loss: float | None) -> dict[str, object]:
+        args = self.args
+        state: dict[str, object] = {
+            "epoch": epoch,
+            "best_loss": self.best_loss,
+            "best_epoch": self.best_epoch,
+            "patience_counter": self.patience_counter,
+            "val_loss": val_loss,
+            "train_losses": self.train_losses,
+            "val_losses": self.val_losses,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "model_state": self.model.state_dict(),
+            "training_params": {
+                "batch_size": args.batch_size,
+                "learning_rate": args.learning_rate,
+                "d_model": args.d_model,
+                "nhead": args.nhead,
+                "num_layers": args.num_layers,
+                "mask_ratio": args.mask_ratio,
+                "value_mask_ratio": args.value_mask_ratio,
+                "epochs": args.epochs,
+                "unmasked_weight": args.unmasked_weight,
+                "n_predict_steps": args.n_predict_steps,
+                "pred_loss_weight": args.pred_loss_weight,
+                "patch_length": args.patch_length,
+                "device": args.device,
+            },
+        }
+        if args.save_optimizer:
+            state["optimizer_state"] = self.optimizer.state_dict()
+        if args.save_rng_state:
+            state["rng_state"] = self._capture_rng_state()
+        return state
+
+    def _save_checkpoint(self, path: Path, epoch: int, val_loss: float | None, is_best: bool = False) -> None:
+        try:
+            payload = self._checkpoint_state(epoch, val_loss)
+            payload["is_best"] = is_best
+            torch.save(payload, path)
+            if self.args.verbose:
+                label = "best" if is_best else path.name
+                print(f"[patched-trainer] Saved checkpoint ({label}) at epoch {epoch} -> {path}")
+        except Exception as exc:
+            warnings.warn(f"Failed to save checkpoint at {path}: {exc}")
+
+    def _clean_old_checkpoints(self) -> None:
+        max_keep = self.args.max_checkpoints_to_keep
+        if max_keep <= 0:
+            return
+        pattern = re.compile(r"^checkpoint_epoch(\d+)\.pt$")
+        candidates: list[tuple[int, Path]] = []
+        for p in self.checkpoints_dir.iterdir():
+            if not p.is_file():
+                continue
+            m = pattern.match(p.name)
+            if m:
+                candidates.append((int(m.group(1)), p))
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for _, p in candidates[max_keep:]:
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+    def _load_checkpoint(self, path: Path) -> int:
+        checkpoint = torch.load(path, map_location=self.device)
+        if not isinstance(checkpoint, dict) or "model_state" not in checkpoint:
+            self.model.load_state_dict(checkpoint)
+            warnings.warn(f"Checkpoint {path} lacks trainer metadata; loaded weights only.")
+            return 0
+        self.model.load_state_dict(checkpoint["model_state"])
+        if self.args.save_optimizer and "optimizer_state" in checkpoint:
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+            except Exception as exc:
+                warnings.warn(f"Could not load optimizer state from {path}: {exc}")
+        self.best_loss = checkpoint.get("best_loss", self.best_loss)
+        self.best_epoch = checkpoint.get("best_epoch", self.best_epoch)
+        self.patience_counter = checkpoint.get("patience_counter", 0)
+        self.train_losses = checkpoint.get("train_losses", self.train_losses)
+        self.val_losses = checkpoint.get("val_losses", self.val_losses)
+        rng_state = checkpoint.get("rng_state")
+        if rng_state and self.args.save_rng_state:
+            self._restore_rng_state(rng_state)
+        return int(checkpoint.get("epoch", 0))
+
+    # ── W&B ──────────────────────────────────────────────────────────────────
+
+    def _init_wandb(self):
+        args = self.args
+        if wandb is None:
+            return None, False
+        if args.wandb_project is None and getattr(wandb, "run", None) is not None:
+            return wandb.run, False
+        if args.wandb_project is None:
+            return None, False
+        init_kwargs: dict = {"project": args.wandb_project}
+        if args.wandb_run_name:
+            init_kwargs["name"] = args.wandb_run_name
+        if args.wandb_tags:
+            init_kwargs["tags"] = args.wandb_tags
+        if args.wandb_mode:
+            init_kwargs["mode"] = args.wandb_mode
+        if args.wandb_entity:
+            init_kwargs["entity"] = args.wandb_entity
+        init_kwargs["config"] = {
+            "model": "patched_predictive" if self.is_predictive else "patched_masked",
+            "patch_length": args.patch_length,
+            "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "d_model": args.d_model,
+            "nhead": args.nhead,
+            "num_layers": args.num_layers,
+            "mask_ratio": args.mask_ratio,
+            "unmasked_weight": args.unmasked_weight,
+            "n_predict_steps": args.n_predict_steps,
+            "pred_loss_weight": args.pred_loss_weight,
+        }
+        try:
+            return wandb.init(**init_kwargs), True
+        except Exception as exc:
+            warnings.warn(f"Failed to initialize wandb: {exc}")
+            return None, False
+
+    def _log_wandb(self, metrics: dict[str, float], step: int | None = None) -> None:
+        if self._wandb_run is None:
+            return
+        payload = dict(metrics)
+        if step is not None and "epoch" not in payload:
+            payload["epoch"] = step
+        self._wandb_run.log(payload, step=step)
+
+    def _log_wandb_image(self, tag: str, fig: plt.Figure, step: int | None) -> None:
+        if self._wandb_run is None or wandb is None or step is None:
+            return
+        try:
+            self._wandb_run.log({tag: wandb.Image(fig)}, step=step)
+        except Exception:
+            pass
+
+    # ── Data summary ─────────────────────────────────────────────────────────
+
+    def _log_data_summary(self) -> None:
+        args = self.args
+        n_train = args.train_windows.shape[0]
+        n_val = args.val_windows.shape[0]
+        n_test = args.test_windows.shape[0] if args.test_windows is not None else 0
+        window_size = args.train_windows.shape[1]
+        lines = [
+            "Data summary (patched model)",
+            "-----------------------------",
+            f"train_windows: {n_train}",
+            f"val_windows:   {n_val}",
+            f"test_windows:  {n_test}",
+            f"window_size:   {window_size}",
+            f"patch_length:  {args.patch_length}",
+            f"n_patches:     {self.n_patches}",
+            f"n_features:    {args.f_in}",
+            f"event_mask:    {args.train_event_mask is not None}",
+            f"bidirectional: True",
+        ]
+        if args.feature_names:
+            lines.append(f"features: {', '.join(args.feature_names)}")
+        text = "\n".join(lines)
+        try:
+            (self.save_path / "data_summary.txt").write_text(text, encoding="utf-8")
+        except Exception:
+            pass
+        if args.verbose:
+            print(text)
+        self.writer.add_text("data/summary", text.replace("\n", "  \n"), 0)
+        self._log_wandb({"data/n_train": n_train, "data/n_val": n_val, "data/n_features": args.f_in}, step=0)
+
+    # ── Main training loop ───────────────────────────────────────────────────
+
+    def train(self) -> float:
+        args = self.args
+        self._log_data_summary()
+        eval_every = max(1, args.eval_every_n_epochs)
+        stop_training = False
+        final_epoch = self.start_epoch - 1
+
+        for epoch in range(self.start_epoch, args.epochs + 1):
+            final_epoch = epoch
+            self.model.train()
+            running_loss = 0.0
+            n_train = len(self.train_loader.dataset)
+            if n_train == 0:
+                raise ValueError("Train dataset is empty.")
+            for batch in self.train_loader:
+                n_batch = batch[0].size(0) if isinstance(batch, (list, tuple)) and len(batch) == 2 else batch.size(0)
+                running_loss += self.learning_step(batch) * n_batch
+            avg_train = running_loss / n_train
+            self.train_losses.append(avg_train)
+            self.writer.add_scalar("train/loss", avg_train, epoch)
+            self._log_wandb({"train/loss": avg_train}, step=epoch)
+
+            epoch_val_loss: float | None = None
+            if epoch % eval_every == 0 or epoch == args.epochs:
+                epoch_val_loss = self._eval(self.val_loader)
+                self.val_losses.append(epoch_val_loss)
+                self.writer.add_scalar("val/loss", epoch_val_loss, epoch)
+                self._log_wandb({"val/loss": epoch_val_loss}, step=epoch)
+                self._plot_validation(epoch)
+                if args.verbose:
+                    print(
+                        f"Epoch {epoch}/{args.epochs} | "
+                        f"Train: {avg_train:.4f} | Val: {epoch_val_loss:.4f}"
+                    )
+                if epoch_val_loss < self.best_loss:
+                    self.best_loss = epoch_val_loss
+                    self.best_epoch = epoch
+                    self.patience_counter = 0
+                    if args.save_model and args.save_best:
+                        self._save_checkpoint(self.save_path / "best.pt", epoch, epoch_val_loss, is_best=True)
+                    self._log_wandb({"best/val_loss": self.best_loss}, step=epoch)
+                else:
+                    self.patience_counter += 1
+                if self.patience_counter >= args.patience:
+                    if args.verbose:
+                        print(f"Early stop at epoch {epoch}")
+                    stop_training = True
+
+            checkpoint_metric = epoch_val_loss if epoch_val_loss is not None else avg_train
+            if args.save_model and args.save_last:
+                self._save_checkpoint(self.save_path / "last.pt", epoch, checkpoint_metric)
+            if args.save_model and args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
+                ckpt_name = self.checkpoints_dir / f"checkpoint_epoch{epoch}.pt"
+                self._save_checkpoint(ckpt_name, epoch, checkpoint_metric)
+                self._clean_old_checkpoints()
+
+            if stop_training:
+                break
+
+        if self.test_loader is not None:
+            test_loss = self._eval(self.test_loader)
+            self.writer.add_scalar("test/loss", test_loss, final_epoch)
+            self._log_wandb({"test/loss": test_loss}, step=final_epoch)
+            self._plot_reconstruction(
+                self.test_loader,
+                "test_recon.png",
+                f"Test set: ~{args.mask_ratio*100:.0f}% patches masked (P={self.patch_length})",
+                self.val_seed + 1,
+                tb_tag="test/gt_vs_recon",
+                tb_step=final_epoch,
+            )
+            if args.verbose:
+                print(f"Final test loss: {test_loss:.4f}")
+        self.writer.close()
+        if self._wandb_run is not None and self._owns_wandb_run:
+            try:
+                self._wandb_run.finish()
+            except Exception:
+                pass
+        return self.best_loss
 
 
 if __name__ == "__main__":
@@ -1177,6 +1848,7 @@ if __name__ == "__main__":
     parser.add_argument("--full_file", action="store_true", help="Load full file(s); no trim.")
     parser.add_argument("--start_times", type=str, default=None, help="Path to startTimes.xlsx (Experiment, CricketEntersTime, ObjectEntersTime). Default: data dir/startTimes.xlsx when loading a dir.")
     parser.add_argument("--no-event-mask", action="store_true", help="Disable event validity mask (all positions valid). Default: use mask when full_file and start_times.")
+    parser.add_argument("--use-dist-head-event", action="store_true", help="Use first non-NaN dist_head row as event start (more accurate than start_times). Loads full files and creates event mask.")
     parser.add_argument("--model", choices=["masked", "predictive"], default="masked", help="Model variant: masked (recon only) or predictive (recon + multi-step prediction).")
     parser.add_argument("--n_predict_steps", type=int, default=3, help="Number of next steps to predict (used when --model predictive).")
     parser.add_argument("--pred_loss_weight", type=float, default=0.5, help="Weight for predictive loss (used when --model predictive).")
@@ -1234,11 +1906,13 @@ if __name__ == "__main__":
             sys.exit(1)
     else:
         use_event_mask = not getattr(args_cli, "no_event_mask", False)
+        use_dh = getattr(args_cli, "use_dist_head_event", False)
         try:
             data, valid_mask = load_data_path(
                 data_path,
-                trim_before_dist_head=not args_cli.full_file,
-                start_times_path=None if args_cli.full_file else args_cli.start_times,
+                trim_before_dist_head=not args_cli.full_file and not use_dh,
+                start_times_path=None if (args_cli.full_file or use_dh) else args_cli.start_times,
+                use_dist_head_event=use_dh,
             )
             valid_mask = valid_mask if use_event_mask else None
             windows, feature_names, event_mask_windows = prepare_masked_transformer_data(
