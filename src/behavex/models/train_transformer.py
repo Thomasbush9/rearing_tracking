@@ -35,6 +35,20 @@ except ImportError:
     wandb = None
 
 
+def set_matmul_precision_auto():
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.set_matmul_precision("high")
+            print("Set matmul precision to high for CUDA")
+        except Exception as e:
+            warnings.warn(f"Failed to set matmul precision to high: {e}")
+
+    else: 
+        pass
+
+
+
+
 def normalize_feature(x: np.ndarray) -> np.ndarray:
     return (x - np.nanmean(x)) / (np.nanstd(x) + 1e-8)
 
@@ -1885,6 +1899,7 @@ if __name__ == "__main__":
     parser.add_argument("--mmap", action="store_true", help="Load preprocessed .npz with memory-mapping (requires uncompressed file).")
     args_cli = parser.parse_args()
 
+    set_matmul_precision_auto()
     if args_cli.config:
         import yaml
         with open(args_cli.config) as f:
