@@ -38,7 +38,7 @@ except ImportError:
 def set_matmul_precision_auto():
     if torch.cuda.is_available():
         try:
-            torch.cuda.set_matmul_precision("high")
+            torch.set_float32_matmul_precision('high')
             print("Set matmul precision to high for CUDA")
         except Exception as e:
             warnings.warn(f"Failed to set matmul precision to high: {e}")
