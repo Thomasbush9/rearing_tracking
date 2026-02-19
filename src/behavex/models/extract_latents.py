@@ -10,6 +10,8 @@ import numpy as np
 from behavex.models.transformer import (
     MaskedTemporalTransformer,
     MaskedPredictiveTemporalTransformer,
+    PatchedMaskedTemporalTransformer,
+    PatchedMaskedPredictiveTemporalTransformer,
 )
 from behavex.models.data import MaskedTemporalDataset
 from torch.utils.data import DataLoader
@@ -27,8 +29,16 @@ def load_single_session_windows(
     start_times_path: str | Path | None = None,
     window_size: int = 128,
     stride: int = 1,
+    full_file: bool = False,
 ) -> tuple[np.ndarray, list[str] | None]:
-    """Load one session (cropped by start time if start_times_path given) and build windows.
+    """Load one session and build windows.
+
+    Args:
+        session_path: Path to the session file (.xlsx).
+        start_times_path: Optional path to startTimes.xlsx for timestamp-based trimming.
+        window_size: Number of timesteps per window.
+        stride: Step between consecutive windows. Use stride=window_size for non-overlapping windows.
+        full_file: If True, load the entire recording without trimming pre-event frames.
 
     Returns:
         windows: (N, window_size, F) float32
@@ -36,7 +46,7 @@ def load_single_session_windows(
     """
     data, _ = load_data_path(
         str(session_path),
-        trim_before_dist_head=True,
+        trim_before_dist_head=not full_file,
         start_times_path=Path(start_times_path) if start_times_path else None,
     )
     windows, feature_names, _ = prepare_masked_transformer_data(
@@ -50,7 +60,12 @@ def _load_model_from_checkpoint(
     device: torch.device,
     return_layer_mean: bool = False,
 ):
-    """Load model from checkpoint. Infers architecture from state_dict and training_params."""
+    """Load model from checkpoint. Infers architecture from state_dict and training_params.
+
+    Supports both standard (MaskedTemporalTransformer) and patched
+    (PatchedMaskedTemporalTransformer) checkpoints. Patched checkpoints are detected
+    by the presence of 'patch_embedding.proj.weight' in the state dict.
+    """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model_state = ckpt.get("model_state", ckpt)
     tp = ckpt.get("training_params", {})
@@ -63,31 +78,62 @@ def _load_model_from_checkpoint(
     n_predict_steps = tp.get("n_predict_steps")
     causal = tp.get("causal", False)
 
-    f_in = model_state["embedding.weight"].shape[1]
-
-    if n_predict_steps is not None:
-        model = MaskedPredictiveTemporalTransformer(
-            f_in=f_in,
-            d_model=d_model,
-            nhead=nhead,
-            num_layers=num_layers,
-            mask_ratio=mask_ratio,
-            value_mask_ratio=value_mask_ratio,
-            n_predict_steps=n_predict_steps,
-            return_layer_mean=return_layer_mean,
-            causal=causal,
-        )
+    is_patched = "patch_embedding.proj.weight" in model_state
+    if is_patched:
+        patch_len = tp.get("patch_length", 8)
+        proj_w = model_state["patch_embedding.proj.weight"]  # (d_model, patch_len * f_in)
+        f_in = proj_w.shape[1] // patch_len
+        dropout = tp.get("dropout", 0.1)
+        if n_predict_steps is not None:
+            model = PatchedMaskedPredictiveTemporalTransformer(
+                f_in=f_in,
+                d_model=d_model,
+                nhead=nhead,
+                num_layers=num_layers,
+                patch_len=patch_len,
+                dropout=dropout,
+                mask_ratio=mask_ratio,
+                value_mask_ratio=value_mask_ratio,
+                n_predict_steps=n_predict_steps,
+                causal=causal,
+            )
+        else:
+            model = PatchedMaskedTemporalTransformer(
+                f_in=f_in,
+                d_model=d_model,
+                nhead=nhead,
+                num_layers=num_layers,
+                patch_len=patch_len,
+                dropout=dropout,
+                mask_ratio=mask_ratio,
+                value_mask_ratio=value_mask_ratio,
+                causal=causal,
+            )
     else:
-        model = MaskedTemporalTransformer(
-            f_in=f_in,
-            d_model=d_model,
-            nhead=nhead,
-            num_layers=num_layers,
-            mask_ratio=mask_ratio,
-            value_mask_ratio=value_mask_ratio,
-            return_layer_mean=return_layer_mean,
-            causal=causal,
-        )
+        f_in = model_state["embedding.weight"].shape[1]
+        if n_predict_steps is not None:
+            model = MaskedPredictiveTemporalTransformer(
+                f_in=f_in,
+                d_model=d_model,
+                nhead=nhead,
+                num_layers=num_layers,
+                mask_ratio=mask_ratio,
+                value_mask_ratio=value_mask_ratio,
+                n_predict_steps=n_predict_steps,
+                return_layer_mean=return_layer_mean,
+                causal=causal,
+            )
+        else:
+            model = MaskedTemporalTransformer(
+                f_in=f_in,
+                d_model=d_model,
+                nhead=nhead,
+                num_layers=num_layers,
+                mask_ratio=mask_ratio,
+                value_mask_ratio=value_mask_ratio,
+                return_layer_mean=return_layer_mean,
+                causal=causal,
+            )
     model.load_state_dict(model_state, strict=True)
     return model.to(device)
 
@@ -99,7 +145,12 @@ def extract_latents(
     batch_size: int = 64,
     no_mask: bool = True,
 ) -> np.ndarray:
-    """Run model in eval mode and collect latent (B, T, d_model) per batch."""
+    """Run model in eval mode and collect latents per batch.
+
+    Returns:
+        For standard models: (N_windows, T, d_model)
+        For patched models:  (N_windows, N_patches, d_model)  where N_patches = T // patch_len
+    """
     model.eval()
     loader = DataLoader(
         MaskedTemporalDataset(windows),
@@ -113,9 +164,37 @@ def extract_latents(
             B, T, _ = X.shape
             mask = torch.zeros(B, T, dtype=torch.bool, device=device) if no_mask else None
             out = model(X, mask=mask)
-            latent = out[1]  # (B, T, d_model)
+            latent = out[1]  # (B, T, d_model) or (B, N_patches, d_model) for patched
             latents_list.append(latent.cpu().numpy())
     return np.concatenate(latents_list, axis=0)
+
+
+def extract_session_latents_for_hmm(
+    session_path: str | Path,
+    checkpoint_path: str | Path,
+    window_size: int = 128,
+    batch_size: int = 64,
+    device: torch.device | None = None,
+    no_mask: bool = True,
+) -> np.ndarray:
+    """Extract patch-level latents from a single session for HMM fitting.
+
+    Uses non-overlapping windows (stride=window_size) so each frame appears exactly once.
+    Loads the full session without trimming pre-event frames.
+
+    Returns:
+        latents: (N_total, d_model) where N_total = N_windows * N_patches_per_window
+                 for patched models, or N_windows * window_size for standard models.
+    """
+    if device is None:
+        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    model = _load_model_from_checkpoint(Path(checkpoint_path), device)
+    windows, _ = load_single_session_windows(
+        session_path, stride=window_size, full_file=True, window_size=window_size
+    )
+    latents = extract_latents(model, windows, device, batch_size=batch_size, no_mask=no_mask)
+    # (N_windows, T_or_N, d_model) → (N_total, d_model)
+    return latents.reshape(-1, latents.shape[-1])
 
 
 def main():
@@ -134,6 +213,7 @@ def main():
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--test-ratio", type=float, default=0.15)
     parser.add_argument("--window-size", type=int, default=128)
+    parser.add_argument("--stride", type=int, default=1, help="Window stride. Use --stride=<window-size> for non-overlapping windows (recommended for HMM)")
     parser.add_argument("--full-file", action="store_true", help="Load full file, no trim")
     parser.add_argument("--start-times", type=str, default=None)
     parser.add_argument("--mmap", action="store_true", help="Memory-map preprocessed .npz")
@@ -165,7 +245,7 @@ def main():
             start_times_path=args.start_times,
         )
         windows, feature_names, _ = prepare_masked_transformer_data(
-            data, window_size=args.window_size, stride=1
+            data, window_size=args.window_size, stride=args.stride
         )
         train_w, val_w, test_w = temporal_train_val_test_split(
             windows, args.val_ratio, args.test_ratio
