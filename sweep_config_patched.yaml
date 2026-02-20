@@ -9,31 +9,31 @@ parameters:
   model:
     value: patched
   patch_length:
-    value: 4
+    values: [4, 16]
   n_predict_steps:
-    value: 3
+    values: [5, 10, 15]
   learning_rate:
     distribution: log_uniform_values
     min: 0.0001
     max: 0.01
   d_model:
-    values: [32, 64, 128]
+    values: [64, 128]
   nhead:
     values: [2, 4]
   num_layers:
     values: [2, 4, 6]
   mask_ratio:
-    values: [0.10, 0.15, 0.20]
+    values: [0.25,0.35,0.40]
   unmasked_weight:
-    values: [0.1, 0.3, 0.5]
+    value: 0.4
   batch_size:
-    values: [16, 32, 64]
+    values: [32, 64, 128]
   pred_loss_weight:
     values: [0.3, 0.5, 0.7]
   data:
     value: null
   preprocessed_data:
-    value: null
+    value: /workspace/data/data_transformer.npz
   val_ratio:
     value: 0.15
   test_ratio:
@@ -43,6 +43,6 @@ parameters:
   patience:
     value: 5
   device:
-    value: mps
+    value: cuda
   seed:
     value: 42

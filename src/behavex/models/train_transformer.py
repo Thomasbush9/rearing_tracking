@@ -94,9 +94,12 @@ def prepare_masked_transformer_data(
     fill_pre_event_with_zero: bool = True,
     drop_cols: list[str] | None = None,
     keep_cols: list[str] | None = None,
-) -> Tuple[np.ndarray, list[str], Optional[np.ndarray]]:
-    """Preprocess: normalize, angular→sin/cos, interpolate, window. Returns (windows, feature_names[, event_mask_windows]).
+    norm_mean: dict | None = None,
+    norm_std: dict | None = None,
+) -> Tuple[np.ndarray, list[str], Optional[np.ndarray], dict]:
+    """Preprocess: normalize, angular→sin/cos, interpolate, window. Returns (windows, feature_names, event_mask_windows, norm_stats).
     When valid_mask (len(data)) is provided, also returns event_mask_windows (N, window_size) and fills pre-event NaNs with 0.
+    norm_mean/norm_std: pre-computed per-feature stats; if provided they are reused instead of computed from data.
     keep_cols: use only these columns (overrides drop_cols). drop_cols: columns to drop (if keep_cols not set).
     """
     if angular_cols is None:
@@ -114,10 +117,16 @@ def prepare_masked_transformer_data(
                 df.loc[~valid_mask, c] = df.loc[~valid_mask, c].fillna(0.0)
 
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    cols_to_norm = [
-        c for c in numeric_cols if c not in angular_cols and c != "timestamp"
-    ]
-    df[cols_to_norm] = df[cols_to_norm].apply(normalize_feature)
+    cols_to_norm = [c for c in numeric_cols if c not in angular_cols and c != "timestamp"]
+    computed_mean: dict[str, float] = {}
+    computed_std: dict[str, float] = {}
+    for c in cols_to_norm:
+        mu  = norm_mean[c] if (norm_mean and c in norm_mean) else float(np.nanmean(df[c]))
+        sig = norm_std[c]  if (norm_std  and c in norm_std)  else float(np.nanstd(df[c]))
+        df[c] = (df[c] - mu) / (sig + 1e-8)
+        computed_mean[c] = mu
+        computed_std[c]  = sig
+    norm_stats_out: dict = {"mean": computed_mean, "std": computed_std}
 
     for c in angular_cols:
         if c in df.columns:
@@ -137,8 +146,8 @@ def prepare_masked_transformer_data(
         em_flat = valid_mask.astype(np.float32).reshape(-1, 1)
         event_mask_windows = make_windows(em_flat, window_size, stride)
         event_mask_windows = (event_mask_windows[:, :, 0] > 0.5).astype(bool)
-        return windows, feature_names, event_mask_windows
-    return windows, feature_names, None
+        return windows, feature_names, event_mask_windows, norm_stats_out
+    return windows, feature_names, None, norm_stats_out
 
 
 def temporal_train_val_test_split(
@@ -169,8 +178,11 @@ def save_preprocessed_dataset(
     train_event_mask: np.ndarray | None = None,
     val_event_mask: np.ndarray | None = None,
     test_event_mask: np.ndarray | None = None,
+    norm_mean: np.ndarray | None = None,
+    norm_std: np.ndarray | None = None,
+    norm_cols: list[str] | None = None,
 ) -> None:
-    """Save preprocessed train/val/test windows to .npz. Optionally save event masks."""
+    """Save preprocessed train/val/test windows to .npz. Optionally save event masks and norm stats."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     arrays: dict = {
@@ -186,6 +198,10 @@ def save_preprocessed_dataset(
         arrays["train_event_mask"] = train_event_mask
         arrays["val_event_mask"] = val_event_mask
         arrays["test_event_mask"] = test_event_mask
+    if norm_mean is not None:
+        arrays["norm_mean"] = norm_mean
+        arrays["norm_std"]  = norm_std
+        arrays["norm_cols"] = np.array(norm_cols, dtype=object)
     meta = {
         "val_ratio": val_ratio,
         "test_ratio": test_ratio,
@@ -209,8 +225,9 @@ def load_preprocessed_dataset(
     Optional[np.ndarray],
     Optional[np.ndarray],
     Optional[np.ndarray],
+    Optional[dict],
 ]:
-    """Load preprocessed train/val/test from .npz or .h5. Returns (train_w, val_w, test_w, feature_names, train_em, val_em, test_em)."""
+    """Load preprocessed train/val/test from .npz or .h5. Returns (train_w, val_w, test_w, feature_names, train_em, val_em, test_em, norm_stats)."""
     path = Path(path)
     if path.suffix.lower() in (".h5", ".hdf5"):
         if h5py is None:
@@ -229,7 +246,7 @@ def load_preprocessed_dataset(
             )
             val_em = np.array(f["val_event_mask"]) if "val_event_mask" in f else None
             test_em = np.array(f["test_event_mask"]) if "test_event_mask" in f else None
-        return train_w, val_w, test_w, feature_names, train_em, val_em, test_em
+        return train_w, val_w, test_w, feature_names, train_em, val_em, test_em, None
     load_kw: dict = {"allow_pickle": True}
     if mmap_mode is not None:
         load_kw["mmap_mode"] = mmap_mode
@@ -242,7 +259,14 @@ def load_preprocessed_dataset(
     train_em = data["train_event_mask"] if "train_event_mask" in data else None
     val_em = data["val_event_mask"] if "val_event_mask" in data else None
     test_em = data["test_event_mask"] if "test_event_mask" in data else None
-    return train_w, val_w, test_w, feature_names, train_em, val_em, test_em
+    norm_stats: dict | None = None
+    if "norm_mean" in data:
+        cols = list(data["norm_cols"])
+        norm_stats = {
+            "mean": dict(zip(cols, data["norm_mean"])),
+            "std":  dict(zip(cols, data["norm_std"])),
+        }
+    return train_w, val_w, test_w, feature_names, train_em, val_em, test_em, norm_stats
 
 
 def prepare_and_save_dataset(
@@ -267,7 +291,7 @@ def prepare_and_save_dataset(
         start_times_path=start_times_path,
         use_dist_head_event=use_dist_head_event,
     )
-    windows, feature_names, event_mask_windows = prepare_masked_transformer_data(
+    windows, feature_names, event_mask_windows, norm_stats = prepare_masked_transformer_data(
         data,
         window_size=window_size,
         stride=stride,
@@ -284,6 +308,9 @@ def prepare_and_save_dataset(
         train_em, val_em, test_em = temporal_train_val_test_split(
             event_mask_windows, val_ratio, test_ratio
         )
+    norm_cols = list(norm_stats["mean"].keys())
+    norm_mean_arr = np.array([norm_stats["mean"][c] for c in norm_cols], dtype=np.float32)
+    norm_std_arr  = np.array([norm_stats["std"][c]  for c in norm_cols], dtype=np.float32)
     save_preprocessed_dataset(
         out_path,
         train_w,
@@ -297,6 +324,9 @@ def prepare_and_save_dataset(
         train_event_mask=train_em,
         val_event_mask=val_em,
         test_event_mask=test_em,
+        norm_mean=norm_mean_arr,
+        norm_std=norm_std_arr,
+        norm_cols=norm_cols,
     )
 
 
@@ -362,7 +392,7 @@ def prepare_and_save_dataset_chunked(
         if columns_ref is None:
             columns_ref = data.columns.tolist()
 
-        windows, fnames, event_mask_windows = prepare_masked_transformer_data(
+        windows, fnames, event_mask_windows, _ = prepare_masked_transformer_data(
             data,
             window_size=window_size,
             stride=stride,
@@ -931,6 +961,7 @@ class MaskedTemporalTrainingArgs:
     wandb_tags: list[str] | None = None
     wandb_mode: str | None = None
     wandb_entity: str | None = None
+    norm_stats: dict | None = None
 
 
 class MaskedTemporalTrainer:
@@ -1335,6 +1366,7 @@ class MaskedTemporalTrainer:
             "timestamp": datetime.datetime.now().isoformat(),
             "model_state": self.model.state_dict(),
             "feature_names": args.feature_names,
+            "norm_stats": args.norm_stats,
             "training_params": {
                 "batch_size": args.batch_size,
                 "learning_rate": args.learning_rate,
@@ -1637,6 +1669,7 @@ def run_train(config: dict) -> float:
     window_size = _scalar(cfg.get("window_size"), 128, int)
 
     train_em, val_em, test_em = None, None, None
+    norm_stats: dict | None = None
     load_path = preprocessed_path or (
         data_path if data_path and str(data_path).endswith(".npz") else None
     )
@@ -1644,7 +1677,7 @@ def run_train(config: dict) -> float:
     if load_path:
         try:
             mmap_mode = "r" if use_mmap else None
-            train_w, val_w, test_w, feature_names, train_em, val_em, test_em = (
+            train_w, val_w, test_w, feature_names, train_em, val_em, test_em, norm_stats = (
                 load_preprocessed_dataset(load_path, mmap_mode=mmap_mode)
             )
         except Exception as e:
@@ -1663,7 +1696,7 @@ def run_train(config: dict) -> float:
                     use_dist_head_event=use_dist_head_event,
                 )
                 valid_mask = valid_mask if use_event_mask else None
-                windows, feature_names, event_mask_windows = (
+                windows, feature_names, event_mask_windows, norm_stats = (
                     prepare_masked_transformer_data(
                         data,
                         window_size=window_size,
@@ -1753,6 +1786,7 @@ def run_train(config: dict) -> float:
         save_path=str(save_path),
         eval_every_n_epochs=_scalar(cfg.get("eval_every_n_epochs"), 1, int),
         feature_names=feature_names,
+        norm_stats=norm_stats,
         unmasked_weight=max(1e-6, _scalar(cfg.get("unmasked_weight"), 0.3, float)),
         n_predict_steps=n_predict_steps,
         pred_loss_weight=pred_loss_weight,
@@ -1844,6 +1878,7 @@ class PatchedTrainingArgs:
     wandb_tags: list[str] | None = None
     wandb_mode: str | None = None
     wandb_entity: str | None = None
+    norm_stats: dict | None = None
 
 
 class PatchedMaskedTemporalTrainer:
@@ -2186,6 +2221,7 @@ class PatchedMaskedTemporalTrainer:
             "timestamp": datetime.datetime.now().isoformat(),
             "model_state": self.model.state_dict(),
             "feature_names": args.feature_names,
+            "norm_stats": args.norm_stats,
             "training_params": {
                 "batch_size": args.batch_size,
                 "learning_rate": args.learning_rate,
@@ -2686,7 +2722,7 @@ if __name__ == "__main__":
     if args_cli.preprocessed_data:
         try:
             mmap_mode = "r" if args_cli.mmap else None
-            train_w, val_w, test_w, feature_names, train_em, val_em, test_em = (
+            train_w, val_w, test_w, feature_names, train_em, val_em, test_em, _ = (
                 load_preprocessed_dataset(
                     args_cli.preprocessed_data, mmap_mode=mmap_mode
                 )
@@ -2707,7 +2743,7 @@ if __name__ == "__main__":
                 use_dist_head_event=use_dh,
             )
             valid_mask = valid_mask if use_event_mask else None
-            windows, feature_names, event_mask_windows = (
+            windows, feature_names, event_mask_windows, _cli_norm_stats = (
                 prepare_masked_transformer_data(
                     data,
                     window_size=128,
@@ -2724,6 +2760,7 @@ if __name__ == "__main__":
             windows = np.random.randn(1000, 128, 24).astype(np.float32)
             feature_names = None
             event_mask_windows = None
+            _cli_norm_stats = None
         if args_cli.test_loading:
             path = Path(data_path)
             kind = "file" if path.is_file() else "dir"
@@ -2743,6 +2780,15 @@ if __name__ == "__main__":
             )
         if args_cli.save_dataset or args_cli.save_dataset_only:
             out = args_cli.save_dataset or "dataset_preprocessed.npz"
+            _cli_nc = list(_cli_norm_stats["mean"].keys()) if _cli_norm_stats else None
+            _cli_nm = (
+                np.array([_cli_norm_stats["mean"][c] for c in _cli_nc], dtype=np.float32)
+                if _cli_norm_stats else None
+            )
+            _cli_ns = (
+                np.array([_cli_norm_stats["std"][c]  for c in _cli_nc], dtype=np.float32)
+                if _cli_norm_stats else None
+            )
             save_preprocessed_dataset(
                 out,
                 train_w,
@@ -2756,6 +2802,9 @@ if __name__ == "__main__":
                 train_event_mask=train_em,
                 val_event_mask=val_em,
                 test_event_mask=test_em,
+                norm_mean=_cli_nm,
+                norm_std=_cli_ns,
+                norm_cols=_cli_nc,
             )
             print(f"Saved preprocessed dataset to {out}")
             if args_cli.save_dataset_only:

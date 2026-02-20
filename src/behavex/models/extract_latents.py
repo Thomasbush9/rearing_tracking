@@ -31,6 +31,7 @@ def load_single_session_windows(
     stride: int = 1,
     full_file: bool = False,
     keep_features: list[str] | None = None,
+    norm_stats: dict | None = None,
 ) -> tuple[np.ndarray, list[str] | None]:
     """Load one session and build windows.
 
@@ -53,8 +54,12 @@ def load_single_session_windows(
         trim_before_dist_head=not full_file,
         start_times_path=Path(start_times_path) if start_times_path else None,
     )
-    windows, feature_names, _ = prepare_masked_transformer_data(
-        data, window_size=window_size, stride=stride
+    windows, feature_names, _, _ = prepare_masked_transformer_data(
+        data,
+        window_size=window_size,
+        stride=stride,
+        norm_mean=norm_stats.get("mean") if norm_stats else None,
+        norm_std=norm_stats.get("std") if norm_stats else None,
     )
     if keep_features is not None and feature_names is not None:
         # Build index mapping from keep_features → column indices in windows
@@ -167,7 +172,8 @@ def _load_model_from_checkpoint(
                 causal=causal,
             )
     model.load_state_dict(model_state, strict=True)
-    return model.to(device), feature_names
+    norm_stats = ckpt.get("norm_stats", None)
+    return model.to(device), feature_names, norm_stats
 
 
 def extract_latents(
@@ -228,12 +234,12 @@ def extract_session_latents_for_hmm(
     """
     if device is None:
         device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    model, feature_names = _load_model_from_checkpoint(Path(checkpoint_path), device)
+    model, feature_names, norm_stats = _load_model_from_checkpoint(Path(checkpoint_path), device)
     if feature_names:
         print(f"[extract] Filtering session to {len(feature_names)} training features.")
     windows, _ = load_single_session_windows(
         session_path, stride=window_size, full_file=True, window_size=window_size,
-        keep_features=feature_names,
+        keep_features=feature_names, norm_stats=norm_stats,
     )
     latents = extract_latents(model, windows, device, batch_size=batch_size, no_mask=no_mask)
     # (N_windows, T_or_N, d_model) → (N_total, d_model)
@@ -263,7 +269,7 @@ def main():
     args = parser.parse_args()
 
     no_mask = not args.use_mask
-    device = torch.device(args.device or "mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device(args.device if args.device else ("mps" if torch.backends.mps.is_available() else "cpu"))
 
     # Load checkpoint and model
     ckpt_path = Path(args.checkpoint).expanduser().resolve()
@@ -271,12 +277,12 @@ def main():
         print(f"Checkpoint not found: {ckpt_path}", file=sys.stderr)
         sys.exit(1)
 
-    model, _ = _load_model_from_checkpoint(ckpt_path, device, return_layer_mean=args.layer_mean)
+    model, _, _ = _load_model_from_checkpoint(ckpt_path, device, return_layer_mean=args.layer_mean)
 
     # Load data
     if args.preprocessed_data:
         mmap_mode = "r" if args.mmap else None
-        train_w, val_w, test_w, feature_names, _, _, _ = load_preprocessed_dataset(
+        train_w, val_w, test_w, feature_names, _, _, _, _ = load_preprocessed_dataset(
             args.preprocessed_data, mmap_mode=mmap_mode
         )
         with np.load(args.preprocessed_data, allow_pickle=True) as npz:
@@ -287,7 +293,7 @@ def main():
             trim_before_dist_head=not args.full_file,
             start_times_path=args.start_times,
         )
-        windows, feature_names, _ = prepare_masked_transformer_data(
+        windows, feature_names, _, _ = prepare_masked_transformer_data(
             data, window_size=args.window_size, stride=args.stride
         )
         train_w, val_w, test_w = temporal_train_val_test_split(

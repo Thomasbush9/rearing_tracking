@@ -1,0 +1,69 @@
+
+== Latent Space Extraction and Hidden State Discovery
+
+The self-supervised transformer described in the previous section learns a continuous latent representation of behavior at each timestep (or patch). To bridge the gap between this continuous representation and the discrete behavioral states hypothesized by ethological models, we fit a Hidden Markov Model (HMM) on the extracted latent time series. This two-stage approach — representation learning followed by probabilistic state inference — combines the expressivity of deep sequence models with the interpretability and statistical rigor of generative state-space models.
+
+=== Latent Extraction
+
+After training, latent representations are extracted from the best-performing transformer checkpoint in inference mode. For each sliding window of $w = 128$ frames, the model receives the full, unmasked input (the mask is set to all zeros) and produces a deterministic latent vector at each position. For the non-patched model, this yields a tensor of shape $(w, d_"model")$ per window; for the patched model, the output is $(N, d_"model")$ where $N = w slash P$.
+
+To obtain a single latent vector per timestep — suitable for fitting a sequential model over the full recording — we take the representation at the last position of each window. Because windows are constructed with stride $s = 1$, this produces a continuous latent time series $bold(z)_t in bb(R)^(d_"model")$ for $t = 1, dots, T'$, where $T' = T - w + 1$ is the number of valid windows. Each $bold(z)_t$ summarizes the behavioral state at frame $t$ conditioned on the preceding $w - 1$ frames of temporal context, as encoded by the transformer's self-attention mechanism.
+
+=== Dimensionality Reduction
+
+Before fitting the HMM, the dimensionality of the latent space is optionally reduced via Principal Component Analysis (PCA). This serves two purposes: (i) it removes directions of negligible variance that may add noise to the HMM emission model, and (ii) it reduces the number of parameters in the Gaussian emission distributions, improving model stability and convergence. The number of retained components is selected to preserve a target fraction of the total variance (e.g. 95%), or set to a fixed value based on inspection of the explained variance spectrum. In practice, the transformer latent space tends to concentrate meaningful variation in a relatively low-dimensional subspace, making moderate compression ($d_"model" arrow.r d_"PCA" approx 10$–$20$) feasible without significant information loss.
+
+=== Choice of State-Space Model: HMM vs. AR-HMM
+
+A natural alternative to the standard Gaussian HMM would be an autoregressive HMM (AR-HMM), in which each state's emission model includes an autoregressive component: $bold(z)_t | s_t = k, bold(z)_(t-1) tilde cal(N)(bold(A)_k bold(z)_(t-1) + bold(b)_k, bold(Sigma)_k)$. AR-HMMs have proven highly effective for behavioral segmentation when applied directly to raw pose-derived features, where strong temporal autocorrelation within behavioral bouts makes simple Gaussian emissions inadequate — this is the approach taken by MoSeq @winslowMAPHDPLabelFree2016 and related AR-HMM frameworks @lindermanBayesianLearningDiscovery2017.
+
+However, in our two-stage pipeline the observations fed to the HMM are not raw kinematic features but transformer latent representations. Each latent $bold(z)_t$ already encodes temporal dynamics over a $w = 128$-frame context window through self-attention, and has been explicitly shaped by a multi-step predictive training objective (see @training_objectives). Consequently, the temporal dependencies that an AR-HMM would model are already absorbed into the representation itself. Adding autoregressive parameters on top of these latents would be largely redundant, while substantially increasing the number of free parameters per state (each state would require a $d times d$ dynamics matrix $bold(A)_k$), making estimation less stable — particularly when individual states have limited occupancy.
+
+This reasoning follows the general principle in representation learning that, when a deep encoder has already captured the relevant temporal structure, downstream probabilistic models can operate with simpler emission distributions @bengiRepresentationLearningReview2013. Empirical work on self-supervised behavioral embeddings has similarly found that simple clustering or Gaussian mixture models on learned latents are sufficient to recover meaningful behavioral states, without requiring autoregressive emission models @sunSelfSupervisedBehavioralAnalysis2021 @luxemOpenSourceToolsForBehavioralAnalysis2023. We therefore adopt a standard Gaussian HMM, which assigns each state a simple emission distribution and relies on the transition matrix to capture the sequential organization of behavioral states.
+
+=== Hidden Markov Model
+
+We model the reduced latent time series $tilde(bold(z))_1, dots, tilde(bold(z))_(T')$ as observations generated by a Hidden Markov Model with $K$ discrete hidden states. Each hidden state $k in {1, dots, K}$ is associated with a multivariate Gaussian emission distribution:
+
+$ tilde(bold(z))_t | s_t = k tilde cal(N)(bold(mu)_k, bold(Sigma)_k) $
+
+where $bold(mu)_k$ and $bold(Sigma)_k$ are the mean and covariance of state $k$. The hidden state sequence $s_1, dots, s_(T')$ evolves according to a first-order Markov chain with transition matrix $bold(A) in bb(R)^(K times K)$, where $A_(i j) = P(s_(t+1) = j | s_t = i)$, and initial state distribution $bold(pi)$.
+
+The model parameters ${bold(pi), bold(A), {bold(mu)_k, bold(Sigma)_k}_(k=1)^K}$ are estimated via the Expectation-Maximization (EM) algorithm (Baum-Welch), and the most likely state sequence is decoded using the Viterbi algorithm.
+
+==== Model Selection: Number of States
+
+The number of hidden states $K$ is a critical hyperparameter that determines the granularity of the behavioral segmentation. We fit HMMs for a range of candidate values (e.g. $K in {3, 5, 8, 10, 15, 20}$) and select the optimal $K$ using the Bayesian Information Criterion (BIC):
+
+$ "BIC" = -2 ln hat(cal(L)) + p ln T' $
+
+where $hat(cal(L))$ is the maximized log-likelihood, $p$ is the number of free parameters, and $T'$ is the number of observations. The BIC penalizes model complexity, favoring the simplest model that adequately explains the data. The optimal $K$ is identified as the value at which the BIC curve exhibits a clear elbow or reaches a minimum. Additionally, models are evaluated for degenerate states (states with negligible occupancy or near-identical emission distributions) and the selected $K$ is validated against the interpretability of the resulting behavioral segmentation.
+
+=== Analysis of Discovered Hidden States
+
+Once the HMM is fitted and the Viterbi state sequence $hat(s)_1, dots, hat(s)_(T')$ is decoded, we characterize the discovered behavioral states through the following analyses:
+
+==== State Occupancy and Duration
+
+For each state $k$, we compute the fractional occupancy (proportion of time spent in that state) and the distribution of bout durations (number of consecutive frames assigned to the same state). The bout duration distribution reveals whether states represent brief, transient actions or sustained behavioral modes, and whether the geometric duration assumption implicit in the HMM is appropriate.
+
+==== Transition Structure
+
+The estimated transition matrix $bold(A)$ is visualized as a heatmap and as a directed graph, where edge weights correspond to transition probabilities. This reveals the sequential organization of behavior: which states preferentially follow one another, whether there are absorbing states, and whether the transition structure forms modular sub-networks corresponding to distinct behavioral programs (e.g. exploration vs. interaction).
+
+==== Ethograms
+
+The decoded state sequence is displayed as a color-coded ethogram aligned with the original behavioral recording. This provides a temporal map of behavioral state assignments, allowing visual inspection of the segmentation quality and comparison across experimental conditions (e.g. cricket vs. object sessions, or across animals).
+
+==== State-Feature Correspondence
+
+To interpret what each hidden state represents in terms of observable behavior, we map the decoded states back to the original feature space. For each state $k$, we compute summary statistics (mean and standard deviation) of the original pose-derived features across all frames assigned to that state. This produces a behavioral profile for each state — for example, a state characterized by high angular velocity, low distance to the target, and specific head-body angle configurations may correspond to oriented approach behavior.
+
+==== Latent Space Visualization
+
+The latent time series is projected onto two dimensions via UMAP or t-SNE and colored by the decoded HMM state assignment. This visualization reveals whether the transformer has learned a latent geometry in which behavioral states form separable clusters — a qualitative measure of the alignment between the learned representation and the discrete state structure imposed by the HMM. Well-separated clusters indicate that the transformer has captured behaviorally meaningful variation, while overlap may suggest that certain states are distinguished primarily by their temporal dynamics rather than their instantaneous feature profiles.
+
+==== Comparison Across Conditions
+
+To assess whether the discovered behavioral states differ across experimental conditions, we compare state occupancies, bout duration distributions, and transition matrices between conditions (e.g. sessions with a live cricket vs. an inanimate object). Statistical differences in state usage are tested using permutation tests or bootstrap confidence intervals on the state occupancy fractions. Changes in transition structure are quantified by comparing the off-diagonal elements of the transition matrices, revealing condition-dependent shifts in the sequential organization of behavior.
+

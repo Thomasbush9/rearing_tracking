@@ -82,7 +82,7 @@ class HmmLatentExtractor:
 
     def _load_model(self):
         """Load model from checkpoint."""
-        model, _ = _load_model_from_checkpoint(
+        model, _, _ = _load_model_from_checkpoint(
             self.checkpoint_path, self.device, return_layer_mean=self.return_layer_mean
         )
         return model
@@ -181,7 +181,7 @@ class HmmLatentExtractor:
         if data_path.suffix == ".npz":
             # Preprocessed data
             mmap_mode = mmap_mode or ("r" if mmap_mode else None)
-            train_w, val_w, test_w, feature_names, _, _, _ = load_preprocessed_dataset(
+            train_w, val_w, test_w, feature_names, _, _, _, _ = load_preprocessed_dataset(
                 str(data_path), mmap_mode=mmap_mode
             )
 
@@ -192,7 +192,7 @@ class HmmLatentExtractor:
         else:
             # Raw data
             data, _ = load_data_path(str(data_path), trim_before_dist_head=True)
-            windows, feature_names, _ = prepare_masked_transformer_data(
+            windows, feature_names, _, _ = prepare_masked_transformer_data(
                 data, window_size=window_size, stride=1
             )
             train_w, val_w, test_w = temporal_train_val_test_split(windows, 0.15, 0.15)
