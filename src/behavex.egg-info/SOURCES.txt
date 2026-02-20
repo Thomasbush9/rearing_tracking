@@ -17,11 +17,16 @@ src/behavex/inference/__init__.py
 src/behavex/inference/inference.py
 src/behavex/models/__init__.py
 src/behavex/models/data.py
+src/behavex/models/extract_hmm_latents.py
 src/behavex/models/extract_latents.py
 src/behavex/models/gru.py
+src/behavex/models/hmm_data.py
+src/behavex/models/hmm_trainer.py
 src/behavex/models/inspect_transformer.py
 src/behavex/models/make_dataset.py
+src/behavex/models/run_hmm_pipeline.py
 src/behavex/models/sweep_transformer.py
+src/behavex/models/test_hmm.py
 src/behavex/models/train.py
 src/behavex/models/train_transformer.py
 src/behavex/models/transformer.py
@@ -33,3 +38,4 @@ src/behavex/utils/__init__.py
 src/behavex/utils/copula_script.py
 src/behavex/utils/helpers.py
 src/behavex/utils/validation.py
+tests/test_dataset_prep.py

@@ -82,9 +82,10 @@ class HmmLatentExtractor:
 
     def _load_model(self):
         """Load model from checkpoint."""
-        return _load_model_from_checkpoint(
+        model, _ = _load_model_from_checkpoint(
             self.checkpoint_path, self.device, return_layer_mean=self.return_layer_mean
         )
+        return model
 
     def extract_sequential_latents(
         self,
@@ -287,12 +288,15 @@ class HmmLatentExtractor:
                 X = X.to(self.device)
                 B, T, _ = X.shape
 
-                # Create mask
-                mask = (
-                    torch.zeros(B, T, dtype=torch.bool, device=self.device)
-                    if no_mask
-                    else None
-                )
+                # Create mask — patched models expect (B, N) patch-level, not (B, T)
+                if no_mask:
+                    if is_patched:
+                        N = T // self.model.patch_len
+                        mask = torch.zeros(B, N, dtype=torch.bool, device=self.device)
+                    else:
+                        mask = torch.zeros(B, T, dtype=torch.bool, device=self.device)
+                else:
+                    mask = None
 
                 if return_uncertainty:
                     # Multiple forward passes with dropout ON
@@ -391,15 +395,19 @@ class HmmLatentExtractor:
         if return_uncertainty:
             all_latent_samples = []
 
+        is_patched_per_window = hasattr(self.model, "patch_embedding")
         with torch.no_grad():
             for X in loader:
                 X = X.to(self.device)
                 B, T, _ = X.shape
-                mask = (
-                    torch.zeros(B, T, dtype=torch.bool, device=self.device)
-                    if no_mask
-                    else None
-                )
+                if no_mask:
+                    if is_patched_per_window:
+                        N = T // self.model.patch_len
+                        mask = torch.zeros(B, N, dtype=torch.bool, device=self.device)
+                    else:
+                        mask = torch.zeros(B, T, dtype=torch.bool, device=self.device)
+                else:
+                    mask = None
 
                 if return_uncertainty:
                     latent_samples = []

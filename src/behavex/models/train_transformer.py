@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from torch.optim import Adam
 from dataclasses import dataclass, field
 from behavex.models.data import MaskedTemporalDataset
-from typing import Union, Optional, Tuple
+from typing import Union, Optional, Tuple, Iterator
 from pathlib import Path
 import re
 import torch
@@ -25,6 +25,7 @@ import datetime
 import random
 import warnings
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -34,19 +35,22 @@ try:
 except ImportError:
     wandb = None
 
+try:
+    import h5py
+except ImportError:
+    h5py = None
+
 
 def set_matmul_precision_auto():
     if torch.cuda.is_available():
         try:
-            torch.set_float32_matmul_precision('high')
+            torch.set_float32_matmul_precision("high")
             print("Set matmul precision to high for CUDA")
         except Exception as e:
             warnings.warn(f"Failed to set matmul precision to high: {e}")
 
-    else: 
+    else:
         pass
-
-
 
 
 def normalize_feature(x: np.ndarray) -> np.ndarray:
@@ -68,16 +72,16 @@ def make_windows(X: np.ndarray, window_size: int, stride: int = 1) -> np.ndarray
 
 
 def _default_angular_cols() -> list[str]:
+    """Angular/orientation columns (deg or deg/s) to encode as sin/cos."""
     return [
         "angle_head_body_axis",
+        "angle_head_body_speed",
         "angle_head_body_l",
         "angle_head_body_r",
         "ori_allBody",
         "ori_trunk",
         "ori_head",
         "facing_angle",
-        "rel_bearing",
-        "rel_angle_target",
     ]
 
 
@@ -89,14 +93,18 @@ def prepare_masked_transformer_data(
     valid_mask: np.ndarray | None = None,
     fill_pre_event_with_zero: bool = True,
     drop_cols: list[str] | None = None,
+    keep_cols: list[str] | None = None,
 ) -> Tuple[np.ndarray, list[str], Optional[np.ndarray]]:
     """Preprocess: normalize, angular→sin/cos, interpolate, window. Returns (windows, feature_names[, event_mask_windows]).
     When valid_mask (len(data)) is provided, also returns event_mask_windows (N, window_size) and fills pre-event NaNs with 0.
-    drop_cols: columns to drop before processing (e.g. ['height'] to keep only height_scaled)."""
+    keep_cols: use only these columns (overrides drop_cols). drop_cols: columns to drop (if keep_cols not set).
+    """
     if angular_cols is None:
         angular_cols = _default_angular_cols()
     df = data.dropna(axis=1, how="all").copy()
-    if drop_cols:
+    if keep_cols:
+        df = df[[c for c in keep_cols if c in df.columns]]
+    elif drop_cols:
         df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
 
     if valid_mask is not None and fill_pre_event_with_zero:
@@ -106,7 +114,9 @@ def prepare_masked_transformer_data(
                 df.loc[~valid_mask, c] = df.loc[~valid_mask, c].fillna(0.0)
 
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    cols_to_norm = [c for c in numeric_cols if c not in angular_cols and c != "timestamp"]
+    cols_to_norm = [
+        c for c in numeric_cols if c not in angular_cols and c != "timestamp"
+    ]
     df[cols_to_norm] = df[cols_to_norm].apply(normalize_feature)
 
     for c in angular_cols:
@@ -116,7 +126,9 @@ def prepare_masked_transformer_data(
             df[f"{c}_cos"] = np.cos(rad)
             df = df.drop(columns=[c])
 
-    numeric = df.select_dtypes(include=[np.number]).drop(columns=["timestamp"], errors="ignore")
+    numeric = df.select_dtypes(include=[np.number]).drop(
+        columns=["timestamp"], errors="ignore"
+    )
     numeric = numeric.interpolate(method="linear", limit_direction="both")
     feature_names = numeric.columns.tolist()
     X = numeric.values
@@ -166,11 +178,19 @@ def save_preprocessed_dataset(
         "val_windows": val_windows,
         "test_windows": test_windows,
     }
-    if train_event_mask is not None and val_event_mask is not None and test_event_mask is not None:
+    if (
+        train_event_mask is not None
+        and val_event_mask is not None
+        and test_event_mask is not None
+    ):
         arrays["train_event_mask"] = train_event_mask
         arrays["val_event_mask"] = val_event_mask
         arrays["test_event_mask"] = test_event_mask
-    meta = {"val_ratio": val_ratio, "test_ratio": test_ratio, "window_size": window_size}
+    meta = {
+        "val_ratio": val_ratio,
+        "test_ratio": test_ratio,
+        "window_size": window_size,
+    }
     fn_arr = np.array(feature_names, dtype=object) if feature_names else np.array([])
     if compressed:
         np.savez_compressed(path, **arrays, feature_names=fn_arr, **meta)
@@ -181,8 +201,35 @@ def save_preprocessed_dataset(
 def load_preprocessed_dataset(
     path: str | Path,
     mmap_mode: str | None = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[list[str]], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-    """Load preprocessed train/val/test from .npz. Returns (train_w, val_w, test_w, feature_names, train_em, val_em, test_em)."""
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    Optional[list[str]],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+]:
+    """Load preprocessed train/val/test from .npz or .h5. Returns (train_w, val_w, test_w, feature_names, train_em, val_em, test_em)."""
+    path = Path(path)
+    if path.suffix.lower() in (".h5", ".hdf5"):
+        if h5py is None:
+            raise ImportError(
+                "h5py is required to load .h5 datasets; install with: pip install h5py"
+            )
+        with h5py.File(path, "r") as f:
+            train_w = np.array(f["train_windows"])
+            val_w = np.array(f["val_windows"])
+            test_w = np.array(f["test_windows"])
+            feature_names = (
+                list(f["feature_names"][:]) if "feature_names" in f else None
+            )
+            train_em = (
+                np.array(f["train_event_mask"]) if "train_event_mask" in f else None
+            )
+            val_em = np.array(f["val_event_mask"]) if "val_event_mask" in f else None
+            test_em = np.array(f["test_event_mask"]) if "test_event_mask" in f else None
+        return train_w, val_w, test_w, feature_names, train_em, val_em, test_em
     load_kw: dict = {"allow_pickle": True}
     if mmap_mode is not None:
         load_kw["mmap_mode"] = mmap_mode
@@ -210,6 +257,7 @@ def prepare_and_save_dataset(
     compressed: bool = True,
     angular_cols: list[str] | None = None,
     drop_cols: list[str] | None = None,
+    keep_cols: list[str] | None = None,
     use_dist_head_event: bool = False,
 ) -> None:
     """Load raw data, preprocess, split, and save. When trim_before_dist_head=False and start_times_path set, saves event masks."""
@@ -220,22 +268,176 @@ def prepare_and_save_dataset(
         use_dist_head_event=use_dist_head_event,
     )
     windows, feature_names, event_mask_windows = prepare_masked_transformer_data(
-        data, window_size=window_size, stride=stride, valid_mask=valid_mask,
-        angular_cols=angular_cols, drop_cols=drop_cols,
+        data,
+        window_size=window_size,
+        stride=stride,
+        valid_mask=valid_mask,
+        angular_cols=angular_cols,
+        drop_cols=drop_cols,
+        keep_cols=keep_cols,
     )
-    train_w, val_w, test_w = temporal_train_val_test_split(windows, val_ratio, test_ratio)
+    train_w, val_w, test_w = temporal_train_val_test_split(
+        windows, val_ratio, test_ratio
+    )
     train_em, val_em, test_em = None, None, None
     if event_mask_windows is not None:
-        train_em, val_em, test_em = temporal_train_val_test_split(event_mask_windows, val_ratio, test_ratio)
+        train_em, val_em, test_em = temporal_train_val_test_split(
+            event_mask_windows, val_ratio, test_ratio
+        )
     save_preprocessed_dataset(
-        out_path, train_w, val_w, test_w, feature_names,
-        val_ratio, test_ratio, window_size, compressed=compressed,
-        train_event_mask=train_em, val_event_mask=val_em, test_event_mask=test_em,
+        out_path,
+        train_w,
+        val_w,
+        test_w,
+        feature_names,
+        val_ratio,
+        test_ratio,
+        window_size,
+        compressed=compressed,
+        train_event_mask=train_em,
+        val_event_mask=val_em,
+        test_event_mask=test_em,
     )
+
+
+def prepare_and_save_dataset_chunked(
+    data_path: str | Path,
+    out_path: str | Path,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    window_size: int = 128,
+    stride: int = 1,
+    trim_before_dist_head: bool = True,
+    start_times_path: str | Path | None = None,
+    angular_cols: list[str] | None = None,
+    drop_cols: list[str] | None = None,
+    keep_cols: list[str] | None = None,
+    use_dist_head_event: bool = False,
+) -> None:
+    """Build dataset per-session and append to HDF5 to avoid loading all data into RAM."""
+    if h5py is None:
+        raise ImportError(
+            "h5py is required for chunked dataset preparation; install with: pip install h5py"
+        )
+    path = Path(data_path)
+    out_path = Path(out_path)
+    if out_path.suffix.lower() not in (".h5", ".hdf5"):
+        out_path = out_path.with_suffix(".h5")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    start_times_df = None
+    if not use_dist_head_event:
+        sp = (
+            Path(start_times_path)
+            if start_times_path
+            else (
+                path / "startTimes.xlsx"
+                if path.is_dir()
+                else path.parent / "startTimes.xlsx"
+            )
+        )
+        if sp.is_file():
+            start_times_df = _load_start_times(sp)
+
+    session_paths = _get_session_paths(str(data_path))
+    M = len(session_paths)
+    n_train = max(0, int(M * (1 - val_ratio - test_ratio)))
+    n_val = max(0, int(M * val_ratio))
+    n_test = M - n_train - n_val
+
+    columns_ref: list[str] | None = None
+    feature_names: list[str] | None = None
+    n_features: int = 0
+    has_event_mask = False
+    f = None
+    train_ds = val_ds = test_ds = None
+    train_em_ds = val_em_ds = test_em_ds = None
+
+    for i, fp in enumerate(tqdm(session_paths, desc="Sessions", unit="file")):
+        data, valid_mask = _load_one_session_from_path(
+            fp, columns_ref, trim_before_dist_head, start_times_df, use_dist_head_event
+        )
+        if data.empty or len(data) < window_size:
+            continue
+        if columns_ref is None:
+            columns_ref = data.columns.tolist()
+
+        windows, fnames, event_mask_windows = prepare_masked_transformer_data(
+            data,
+            window_size=window_size,
+            stride=stride,
+            valid_mask=valid_mask,
+            angular_cols=angular_cols,
+            drop_cols=drop_cols,
+            keep_cols=keep_cols,
+        )
+        if windows.size == 0:
+            continue
+        _, _, F = windows.shape
+        if feature_names is None:
+            feature_names = fnames
+            n_features = F
+            has_event_mask = event_mask_windows is not None
+            f = h5py.File(out_path, "w")
+            for name, n_max in [
+                ("train_windows", n_train),
+                ("val_windows", n_val),
+                ("test_windows", n_test),
+            ]:
+                # Create with 0 rows; we resize and append per session
+                f.create_dataset(
+                    name,
+                    shape=(0, window_size, n_features),
+                    maxshape=(None, window_size, n_features),
+                    dtype=windows.dtype,
+                    chunks=(1, window_size, n_features),
+                )
+            if has_event_mask:
+                for name in ("train_event_mask", "val_event_mask", "test_event_mask"):
+                    f.create_dataset(
+                        name,
+                        shape=(0, window_size),
+                        maxshape=(None, window_size),
+                        dtype=bool,
+                        chunks=(1, window_size),
+                    )
+            f.attrs["val_ratio"] = val_ratio
+            f.attrs["test_ratio"] = test_ratio
+            f.attrs["window_size"] = window_size
+            dt = h5py.special_dtype(vlen=str)
+            f.create_dataset(
+                "feature_names", (len(feature_names),), dtype=dt, data=feature_names
+            )
+            train_ds = f["train_windows"]
+            val_ds = f["val_windows"]
+            test_ds = f["test_windows"]
+            if has_event_mask:
+                train_em_ds = f["train_event_mask"]
+                val_em_ds = f["val_event_mask"]
+                test_em_ds = f["test_event_mask"]
+
+        if i < n_train:
+            dst, em_dst = train_ds, train_em_ds
+        elif i < n_train + n_val:
+            dst, em_dst = val_ds, val_em_ds
+        else:
+            dst, em_dst = test_ds, test_em_ds
+
+        n_win = len(windows)
+        dst.resize(dst.shape[0] + n_win, axis=0)
+        dst[-n_win:] = windows
+        if has_event_mask and event_mask_windows is not None and em_dst is not None:
+            em_dst.resize(em_dst.shape[0] + n_win, axis=0)
+            em_dst[-n_win:] = event_mask_windows
+
+    if f is not None:
+        f.close()
 
 
 # Filename pattern: m{mouse}_s{session}_{cricket|object}.xlsx / .xls
-_SESSION_PATTERN = re.compile(r"^m\d+_s\d+_(cricket|object)\.(xlsx|xls)$", re.IGNORECASE)
+_SESSION_PATTERN = re.compile(
+    r"^m\d+_s\d+_(cricket|object)\.(xlsx|xls)$", re.IGNORECASE
+)
 
 
 def _session_key_from_path(path: Path) -> tuple[str, str] | None:
@@ -366,11 +568,16 @@ def load_data_path(
         if not path.is_dir():
             raise FileNotFoundError(f"Not a file or directory: {path}")
         matching = sorted(
-            f for f in path.iterdir()
-            if f.is_file() and f.suffix.lower() in (".xlsx", ".xls") and _SESSION_PATTERN.match(f.name)
+            f
+            for f in path.iterdir()
+            if f.is_file()
+            and f.suffix.lower() in (".xlsx", ".xls")
+            and _SESSION_PATTERN.match(f.name)
         )
         if not matching:
-            raise FileNotFoundError(f"No session files (m*_s*_cricket|object.xlsx) in {path}")
+            raise FileNotFoundError(
+                f"No session files (m*_s*_cricket|object.xlsx) in {path}"
+            )
         frames: list[pd.DataFrame] = []
         valid_chunks: list[np.ndarray] = []
         columns_ref: list[str] | None = None
@@ -388,18 +595,26 @@ def load_data_path(
             frames.append(df)
             valid_chunks.append(vm)
         if not frames:
-            raise FileNotFoundError(f"No session files (m*_s*_cricket|object.xlsx) in {path}")
+            raise FileNotFoundError(
+                f"No session files (m*_s*_cricket|object.xlsx) in {path}"
+            )
         data = pd.concat(frames, ignore_index=True)
         valid_mask = np.concatenate(valid_chunks)
         return data, valid_mask
 
     # ── Legacy paths (start_times / trim_before_dist_head) ───────────────
     if path.is_file():
-        start_path = Path(start_times_path) if start_times_path else path.parent / "startTimes.xlsx"
+        start_path = (
+            Path(start_times_path)
+            if start_times_path
+            else path.parent / "startTimes.xlsx"
+        )
         start_df = _load_start_times(start_path) if start_path.is_file() else None
         t = _get_start_time_for_file(path, start_df) if start_df is not None else None
         if trim_before_dist_head:
-            data = _load_one_session(path, trim_before_dist_head=(t is None), start_time=t)
+            data = _load_one_session(
+                path, trim_before_dist_head=(t is None), start_time=t
+            )
             return data, None
         data = _load_one_session(path, trim_before_dist_head=False, start_time=None)
         if start_df is not None and t is not None:
@@ -410,7 +625,9 @@ def load_data_path(
         return data, None
     if not path.is_dir():
         raise FileNotFoundError(f"Not a file or directory: {path}")
-    start_path = Path(start_times_path) if start_times_path else path / "startTimes.xlsx"
+    start_path = (
+        Path(start_times_path) if start_times_path else path / "startTimes.xlsx"
+    )
     start_times_df: pd.DataFrame | None = None
     if start_path.is_file():
         start_times_df = _load_start_times(start_path)
@@ -418,13 +635,22 @@ def load_data_path(
     valid_chunks = []
     columns_ref = None
     matching = sorted(
-        f for f in path.iterdir()
-        if f.is_file() and f.suffix.lower() in (".xlsx", ".xls") and _SESSION_PATTERN.match(f.name)
+        f
+        for f in path.iterdir()
+        if f.is_file()
+        and f.suffix.lower() in (".xlsx", ".xls")
+        and _SESSION_PATTERN.match(f.name)
     )
     if not matching:
-        raise FileNotFoundError(f"No session files (m*_s*_cricket|object.xlsx) in {path}")
+        raise FileNotFoundError(
+            f"No session files (m*_s*_cricket|object.xlsx) in {path}"
+        )
     for f in tqdm(matching, desc="Loading sessions", unit="file"):
-        start_time = _get_start_time_for_file(f, start_times_df) if start_times_df is not None else None
+        start_time = (
+            _get_start_time_for_file(f, start_times_df)
+            if start_times_df is not None
+            else None
+        )
         if start_times_df is not None and start_time is None:
             print(f"  [start_times] No match for {f.name}, using fallback trim.")
         use_start = start_time is not None
@@ -440,21 +666,224 @@ def load_data_path(
         else:
             df = df.reindex(columns=columns_ref)
         frames.append(df)
-        if not trim_before_dist_head and start_times_df is not None and start_time is not None:
+        if (
+            not trim_before_dist_head
+            and start_times_df is not None
+            and start_time is not None
+        ):
             event_row = _event_row_from_dataframe(df, start_time)
-            valid_chunks.append(np.array([False] * event_row + [True] * (len(df) - event_row), dtype=bool))
+            valid_chunks.append(
+                np.array(
+                    [False] * event_row + [True] * (len(df) - event_row), dtype=bool
+                )
+            )
         elif not trim_before_dist_head:
             valid_chunks.append(np.ones(len(df), dtype=bool))
     if not frames:
-        raise FileNotFoundError(f"No session files (m*_s*_cricket|object.xlsx) in {path}")
+        raise FileNotFoundError(
+            f"No session files (m*_s*_cricket|object.xlsx) in {path}"
+        )
     data = pd.concat(frames, ignore_index=True)
     valid_mask = np.concatenate(valid_chunks) if valid_chunks else None
     return data, valid_mask
 
 
+def _get_session_paths(data_path: str) -> list[Path]:
+    """Return list of session file paths (single file or directory)."""
+    path = Path(data_path)
+    if path.is_file():
+        return [path]
+    if not path.is_dir():
+        raise FileNotFoundError(f"Not a file or directory: {path}")
+    matching = sorted(
+        f
+        for f in path.iterdir()
+        if f.is_file()
+        and f.suffix.lower() in (".xlsx", ".xls")
+        and _SESSION_PATTERN.match(f.name)
+    )
+    if not matching:
+        raise FileNotFoundError(
+            f"No session files (m*_s*_cricket|object.xlsx) in {path}"
+        )
+    return matching
+
+
+def _load_one_session_from_path(
+    f: Path,
+    columns_ref: list[str] | None,
+    trim_before_dist_head: bool,
+    start_times_df: pd.DataFrame | None,
+    use_dist_head_event: bool,
+) -> Tuple[pd.DataFrame, Optional[np.ndarray]]:
+    """Load one session file. columns_ref set from first file on first call."""
+    if use_dist_head_event:
+        df = pd.read_excel(f)
+        if df.empty:
+            return df, None
+        if columns_ref is not None:
+            df = df.reindex(columns=columns_ref)
+        event_row = _dist_head_event_row(df)
+        vm = np.zeros(len(df), dtype=bool)
+        vm[event_row:] = True
+        return df, vm
+    start_time = (
+        _get_start_time_for_file(f, start_times_df)
+        if start_times_df is not None
+        else None
+    )
+    use_start = start_time is not None
+    df = _load_one_session(
+        f,
+        trim_before_dist_head=not use_start and trim_before_dist_head,
+        start_time=start_time if trim_before_dist_head else None,
+    )
+    if df.empty:
+        return df, None
+    if columns_ref is not None:
+        df = df.reindex(columns=columns_ref)
+    if (
+        not trim_before_dist_head
+        and start_times_df is not None
+        and start_time is not None
+    ):
+        event_row = _event_row_from_dataframe(df, start_time)
+        vm = np.array([False] * event_row + [True] * (len(df) - event_row), dtype=bool)
+        return df, vm
+    if not trim_before_dist_head:
+        return df, np.ones(len(df), dtype=bool)
+    return df, None
+
+
+def iter_sessions(
+    data_path: str,
+    trim_before_dist_head: bool = True,
+    start_times_path: str | Path | None = None,
+    use_dist_head_event: bool = False,
+) -> Iterator[Tuple[pd.DataFrame, Optional[np.ndarray]]]:
+    """Yield (data, valid_mask) per session file. Same options as load_data_path; no concat."""
+    path = Path(data_path)
+
+    if use_dist_head_event:
+        if path.is_file():
+            data = pd.read_excel(path)
+            event_row = _dist_head_event_row(data)
+            valid_mask = np.zeros(len(data), dtype=bool)
+            valid_mask[event_row:] = True
+            yield data, valid_mask
+            return
+        if not path.is_dir():
+            raise FileNotFoundError(f"Not a file or directory: {path}")
+        matching = sorted(
+            f
+            for f in path.iterdir()
+            if f.is_file()
+            and f.suffix.lower() in (".xlsx", ".xls")
+            and _SESSION_PATTERN.match(f.name)
+        )
+        if not matching:
+            raise FileNotFoundError(
+                f"No session files (m*_s*_cricket|object.xlsx) in {path}"
+            )
+        columns_ref: list[str] | None = None
+        for f in tqdm(matching, desc="Loading sessions", unit="file"):
+            df = pd.read_excel(f)
+            if df.empty:
+                continue
+            if columns_ref is None:
+                columns_ref = df.columns.tolist()
+            else:
+                df = df.reindex(columns=columns_ref)
+            event_row = _dist_head_event_row(df)
+            vm = np.zeros(len(df), dtype=bool)
+            vm[event_row:] = True
+            yield df, vm
+        return
+
+    if path.is_file():
+        start_path = (
+            Path(start_times_path)
+            if start_times_path
+            else path.parent / "startTimes.xlsx"
+        )
+        start_df = _load_start_times(start_path) if start_path.is_file() else None
+        t = _get_start_time_for_file(path, start_df) if start_df is not None else None
+        if trim_before_dist_head:
+            data = _load_one_session(
+                path, trim_before_dist_head=(t is None), start_time=t
+            )
+            yield data, None
+            return
+        data = _load_one_session(path, trim_before_dist_head=False, start_time=None)
+        if start_df is not None and t is not None:
+            event_row = _event_row_from_dataframe(data, t)
+            valid_mask = np.zeros(len(data), dtype=bool)
+            valid_mask[event_row:] = True
+            yield data, valid_mask
+        else:
+            yield data, None
+        return
+
+    if not path.is_dir():
+        raise FileNotFoundError(f"Not a file or directory: {path}")
+    start_path = (
+        Path(start_times_path) if start_times_path else path / "startTimes.xlsx"
+    )
+    start_times_df: pd.DataFrame | None = None
+    if start_path.is_file():
+        start_times_df = _load_start_times(start_path)
+    columns_ref = None
+    matching = sorted(
+        f
+        for f in path.iterdir()
+        if f.is_file()
+        and f.suffix.lower() in (".xlsx", ".xls")
+        and _SESSION_PATTERN.match(f.name)
+    )
+    if not matching:
+        raise FileNotFoundError(
+            f"No session files (m*_s*_cricket|object.xlsx) in {path}"
+        )
+    for f in tqdm(matching, desc="Loading sessions", unit="file"):
+        start_time = (
+            _get_start_time_for_file(f, start_times_df)
+            if start_times_df is not None
+            else None
+        )
+        if start_times_df is not None and start_time is None:
+            print(f"  [start_times] No match for {f.name}, using fallback trim.")
+        use_start = start_time is not None
+        df = _load_one_session(
+            f,
+            trim_before_dist_head=not use_start and trim_before_dist_head,
+            start_time=start_time if trim_before_dist_head else None,
+        )
+        if df.empty:
+            continue
+        if columns_ref is None:
+            columns_ref = df.columns.tolist()
+        else:
+            df = df.reindex(columns=columns_ref)
+        if (
+            not trim_before_dist_head
+            and start_times_df is not None
+            and start_time is not None
+        ):
+            event_row = _event_row_from_dataframe(df, start_time)
+            valid_mask = np.array(
+                [False] * event_row + [True] * (len(df) - event_row), dtype=bool
+            )
+            yield df, valid_mask
+        elif not trim_before_dist_head:
+            yield df, np.ones(len(df), dtype=bool)
+        else:
+            yield df, None
+
+
 @dataclass
 class MaskedTemporalTrainingArgs:
     """Arguments for training a masked temporal transformer."""
+
     batch_size: int
     device: str
     learning_rate: float
@@ -475,7 +904,12 @@ class MaskedTemporalTrainingArgs:
     patience: int = 5
     verbose: bool = False
     save_model: bool = True
-    save_path: str = field(default_factory=lambda: str(Path("models") / f"masked_transformer_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"))
+    save_path: str = field(
+        default_factory=lambda: str(
+            Path("models")
+            / f"masked_transformer_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+    )
     eval_every_n_epochs: int = 1
     feature_names: Optional[list[str]] = None
     unmasked_weight: float = 0.3
@@ -534,20 +968,27 @@ class MaskedTemporalTrainer:
             persistent_workers=_use_cuda,
         )
         self.train_loader = DataLoader(
-            MaskedTemporalDataset(training_args.train_windows, event_masks=training_args.train_event_mask),
+            MaskedTemporalDataset(
+                training_args.train_windows, event_masks=training_args.train_event_mask
+            ),
             batch_size=training_args.batch_size,
             shuffle=True,
             **_loader_kwargs,
         )
         self.val_loader = DataLoader(
-            MaskedTemporalDataset(training_args.val_windows, event_masks=training_args.val_event_mask),
+            MaskedTemporalDataset(
+                training_args.val_windows, event_masks=training_args.val_event_mask
+            ),
             batch_size=training_args.batch_size,
             shuffle=False,
             **_loader_kwargs,
         )
         self.test_loader = (
             DataLoader(
-                MaskedTemporalDataset(training_args.test_windows, event_masks=training_args.test_event_mask),
+                MaskedTemporalDataset(
+                    training_args.test_windows,
+                    event_masks=training_args.test_event_mask,
+                ),
                 batch_size=training_args.batch_size,
                 shuffle=False,
                 **_loader_kwargs,
@@ -582,7 +1023,9 @@ class MaskedTemporalTrainer:
                     last_epoch = self._load_checkpoint(resume_path)
                     self.start_epoch = max(1, last_epoch + 1)
                     if training_args.verbose:
-                        print(f"[trainer] Resumed from {resume_path} at epoch {last_epoch}")
+                        print(
+                            f"[trainer] Resumed from {resume_path} at epoch {last_epoch}"
+                        )
                 except Exception as exc:
                     warnings.warn(f"Failed to resume from {resume_path}: {exc}")
             else:
@@ -596,17 +1039,25 @@ class MaskedTemporalTrainer:
         with torch.no_grad():
             for batch_idx, batch in enumerate(loader):
                 if isinstance(batch, (list, tuple)) and len(batch) == 2:
-                    X, event_mask_batch = batch[0].to(self.device), batch[1].to(self.device)
+                    X, event_mask_batch = batch[0].to(self.device), batch[1].to(
+                        self.device
+                    )
                 else:
                     X = batch.to(self.device)
                     event_mask_batch = None
                 B, T, _ = X.shape
                 torch.manual_seed(self.val_seed + batch_idx)
-                mask = create_timestep_mask(B, T, self.training_args.mask_ratio, X.device)
+                mask = create_timestep_mask(
+                    B, T, self.training_args.mask_ratio, X.device
+                )
                 out = self.model(X, mask=mask)
                 recon, timestep_mask, value_mask = out[0], out[2], out[3]
                 batch_loss = reconstruction_loss(
-                    recon, X, timestep_mask, self.training_args.unmasked_weight, valid_mask=event_mask_batch
+                    recon,
+                    X,
+                    timestep_mask,
+                    self.training_args.unmasked_weight,
+                    valid_mask=event_mask_batch,
                 ).item()
                 if value_mask is not None:
                     batch_loss += value_reconstruction_loss(
@@ -614,9 +1065,15 @@ class MaskedTemporalTrainer:
                     ).item()
                 if self.is_predictive:
                     pred_next = out[4]
-                    batch_loss += self.training_args.pred_loss_weight * predictive_loss(
-                        pred_next, X, self.training_args.n_predict_steps, valid_mask=event_mask_batch
-                    ).item()
+                    batch_loss += (
+                        self.training_args.pred_loss_weight
+                        * predictive_loss(
+                            pred_next,
+                            X,
+                            self.training_args.n_predict_steps,
+                            valid_mask=event_mask_batch,
+                        ).item()
+                    )
                 total += batch_loss * X.size(0)
                 n += X.size(0)
         self.model.train()
@@ -636,7 +1093,9 @@ class MaskedTemporalTrainer:
             return
         self.model.eval()
         batch = next(iter(loader))
-        X = (batch[0] if isinstance(batch, (list, tuple)) and len(batch) == 2 else batch).to(self.device)
+        X = (
+            batch[0] if isinstance(batch, (list, tuple)) and len(batch) == 2 else batch
+        ).to(self.device)
         B, T, _ = X.shape
         torch.manual_seed(seed)
         mask = create_timestep_mask(B, T, self.training_args.mask_ratio, X.device)
@@ -769,7 +1228,11 @@ class MaskedTemporalTrainer:
         if args.wandb_entity:
             init_kwargs["entity"] = args.wandb_entity
         config = {
-            "model": "masked_predictive_transformer" if self.is_predictive else "masked_transformer",
+            "model": (
+                "masked_predictive_transformer"
+                if self.is_predictive
+                else "masked_transformer"
+            ),
             "batch_size": args.batch_size,
             "learning_rate": args.learning_rate,
             "epochs": args.epochs,
@@ -813,7 +1276,9 @@ class MaskedTemporalTrainer:
             return
         compile_fn = getattr(torch, "compile", None)
         if compile_fn is None:
-            warnings.warn("torch.compile is unavailable in this PyTorch build; skipping.")
+            warnings.warn(
+                "torch.compile is unavailable in this PyTorch build; skipping."
+            )
             return
         try:
             self.model = compile_fn(
@@ -827,7 +1292,9 @@ class MaskedTemporalTrainer:
                     f"(backend={self.training_args.compile_backend}, mode={self.training_args.compile_mode})"
                 )
         except Exception as exc:
-            warnings.warn(f"torch.compile failed; continuing without compile. Error: {exc}")
+            warnings.warn(
+                f"torch.compile failed; continuing without compile. Error: {exc}"
+            )
 
     def _capture_rng_state(self) -> dict[str, object]:
         state: dict[str, object] = {
@@ -853,7 +1320,9 @@ class MaskedTemporalTrainer:
         if python_state is not None:
             random.setstate(python_state)
 
-    def _checkpoint_state(self, epoch: int, val_loss: float | None) -> dict[str, object]:
+    def _checkpoint_state(
+        self, epoch: int, val_loss: float | None
+    ) -> dict[str, object]:
         args = self.training_args
         state: dict[str, object] = {
             "epoch": epoch,
@@ -865,6 +1334,7 @@ class MaskedTemporalTrainer:
             "val_losses": self.val_losses,
             "timestamp": datetime.datetime.now().isoformat(),
             "model_state": self.model.state_dict(),
+            "feature_names": args.feature_names,
             "training_params": {
                 "batch_size": args.batch_size,
                 "learning_rate": args.learning_rate,
@@ -896,7 +1366,9 @@ class MaskedTemporalTrainer:
             torch.save(payload, path)
             if self.training_args.verbose:
                 label = "best" if is_best else path.name
-                print(f"[trainer] Saved checkpoint ({label}) at epoch {epoch} -> {path}")
+                print(
+                    f"[trainer] Saved checkpoint ({label}) at epoch {epoch} -> {path}"
+                )
         except Exception as exc:
             warnings.warn(f"Failed to save checkpoint at {path}: {exc}")
 
@@ -948,7 +1420,9 @@ class MaskedTemporalTrainer:
             self._restore_rng_state(rng_state)
         return int(checkpoint.get("epoch", 0))
 
-    def learning_step(self, batch: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) -> float:
+    def learning_step(
+        self, batch: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+    ) -> float:
         if isinstance(batch, (list, tuple)) and len(batch) == 2:
             X, event_mask_batch = batch[0].to(self.device), batch[1].to(self.device)
         else:
@@ -959,7 +1433,11 @@ class MaskedTemporalTrainer:
         out = self.model(X)
         recon, timestep_mask, value_mask = out[0], out[2], out[3]
         loss = reconstruction_loss(
-            recon, X, timestep_mask, self.training_args.unmasked_weight, valid_mask=event_mask_batch
+            recon,
+            X,
+            timestep_mask,
+            self.training_args.unmasked_weight,
+            valid_mask=event_mask_batch,
         )
         if value_mask is not None:
             loss = loss + value_reconstruction_loss(
@@ -967,7 +1445,10 @@ class MaskedTemporalTrainer:
             )
         if self.is_predictive:
             loss = loss + self.training_args.pred_loss_weight * predictive_loss(
-                out[4], X, self.training_args.n_predict_steps, valid_mask=event_mask_batch
+                out[4],
+                X,
+                self.training_args.n_predict_steps,
+                valid_mask=event_mask_batch,
             )
         loss.backward()
         self.optimizer.step()
@@ -990,7 +1471,7 @@ class MaskedTemporalTrainer:
             f"window_size:   {window_size}",
             f"n_features:   {n_features}",
             f"event_mask:   {args.train_event_mask is not None}",
-        f"causal_attention: {args.causal}",
+            f"causal_attention: {args.causal}",
         ]
         if args.train_event_mask is not None:
             em = np.asarray(args.train_event_mask)
@@ -998,7 +1479,9 @@ class MaskedTemporalTrainer:
             lines.append(f"event_mask_frac_valid (train): {frac:.3f}")
             if args.val_event_mask is not None:
                 em_v = np.asarray(args.val_event_mask)
-                lines.append(f"event_mask_frac_valid (val):   {float(np.mean(em_v)):.3f}")
+                lines.append(
+                    f"event_mask_frac_valid (val):   {float(np.mean(em_v)):.3f}"
+                )
         if args.feature_names:
             lines.append(f"features: {', '.join(args.feature_names)}")
         text = "\n".join(lines)
@@ -1010,7 +1493,14 @@ class MaskedTemporalTrainer:
         if args.verbose:
             print(text)
         self.writer.add_text("data/summary", text.replace("\n", "  \n"), 0)
-        self._log_wandb({"data/n_train": n_train, "data/n_val": n_val, "data/n_features": n_features}, step=0)
+        self._log_wandb(
+            {
+                "data/n_train": n_train,
+                "data/n_val": n_val,
+                "data/n_features": n_features,
+            },
+            step=0,
+        )
 
     def train(self) -> float:
         args = self.training_args
@@ -1026,7 +1516,11 @@ class MaskedTemporalTrainer:
             if n_train == 0:
                 raise ValueError("Train dataset is empty; cannot train.")
             for batch in self.train_loader:
-                n_batch = batch[0].size(0) if isinstance(batch, (list, tuple)) and len(batch) == 2 else batch.size(0)
+                n_batch = (
+                    batch[0].size(0)
+                    if isinstance(batch, (list, tuple)) and len(batch) == 2
+                    else batch.size(0)
+                )
                 running_loss += self.learning_step(batch) * n_batch
             avg_train = running_loss / n_train
             self.train_losses.append(avg_train)
@@ -1051,7 +1545,12 @@ class MaskedTemporalTrainer:
                     self.best_epoch = epoch
                     self.patience_counter = 0
                     if args.save_model and args.save_best:
-                        self._save_checkpoint(self.save_path / "best.pt", epoch, epoch_val_loss, is_best=True)
+                        self._save_checkpoint(
+                            self.save_path / "best.pt",
+                            epoch,
+                            epoch_val_loss,
+                            is_best=True,
+                        )
                     self._log_wandb({"best/val_loss": self.best_loss}, step=epoch)
                 else:
                     self.patience_counter += 1
@@ -1061,10 +1560,18 @@ class MaskedTemporalTrainer:
                         print(f"Early stop at epoch {epoch}")
                     stop_training = True
 
-            checkpoint_metric = epoch_val_loss if epoch_val_loss is not None else avg_train
+            checkpoint_metric = (
+                epoch_val_loss if epoch_val_loss is not None else avg_train
+            )
             if args.save_model and args.save_last:
-                self._save_checkpoint(self.save_path / "last.pt", epoch, checkpoint_metric)
-            if args.save_model and args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
+                self._save_checkpoint(
+                    self.save_path / "last.pt", epoch, checkpoint_metric
+                )
+            if (
+                args.save_model
+                and args.checkpoint_every > 0
+                and epoch % args.checkpoint_every == 0
+            ):
                 ckpt_name = self.checkpoints_dir / f"checkpoint_epoch{epoch}.pt"
                 self._save_checkpoint(ckpt_name, epoch, checkpoint_metric)
                 self._clean_old_checkpoints()
@@ -1120,7 +1627,9 @@ def run_train(config: dict) -> float:
     full_file = bool(cfg.get("full_file", False))
     start_times = cfg.get("start_times")
     use_dist_head_event = bool(cfg.get("use_dist_head_event", False))
-    use_event_mask = cfg.get("use_event_mask", bool(use_dist_head_event or (full_file and start_times)))
+    use_event_mask = cfg.get(
+        "use_event_mask", bool(use_dist_head_event or (full_file and start_times))
+    )
     angular_cols = cfg.get("angular_cols")
     drop_cols = cfg.get("drop_cols", ["height"])
     val_ratio = _scalar(cfg.get("val_ratio"), 0.15, float)
@@ -1128,13 +1637,15 @@ def run_train(config: dict) -> float:
     window_size = _scalar(cfg.get("window_size"), 128, int)
 
     train_em, val_em, test_em = None, None, None
-    load_path = preprocessed_path or (data_path if data_path and str(data_path).endswith(".npz") else None)
+    load_path = preprocessed_path or (
+        data_path if data_path and str(data_path).endswith(".npz") else None
+    )
     use_mmap = bool(cfg.get("mmap", False))
     if load_path:
         try:
             mmap_mode = "r" if use_mmap else None
-            train_w, val_w, test_w, feature_names, train_em, val_em, test_em = load_preprocessed_dataset(
-                load_path, mmap_mode=mmap_mode
+            train_w, val_w, test_w, feature_names, train_em, val_em, test_em = (
+                load_preprocessed_dataset(load_path, mmap_mode=mmap_mode)
             )
         except Exception as e:
             print(f"Load preprocessed failed: {e}. Falling back to raw data.")
@@ -1146,15 +1657,25 @@ def run_train(config: dict) -> float:
                 data, valid_mask = load_data_path(
                     data_path,
                     trim_before_dist_head=not full_file and not use_dist_head_event,
-                    start_times_path=None if (full_file or use_dist_head_event) else start_times,
+                    start_times_path=(
+                        None if (full_file or use_dist_head_event) else start_times
+                    ),
                     use_dist_head_event=use_dist_head_event,
                 )
                 valid_mask = valid_mask if use_event_mask else None
-                windows, feature_names, event_mask_windows = prepare_masked_transformer_data(
-                    data, window_size=window_size, stride=1, valid_mask=valid_mask,
-                    angular_cols=angular_cols, drop_cols=drop_cols,
+                windows, feature_names, event_mask_windows = (
+                    prepare_masked_transformer_data(
+                        data,
+                        window_size=window_size,
+                        stride=1,
+                        valid_mask=valid_mask,
+                        angular_cols=angular_cols,
+                        drop_cols=drop_cols,
+                    )
                 )
-                train_w, val_w, test_w = temporal_train_val_test_split(windows, val_ratio, test_ratio)
+                train_w, val_w, test_w = temporal_train_val_test_split(
+                    windows, val_ratio, test_ratio
+                )
                 if event_mask_windows is not None:
                     train_em, val_em, test_em = temporal_train_val_test_split(
                         event_mask_windows, val_ratio, test_ratio
@@ -1184,13 +1705,18 @@ def run_train(config: dict) -> float:
         n_predict_steps = _scalar(n_predict_steps_raw, 3, int)
     else:
         n_predict_steps = None
-    pred_loss_weight = _scalar(cfg.get("pred_loss_weight"), 0.5, float) if n_predict_steps else 0.5
+    pred_loss_weight = (
+        _scalar(cfg.get("pred_loss_weight"), 0.5, float) if n_predict_steps else 0.5
+    )
 
     run_id = cfg.get("run_id")
     if run_id is not None:
         ts = str(run_id)  # unique per sweep run
     else:
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{random.randint(0, 0xFFFF):04x}"
+        ts = (
+            datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            + f"_{random.randint(0, 0xFFFF):04x}"
+        )
     prefix = "patched_transformer" if is_patched else "masked_transformer"
     save_path = cfg.get("save_path")
     if not save_path:
@@ -1215,7 +1741,9 @@ def run_train(config: dict) -> float:
         d_model=_scalar(cfg.get("d_model"), 64, int),
         nhead=_scalar(cfg.get("nhead"), 2, int),
         num_layers=_scalar(cfg.get("num_layers"), 4, int),
-        mask_ratio=_scalar(cfg.get("timestep_mask_ratio") or cfg.get("mask_ratio"), 0.15, float),
+        mask_ratio=_scalar(
+            cfg.get("timestep_mask_ratio") or cfg.get("mask_ratio"), 0.15, float
+        ),
         value_mask_ratio=_scalar(cfg.get("value_mask_ratio"), 0.0, float),
         epochs=_scalar(cfg.get("epochs"), 25, int),
         weight_decay=_scalar(cfg.get("weight_decay"), 1e-5, float),
@@ -1266,6 +1794,7 @@ def run_train(config: dict) -> float:
 @dataclass
 class PatchedTrainingArgs:
     """Arguments for training a patched masked temporal transformer."""
+
     batch_size: int
     device: str
     learning_rate: float
@@ -1287,7 +1816,12 @@ class PatchedTrainingArgs:
     patience: int = 5
     verbose: bool = False
     save_model: bool = True
-    save_path: str = field(default_factory=lambda: str(Path("models") / f"patched_transformer_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"))
+    save_path: str = field(
+        default_factory=lambda: str(
+            Path("models")
+            / f"patched_transformer_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+    )
     eval_every_n_epochs: int = 1
     feature_names: Optional[list[str]] = None
     unmasked_weight: float = 0.3
@@ -1323,9 +1857,9 @@ class PatchedMaskedTemporalTrainer:
 
         # Validate that window size is divisible by patch length
         window_size = training_args.train_windows.shape[1]
-        assert window_size % self.patch_length == 0, (
-            f"Window size {window_size} must be divisible by patch_length {self.patch_length}"
-        )
+        assert (
+            window_size % self.patch_length == 0
+        ), f"Window size {window_size} must be divisible by patch_length {self.patch_length}"
         self.n_patches = window_size // self.patch_length
 
         if self.is_predictive:
@@ -1362,20 +1896,27 @@ class PatchedMaskedTemporalTrainer:
             persistent_workers=_use_cuda,
         )
         self.train_loader = DataLoader(
-            MaskedTemporalDataset(training_args.train_windows, event_masks=training_args.train_event_mask),
+            MaskedTemporalDataset(
+                training_args.train_windows, event_masks=training_args.train_event_mask
+            ),
             batch_size=training_args.batch_size,
             shuffle=True,
             **_loader_kwargs,
         )
         self.val_loader = DataLoader(
-            MaskedTemporalDataset(training_args.val_windows, event_masks=training_args.val_event_mask),
+            MaskedTemporalDataset(
+                training_args.val_windows, event_masks=training_args.val_event_mask
+            ),
             batch_size=training_args.batch_size,
             shuffle=False,
             **_loader_kwargs,
         )
         self.test_loader = (
             DataLoader(
-                MaskedTemporalDataset(training_args.test_windows, event_masks=training_args.test_event_mask),
+                MaskedTemporalDataset(
+                    training_args.test_windows,
+                    event_masks=training_args.test_event_mask,
+                ),
                 batch_size=training_args.batch_size,
                 shuffle=False,
                 **_loader_kwargs,
@@ -1410,7 +1951,9 @@ class PatchedMaskedTemporalTrainer:
                     last_epoch = self._load_checkpoint(resume_path)
                     self.start_epoch = max(1, last_epoch + 1)
                     if training_args.verbose:
-                        print(f"[patched-trainer] Resumed from {resume_path} at epoch {last_epoch}")
+                        print(
+                            f"[patched-trainer] Resumed from {resume_path} at epoch {last_epoch}"
+                        )
                 except Exception as exc:
                     warnings.warn(f"Failed to resume from {resume_path}: {exc}")
             else:
@@ -1429,7 +1972,9 @@ class PatchedMaskedTemporalTrainer:
 
     # ── Training step ────────────────────────────────────────────────────────
 
-    def learning_step(self, batch: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]) -> float:
+    def learning_step(
+        self, batch: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
+    ) -> float:
         if isinstance(batch, (list, tuple)) and len(batch) == 2:
             X, event_mask_batch = batch[0].to(self.device), batch[1].to(self.device)
         else:
@@ -1440,14 +1985,23 @@ class PatchedMaskedTemporalTrainer:
         out = self.model(X)
         recon, timestep_mask, value_mask = out[0], out[2], out[3]
         loss = reconstruction_loss(
-            recon, X, timestep_mask, self.args.unmasked_weight, valid_mask=event_mask_batch
+            recon,
+            X,
+            timestep_mask,
+            self.args.unmasked_weight,
+            valid_mask=event_mask_batch,
         )
         if value_mask is not None:
-            loss = loss + value_reconstruction_loss(recon, X, value_mask, valid_mask=event_mask_batch)
+            loss = loss + value_reconstruction_loss(
+                recon, X, value_mask, valid_mask=event_mask_batch
+            )
         if self.is_predictive:
             pred_next = out[4]
             loss = loss + self.args.pred_loss_weight * patched_predictive_loss(
-                pred_next, X, self.args.n_predict_steps, self.patch_length,
+                pred_next,
+                X,
+                self.args.n_predict_steps,
+                self.patch_length,
                 valid_mask=event_mask_batch,
             )
         loss.backward()
@@ -1463,17 +2017,25 @@ class PatchedMaskedTemporalTrainer:
         with torch.no_grad():
             for batch_idx, batch in enumerate(loader):
                 if isinstance(batch, (list, tuple)) and len(batch) == 2:
-                    X, event_mask_batch = batch[0].to(self.device), batch[1].to(self.device)
+                    X, event_mask_batch = batch[0].to(self.device), batch[1].to(
+                        self.device
+                    )
                 else:
                     X = batch.to(self.device)
                     event_mask_batch = None
                 B = X.size(0)
                 torch.manual_seed(self.val_seed + batch_idx)
-                mask = create_patch_mask(B, self.n_patches, self.args.mask_ratio, X.device)
+                mask = create_patch_mask(
+                    B, self.n_patches, self.args.mask_ratio, X.device
+                )
                 out = self.model(X, mask=mask)
                 recon, timestep_mask, value_mask = out[0], out[2], out[3]
                 batch_loss = reconstruction_loss(
-                    recon, X, timestep_mask, self.args.unmasked_weight, valid_mask=event_mask_batch
+                    recon,
+                    X,
+                    timestep_mask,
+                    self.args.unmasked_weight,
+                    valid_mask=event_mask_batch,
                 ).item()
                 if value_mask is not None:
                     batch_loss += value_reconstruction_loss(
@@ -1481,10 +2043,16 @@ class PatchedMaskedTemporalTrainer:
                     ).item()
                 if self.is_predictive:
                     pred_next = out[4]
-                    batch_loss += self.args.pred_loss_weight * patched_predictive_loss(
-                        pred_next, X, self.args.n_predict_steps, self.patch_length,
-                        valid_mask=event_mask_batch,
-                    ).item()
+                    batch_loss += (
+                        self.args.pred_loss_weight
+                        * patched_predictive_loss(
+                            pred_next,
+                            X,
+                            self.args.n_predict_steps,
+                            self.patch_length,
+                            valid_mask=event_mask_batch,
+                        ).item()
+                    )
                 total += batch_loss * B
                 n += B
         self.model.train()
@@ -1493,14 +2061,21 @@ class PatchedMaskedTemporalTrainer:
     # ── Plotting ─────────────────────────────────────────────────────────────
 
     def _plot_reconstruction(
-        self, loader: DataLoader, save_name: str, title: str, seed: int,
-        tb_tag: str | None = None, tb_step: int | None = None,
+        self,
+        loader: DataLoader,
+        save_name: str,
+        title: str,
+        seed: int,
+        tb_tag: str | None = None,
+        tb_step: int | None = None,
     ) -> None:
         if len(loader.dataset) == 0:
             return
         self.model.eval()
         batch = next(iter(loader))
-        X = (batch[0] if isinstance(batch, (list, tuple)) and len(batch) == 2 else batch).to(self.device)
+        X = (
+            batch[0] if isinstance(batch, (list, tuple)) and len(batch) == 2 else batch
+        ).to(self.device)
         B = X.size(0)
         torch.manual_seed(seed)
         mask = create_patch_mask(B, self.n_patches, self.args.mask_ratio, X.device)
@@ -1533,7 +2108,10 @@ class PatchedMaskedTemporalTrainer:
             ax.set_ylabel(names[i], fontsize=6)
             ax.legend(loc="upper right", fontsize=5)
             ax.grid(True, alpha=0.3)
-            ax.set_title(f"Full seq (| = masked, P={self.patch_length})" if i == 0 else None, fontsize=7)
+            ax.set_title(
+                f"Full seq (| = masked, P={self.patch_length})" if i == 0 else None,
+                fontsize=7,
+            )
 
             ax = axes[i, 1]
             if len(masked_idx) > 0:
@@ -1593,7 +2171,9 @@ class PatchedMaskedTemporalTrainer:
         if python_state is not None:
             random.setstate(python_state)
 
-    def _checkpoint_state(self, epoch: int, val_loss: float | None) -> dict[str, object]:
+    def _checkpoint_state(
+        self, epoch: int, val_loss: float | None
+    ) -> dict[str, object]:
         args = self.args
         state: dict[str, object] = {
             "epoch": epoch,
@@ -1605,6 +2185,7 @@ class PatchedMaskedTemporalTrainer:
             "val_losses": self.val_losses,
             "timestamp": datetime.datetime.now().isoformat(),
             "model_state": self.model.state_dict(),
+            "feature_names": args.feature_names,
             "training_params": {
                 "batch_size": args.batch_size,
                 "learning_rate": args.learning_rate,
@@ -1627,14 +2208,18 @@ class PatchedMaskedTemporalTrainer:
             state["rng_state"] = self._capture_rng_state()
         return state
 
-    def _save_checkpoint(self, path: Path, epoch: int, val_loss: float | None, is_best: bool = False) -> None:
+    def _save_checkpoint(
+        self, path: Path, epoch: int, val_loss: float | None, is_best: bool = False
+    ) -> None:
         try:
             payload = self._checkpoint_state(epoch, val_loss)
             payload["is_best"] = is_best
             torch.save(payload, path)
             if self.args.verbose:
                 label = "best" if is_best else path.name
-                print(f"[patched-trainer] Saved checkpoint ({label}) at epoch {epoch} -> {path}")
+                print(
+                    f"[patched-trainer] Saved checkpoint ({label}) at epoch {epoch} -> {path}"
+                )
         except Exception as exc:
             warnings.warn(f"Failed to save checkpoint at {path}: {exc}")
 
@@ -1662,7 +2247,9 @@ class PatchedMaskedTemporalTrainer:
         checkpoint = torch.load(path, map_location=self.device)
         if not isinstance(checkpoint, dict) or "model_state" not in checkpoint:
             self.model.load_state_dict(checkpoint)
-            warnings.warn(f"Checkpoint {path} lacks trainer metadata; loaded weights only.")
+            warnings.warn(
+                f"Checkpoint {path} lacks trainer metadata; loaded weights only."
+            )
             return 0
         self.model.load_state_dict(checkpoint["model_state"])
         if self.args.save_optimizer and "optimizer_state" in checkpoint:
@@ -1772,7 +2359,14 @@ class PatchedMaskedTemporalTrainer:
         if args.verbose:
             print(text)
         self.writer.add_text("data/summary", text.replace("\n", "  \n"), 0)
-        self._log_wandb({"data/n_train": n_train, "data/n_val": n_val, "data/n_features": args.f_in}, step=0)
+        self._log_wandb(
+            {
+                "data/n_train": n_train,
+                "data/n_val": n_val,
+                "data/n_features": args.f_in,
+            },
+            step=0,
+        )
 
     # ── Main training loop ───────────────────────────────────────────────────
 
@@ -1791,7 +2385,11 @@ class PatchedMaskedTemporalTrainer:
             if n_train == 0:
                 raise ValueError("Train dataset is empty.")
             for batch in self.train_loader:
-                n_batch = batch[0].size(0) if isinstance(batch, (list, tuple)) and len(batch) == 2 else batch.size(0)
+                n_batch = (
+                    batch[0].size(0)
+                    if isinstance(batch, (list, tuple)) and len(batch) == 2
+                    else batch.size(0)
+                )
                 running_loss += self.learning_step(batch) * n_batch
             avg_train = running_loss / n_train
             self.train_losses.append(avg_train)
@@ -1815,7 +2413,12 @@ class PatchedMaskedTemporalTrainer:
                     self.best_epoch = epoch
                     self.patience_counter = 0
                     if args.save_model and args.save_best:
-                        self._save_checkpoint(self.save_path / "best.pt", epoch, epoch_val_loss, is_best=True)
+                        self._save_checkpoint(
+                            self.save_path / "best.pt",
+                            epoch,
+                            epoch_val_loss,
+                            is_best=True,
+                        )
                     self._log_wandb({"best/val_loss": self.best_loss}, step=epoch)
                 else:
                     self.patience_counter += 1
@@ -1824,10 +2427,18 @@ class PatchedMaskedTemporalTrainer:
                         print(f"Early stop at epoch {epoch}")
                     stop_training = True
 
-            checkpoint_metric = epoch_val_loss if epoch_val_loss is not None else avg_train
+            checkpoint_metric = (
+                epoch_val_loss if epoch_val_loss is not None else avg_train
+            )
             if args.save_model and args.save_last:
-                self._save_checkpoint(self.save_path / "last.pt", epoch, checkpoint_metric)
-            if args.save_model and args.checkpoint_every > 0 and epoch % args.checkpoint_every == 0:
+                self._save_checkpoint(
+                    self.save_path / "last.pt", epoch, checkpoint_metric
+                )
+            if (
+                args.save_model
+                and args.checkpoint_every > 0
+                and epoch % args.checkpoint_every == 0
+            ):
                 ckpt_name = self.checkpoints_dir / f"checkpoint_epoch{epoch}.pt"
                 self._save_checkpoint(ckpt_name, epoch, checkpoint_metric)
                 self._clean_old_checkpoints()
@@ -1861,47 +2472,198 @@ class PatchedMaskedTemporalTrainer:
 if __name__ == "__main__":
     import argparse
     import sys
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default=None, help="Path to YAML config for single-run training (all params in file).")
-    parser.add_argument("--output-dir", type=str, default=None, help="Output directory for checkpoints/logs. With --config overrides config; without --config used as save_path.")
-    parser.add_argument("--data", default=None, help="Data path (file, dir, or .npz). With --config overrides config; without --config required unless using --preprocessed-data.")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to YAML config for single-run training (all params in file).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory for checkpoints/logs. With --config overrides config; without --config used as save_path.",
+    )
+    parser.add_argument(
+        "--data",
+        default=None,
+        help="Data path (file, dir, or .npz). With --config overrides config; without --config required unless using --preprocessed-data.",
+    )
     parser.add_argument("--val_ratio", type=float, default=0.15)
     parser.add_argument("--test_ratio", type=float, default=0.15)
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for split and training (if set before load).")
-    parser.add_argument("--test_loading", action="store_true", help="Only load data and print summary; do not train.")
-    parser.add_argument("--full_file", action="store_true", help="Load full file(s); no trim.")
-    parser.add_argument("--start_times", type=str, default=None, help="Path to startTimes.xlsx (Experiment, CricketEntersTime, ObjectEntersTime). Default: data dir/startTimes.xlsx when loading a dir.")
-    parser.add_argument("--no-event-mask", action="store_true", help="Disable event validity mask (all positions valid). Default: use mask when full_file and start_times.")
-    parser.add_argument("--use-dist-head-event", action="store_true", help="Use first non-NaN dist_head row as event start (more accurate than start_times). Loads full files and creates event mask.")
-    parser.add_argument("--model", choices=["masked", "predictive", "patched"], default="masked", help="Model variant: masked, predictive (recon+prediction), or patched (patch-level; use --patch-length).")
-    parser.add_argument("--patch-length", type=int, default=4, help="Patch size (used when --model patched). window_size must be divisible by this.")
-    parser.add_argument("--n_predict_steps", type=int, default=3, help="Number of next steps to predict (used when --model predictive or patched). 0 = recon only.")
-    parser.add_argument("--pred_loss_weight", type=float, default=0.5, help="Weight for predictive loss (used when --model predictive).")
-    parser.add_argument("--causal", action="store_true", help="Use causal attention (mask future timesteps). Default: bidirectional.")
-    parser.add_argument("--checkpoint-every", type=int, default=0, help="Save an additional checkpoint every N epochs (0 disables).")
-    parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint to resume training from.")
-    parser.add_argument("--no-save-last", action="store_true", help="Disable saving last.pt after every epoch.")
-    parser.add_argument("--no-save-best", action="store_true", help="Disable saving best.pt when validation improves.")
-    parser.add_argument("--no-save-optimizer", action="store_true", help="Do not include optimizer state in checkpoints.")
-    parser.add_argument("--no-save-rng", action="store_true", help="Do not persist RNG state (PyTorch/Numpy/Python).")
-    parser.add_argument("--use-compile", action="store_true", help="Enable torch.compile for faster training (PyTorch 2.0+).")
-    parser.add_argument("--compile-backend", type=str, default="inductor", help="Backend to use with torch.compile (default: inductor).")
-    parser.add_argument("--compile-mode", type=str, default=None, help="Compilation mode for torch.compile (e.g., 'default', 'reduce-overhead').")
-    parser.add_argument("--wandb-project", type=str, default=None, help="Weights & Biases project name to enable logging.")
-    parser.add_argument("--wandb-run-name", type=str, default=None, help="Weights & Biases run display name.")
-    parser.add_argument("--wandb-tags", nargs="+", default=None, help="Optional list of W&B tags to attach to the run.")
-    parser.add_argument("--wandb-mode", type=str, default=None, help="W&B mode: online, offline, disabled.")
-    parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity (team/user) to log under.")
-    parser.add_argument("--preprocessed-data", type=str, default=None, help="Path to preprocessed .npz (skips raw load; faster).")
-    parser.add_argument("--save-dataset", type=str, default=None, help="Save preprocessed data to .npz for future --preprocessed-data.")
-    parser.add_argument("--save-dataset-only", action="store_true", help="Save preprocessed dataset and exit (no training).")
-    parser.add_argument("--no-compress", action="store_true", help="Save uncompressed .npz for mmap (larger file, fast load).")
-    parser.add_argument("--mmap", action="store_true", help="Load preprocessed .npz with memory-mapping (requires uncompressed file).")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for split and training (if set before load).",
+    )
+    parser.add_argument(
+        "--test_loading",
+        action="store_true",
+        help="Only load data and print summary; do not train.",
+    )
+    parser.add_argument(
+        "--full_file", action="store_true", help="Load full file(s); no trim."
+    )
+    parser.add_argument(
+        "--start_times",
+        type=str,
+        default=None,
+        help="Path to startTimes.xlsx (Experiment, CricketEntersTime, ObjectEntersTime). Default: data dir/startTimes.xlsx when loading a dir.",
+    )
+    parser.add_argument(
+        "--no-event-mask",
+        action="store_true",
+        help="Disable event validity mask (all positions valid). Default: use mask when full_file and start_times.",
+    )
+    parser.add_argument(
+        "--use-dist-head-event",
+        action="store_true",
+        help="Use first non-NaN dist_head row as event start (more accurate than start_times). Loads full files and creates event mask.",
+    )
+    parser.add_argument(
+        "--model",
+        choices=["masked", "predictive", "patched"],
+        default="masked",
+        help="Model variant: masked, predictive (recon+prediction), or patched (patch-level; use --patch-length).",
+    )
+    parser.add_argument(
+        "--patch-length",
+        type=int,
+        default=4,
+        help="Patch size (used when --model patched). window_size must be divisible by this.",
+    )
+    parser.add_argument(
+        "--n_predict_steps",
+        type=int,
+        default=3,
+        help="Number of next steps to predict (used when --model predictive or patched). 0 = recon only.",
+    )
+    parser.add_argument(
+        "--pred_loss_weight",
+        type=float,
+        default=0.5,
+        help="Weight for predictive loss (used when --model predictive).",
+    )
+    parser.add_argument(
+        "--causal",
+        action="store_true",
+        help="Use causal attention (mask future timesteps). Default: bidirectional.",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="Save an additional checkpoint every N epochs (0 disables).",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume training from.",
+    )
+    parser.add_argument(
+        "--no-save-last",
+        action="store_true",
+        help="Disable saving last.pt after every epoch.",
+    )
+    parser.add_argument(
+        "--no-save-best",
+        action="store_true",
+        help="Disable saving best.pt when validation improves.",
+    )
+    parser.add_argument(
+        "--no-save-optimizer",
+        action="store_true",
+        help="Do not include optimizer state in checkpoints.",
+    )
+    parser.add_argument(
+        "--no-save-rng",
+        action="store_true",
+        help="Do not persist RNG state (PyTorch/Numpy/Python).",
+    )
+    parser.add_argument(
+        "--use-compile",
+        action="store_true",
+        help="Enable torch.compile for faster training (PyTorch 2.0+).",
+    )
+    parser.add_argument(
+        "--compile-backend",
+        type=str,
+        default="inductor",
+        help="Backend to use with torch.compile (default: inductor).",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        type=str,
+        default=None,
+        help="Compilation mode for torch.compile (e.g., 'default', 'reduce-overhead').",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default=None,
+        help="Weights & Biases project name to enable logging.",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Weights & Biases run display name.",
+    )
+    parser.add_argument(
+        "--wandb-tags",
+        nargs="+",
+        default=None,
+        help="Optional list of W&B tags to attach to the run.",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        default=None,
+        help="W&B mode: online, offline, disabled.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="W&B entity (team/user) to log under.",
+    )
+    parser.add_argument(
+        "--preprocessed-data",
+        type=str,
+        default=None,
+        help="Path to preprocessed .npz (skips raw load; faster).",
+    )
+    parser.add_argument(
+        "--save-dataset",
+        type=str,
+        default=None,
+        help="Save preprocessed data to .npz for future --preprocessed-data.",
+    )
+    parser.add_argument(
+        "--save-dataset-only",
+        action="store_true",
+        help="Save preprocessed dataset and exit (no training).",
+    )
+    parser.add_argument(
+        "--no-compress",
+        action="store_true",
+        help="Save uncompressed .npz for mmap (larger file, fast load).",
+    )
+    parser.add_argument(
+        "--mmap",
+        action="store_true",
+        help="Load preprocessed .npz with memory-mapping (requires uncompressed file).",
+    )
     args_cli = parser.parse_args()
 
     set_matmul_precision_auto()
     if args_cli.config:
         import yaml
+
         with open(args_cli.config) as f:
             cfg = yaml.safe_load(f) or {}
         if args_cli.data is not None:
@@ -1924,8 +2686,10 @@ if __name__ == "__main__":
     if args_cli.preprocessed_data:
         try:
             mmap_mode = "r" if args_cli.mmap else None
-            train_w, val_w, test_w, feature_names, train_em, val_em, test_em = load_preprocessed_dataset(
-                args_cli.preprocessed_data, mmap_mode=mmap_mode
+            train_w, val_w, test_w, feature_names, train_em, val_em, test_em = (
+                load_preprocessed_dataset(
+                    args_cli.preprocessed_data, mmap_mode=mmap_mode
+                )
             )
         except Exception as e:
             print(f"Load preprocessed failed: {e}", file=sys.stderr)
@@ -1937,12 +2701,20 @@ if __name__ == "__main__":
             data, valid_mask = load_data_path(
                 data_path,
                 trim_before_dist_head=not args_cli.full_file and not use_dh,
-                start_times_path=None if (args_cli.full_file or use_dh) else args_cli.start_times,
+                start_times_path=(
+                    None if (args_cli.full_file or use_dh) else args_cli.start_times
+                ),
                 use_dist_head_event=use_dh,
             )
             valid_mask = valid_mask if use_event_mask else None
-            windows, feature_names, event_mask_windows = prepare_masked_transformer_data(
-                data, window_size=128, stride=1, valid_mask=valid_mask, drop_cols=["height"],
+            windows, feature_names, event_mask_windows = (
+                prepare_masked_transformer_data(
+                    data,
+                    window_size=128,
+                    stride=1,
+                    valid_mask=valid_mask,
+                    drop_cols=["height"],
+                )
             )
         except Exception as e:
             if args_cli.test_loading:
@@ -1958,7 +2730,9 @@ if __name__ == "__main__":
             print(f"Load OK: {kind} -> {data_path}")
             print(f"  data: {data.shape[0]} rows, {data.shape[1]} cols")
             print(f"  windows: {windows.shape} (N, T, F)")
-            print(f"  features: {len(feature_names) if feature_names else windows.shape[-1]}")
+            print(
+                f"  features: {len(feature_names) if feature_names else windows.shape[-1]}"
+            )
             sys.exit(0)
         train_w, val_w, test_w = temporal_train_val_test_split(
             windows, args_cli.val_ratio, args_cli.test_ratio
@@ -1970,10 +2744,18 @@ if __name__ == "__main__":
         if args_cli.save_dataset or args_cli.save_dataset_only:
             out = args_cli.save_dataset or "dataset_preprocessed.npz"
             save_preprocessed_dataset(
-                out, train_w, val_w, test_w, feature_names,
-                args_cli.val_ratio, args_cli.test_ratio, 128,
+                out,
+                train_w,
+                val_w,
+                test_w,
+                feature_names,
+                args_cli.val_ratio,
+                args_cli.test_ratio,
+                128,
                 compressed=not args_cli.no_compress,
-                train_event_mask=train_em, val_event_mask=val_em, test_event_mask=test_em,
+                train_event_mask=train_em,
+                val_event_mask=val_em,
+                test_event_mask=test_em,
             )
             print(f"Saved preprocessed dataset to {out}")
             if args_cli.save_dataset_only:
@@ -1986,17 +2768,27 @@ if __name__ == "__main__":
     if is_patched:
         patch_length = args_cli.patch_length
         if window_size % patch_length != 0:
-            print(f"Error: window_size {window_size} must be divisible by patch_length {patch_length}", file=sys.stderr)
+            print(
+                f"Error: window_size {window_size} must be divisible by patch_length {patch_length}",
+                file=sys.stderr,
+            )
             sys.exit(1)
-        n_predict_steps = args_cli.n_predict_steps if args_cli.n_predict_steps > 0 else None
+        n_predict_steps = (
+            args_cli.n_predict_steps if args_cli.n_predict_steps > 0 else None
+        )
     else:
-        n_predict_steps = args_cli.n_predict_steps if args_cli.model == "predictive" else None
+        n_predict_steps = (
+            args_cli.n_predict_steps if args_cli.model == "predictive" else None
+        )
     pred_loss_weight = args_cli.pred_loss_weight if n_predict_steps else 0.5
 
     prefix = "patched_transformer" if is_patched else "masked_transformer"
     save_path = args_cli.output_dir
     if not save_path:
-        save_path = str(Path("models") / f"{prefix}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        save_path = str(
+            Path("models")
+            / f"{prefix}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
 
     if is_patched:
         args = PatchedTrainingArgs(
@@ -2073,5 +2865,3 @@ if __name__ == "__main__":
         trainer = MaskedTemporalTrainer(args)
     best = trainer.train()
     print(f"Best val loss: {best:.4f}")
-
-

@@ -12,6 +12,8 @@ tensorboard
 opencv-python
 openpyxl
 xlrd
+hmmlearn>=0.3.3
+h5py
 
 [dev]
 pytest

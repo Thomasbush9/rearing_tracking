@@ -18,6 +18,8 @@ Requires-Dist: tensorboard
 Requires-Dist: opencv-python
 Requires-Dist: openpyxl
 Requires-Dist: xlrd
+Requires-Dist: hmmlearn>=0.3.3
+Requires-Dist: h5py
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: black; extra == "dev"

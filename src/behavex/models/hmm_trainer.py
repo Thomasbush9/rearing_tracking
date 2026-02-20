@@ -122,6 +122,7 @@ class HiddenMarkovModelTrainer:
         n_iter: int = 100,
         normalize: bool = True,
         random_state: Optional[int] = None,
+        sticky_prior: float = 0.0,
     ) -> "HiddenMarkovModelTrainer":
         """
         Train HMM on sequence data.
@@ -152,6 +153,15 @@ class HiddenMarkovModelTrainer:
 
         if random_state is not None:
             self.model.random_state = random_state
+
+        if sticky_prior > 0.0:
+            # Initialise transition matrix with self-transition probability = sticky_prior
+            # and skip hmmlearn's own transmat initialisation so it keeps our matrix.
+            off = (1.0 - sticky_prior) / max(self.n_states - 1, 1)
+            A0 = np.full((self.n_states, self.n_states), off)
+            np.fill_diagonal(A0, sticky_prior)
+            self.model.init_params = self.model.init_params.replace("t", "")
+            self.model.transmat_ = A0
 
         # Fit model
         if self.emission_type == "gaussian":

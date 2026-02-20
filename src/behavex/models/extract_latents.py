@@ -30,6 +30,7 @@ def load_single_session_windows(
     window_size: int = 128,
     stride: int = 1,
     full_file: bool = False,
+    keep_features: list[str] | None = None,
 ) -> tuple[np.ndarray, list[str] | None]:
     """Load one session and build windows.
 
@@ -39,6 +40,9 @@ def load_single_session_windows(
         window_size: Number of timesteps per window.
         stride: Step between consecutive windows. Use stride=window_size for non-overlapping windows.
         full_file: If True, load the entire recording without trimming pre-event frames.
+        keep_features: If provided, reindex windows to only these features (in this order).
+                       Features not found in the session will be filled with zeros.
+                       Use this to match the feature set a model was trained on.
 
     Returns:
         windows: (N, window_size, F) float32
@@ -52,6 +56,17 @@ def load_single_session_windows(
     windows, feature_names, _ = prepare_masked_transformer_data(
         data, window_size=window_size, stride=stride
     )
+    if keep_features is not None and feature_names is not None:
+        # Build index mapping from keep_features → column indices in windows
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        selected = []
+        for name in keep_features:
+            if name in name_to_idx:
+                selected.append(windows[:, :, name_to_idx[name]])
+            else:
+                selected.append(np.zeros(windows.shape[:2], dtype=np.float32))
+        windows = np.stack(selected, axis=-1)
+        feature_names = list(keep_features)
     return windows, feature_names
 
 
@@ -69,6 +84,23 @@ def _load_model_from_checkpoint(
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model_state = ckpt.get("model_state", ckpt)
     tp = ckpt.get("training_params", {})
+
+    # feature_names may be stored directly in the checkpoint; if not, fall back
+    # to parsing data_summary.txt that the trainer writes alongside the checkpoint.
+    feature_names: list[str] | None = ckpt.get("feature_names")
+    if feature_names is None:
+        summary_path = checkpoint_path.parent / "data_summary.txt"
+        if summary_path.exists():
+            for line in summary_path.read_text().splitlines():
+                if line.startswith("features:"):
+                    feature_names = [f.strip() for f in line[len("features:"):].split(",")]
+                    break
+
+    # torch.compile wraps the model and prefixes all keys with "_orig_mod."
+    # Strip the prefix so key lookups work regardless of whether compile was used.
+    prefix = "_orig_mod."
+    if any(k.startswith(prefix) for k in model_state):
+        model_state = {k[len(prefix):]: v for k, v in model_state.items()}
 
     d_model = tp.get("d_model", 64)
     nhead = tp.get("nhead", 2)
@@ -135,7 +167,7 @@ def _load_model_from_checkpoint(
                 causal=causal,
             )
     model.load_state_dict(model_state, strict=True)
-    return model.to(device)
+    return model.to(device), feature_names
 
 
 def extract_latents(
@@ -157,12 +189,20 @@ def extract_latents(
         batch_size=batch_size,
         shuffle=False,
     )
+    is_patched = hasattr(model, "patch_embedding")
     latents_list: list[np.ndarray] = []
     with torch.no_grad():
         for X in loader:
             X = X.to(device)
             B, T, _ = X.shape
-            mask = torch.zeros(B, T, dtype=torch.bool, device=device) if no_mask else None
+            if no_mask:
+                if is_patched:
+                    N = T // model.patch_len
+                    mask = torch.zeros(B, N, dtype=torch.bool, device=device)
+                else:
+                    mask = torch.zeros(B, T, dtype=torch.bool, device=device)
+            else:
+                mask = None
             out = model(X, mask=mask)
             latent = out[1]  # (B, T, d_model) or (B, N_patches, d_model) for patched
             latents_list.append(latent.cpu().numpy())
@@ -188,9 +228,12 @@ def extract_session_latents_for_hmm(
     """
     if device is None:
         device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    model = _load_model_from_checkpoint(Path(checkpoint_path), device)
+    model, feature_names = _load_model_from_checkpoint(Path(checkpoint_path), device)
+    if feature_names:
+        print(f"[extract] Filtering session to {len(feature_names)} training features.")
     windows, _ = load_single_session_windows(
-        session_path, stride=window_size, full_file=True, window_size=window_size
+        session_path, stride=window_size, full_file=True, window_size=window_size,
+        keep_features=feature_names,
     )
     latents = extract_latents(model, windows, device, batch_size=batch_size, no_mask=no_mask)
     # (N_windows, T_or_N, d_model) → (N_total, d_model)
@@ -228,7 +271,7 @@ def main():
         print(f"Checkpoint not found: {ckpt_path}", file=sys.stderr)
         sys.exit(1)
 
-    model = _load_model_from_checkpoint(ckpt_path, device, return_layer_mean=args.layer_mean)
+    model, _ = _load_model_from_checkpoint(ckpt_path, device, return_layer_mean=args.layer_mean)
 
     # Load data
     if args.preprocessed_data:
