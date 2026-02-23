@@ -1,8 +1,14 @@
-from behavex.models.extract_latents import extract_session_latents_for_hmm
+from behavex.models.extract_latents import (
+    extract_session_latents_for_hmm,
+    extract_latents,
+    _load_model_from_checkpoint,
+)
+from behavex.models.train_transformer import load_preprocessed_dataset
 from behavex.models.hmm_trainer import HiddenMarkovModelTrainer
 from argparse import ArgumentParser
 from pathlib import Path
 import numpy as np
+import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -88,8 +94,7 @@ def plot_state_occupancy(states: np.ndarray, K: int, out_path: Path) -> None:
 
 if __name__ == "__main__":
 
-    parser = ArgumentParser(description="Single-session HMM sanity check")
-    parser.add_argument("--session_path", required=True, type=str)
+    parser = ArgumentParser(description="HMM sanity check — single session or full preprocessed dataset")
     parser.add_argument("--model_path",   required=True, type=str)
     parser.add_argument("--output_dir",   default="hmm_sanity_check", type=str,
                         help="Directory to save latents, model, and plots")
@@ -99,6 +104,17 @@ if __name__ == "__main__":
                         help="Number of timesteps shown in the ethogram")
     parser.add_argument("--fps",          default=62.4, type=float,
                         help="Recording frame rate (for time axis)")
+
+    src_group = parser.add_mutually_exclusive_group(required=True)
+    src_group.add_argument("--session_path", type=str,
+                           help="Path to a single raw session (.xlsx)")
+    src_group.add_argument("--preprocessed_data", type=str,
+                           help="Path to preprocessed dataset (.npz) — uses cross-session normalisation")
+
+    parser.add_argument("--split", default="all", choices=["train", "val", "test", "all"],
+                        help="Which split(s) of the .npz to use (default: all)")
+    parser.add_argument("--device", default=None, type=str,
+                        help="Device: mps | cuda | cpu (default: auto)")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -106,7 +122,34 @@ if __name__ == "__main__":
 
     # ── 1. Extract latents ────────────────────────────────────────────────────
     print("Extracting latent space …")
-    latents = extract_session_latents_for_hmm(args.session_path, args.model_path)
+
+    if args.preprocessed_data:
+        # Resolve device
+        if args.device:
+            device = torch.device(args.device)
+        else:
+            device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+        # Load preprocessed splits (already cross-session normalised)
+        train_w, val_w, test_w, feature_names, _, _, _, _ = load_preprocessed_dataset(
+            args.preprocessed_data
+        )
+
+        split_map = {"train": [train_w], "val": [val_w], "test": [test_w],
+                     "all": [train_w, val_w, test_w]}
+        selected = [w for w in split_map[args.split] if w is not None and len(w) > 0]
+        if not selected:
+            raise ValueError(f"No windows found for split='{args.split}'")
+        windows = np.concatenate(selected, axis=0).astype(np.float32)
+
+        model, _, _ = _load_model_from_checkpoint(Path(args.model_path), device)
+
+        raw_latents = extract_latents(model, windows, device, no_mask=True)
+        # (N_windows, N_patches, d_model) → (N_total, d_model)
+        latents = raw_latents.reshape(-1, raw_latents.shape[-1])
+    else:
+        latents = extract_session_latents_for_hmm(args.session_path, args.model_path)
+
     print(f"  Latents shape: {latents.shape}")
 
     # ── 2. Fit HMM ────────────────────────────────────────────────────────────
