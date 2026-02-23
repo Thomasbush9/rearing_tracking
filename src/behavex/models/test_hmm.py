@@ -115,6 +115,13 @@ if __name__ == "__main__":
                         help="Which split(s) of the .npz to use (default: all)")
     parser.add_argument("--device", default=None, type=str,
                         help="Device: mps | cuda | cpu (default: auto)")
+    parser.add_argument("--covariance_type", default="diag",
+                        choices=["full", "diag", "tied", "spherical"],
+                        help="HMM emission covariance type (default: diag)")
+    parser.add_argument("--n_fit_samples", default=None, type=int,
+                        help="Subsample this many points for EM fit (default: use all)")
+    parser.add_argument("--n_iter", default=100, type=int,
+                        help="Max EM iterations for HMM fit (default: 100)")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -153,11 +160,20 @@ if __name__ == "__main__":
     print(f"  Latents shape: {latents.shape}")
 
     # ── 2. Fit HMM ────────────────────────────────────────────────────────────
-    print(f"Training HMM (K={args.n_states}) …")
+    print(f"Training HMM (K={args.n_states}, cov={args.covariance_type}, n_iter={args.n_iter}) …")
     # sticky_prior: initial self-transition probability fed to EM.
     # 0.95 → each state expects to stay put for ~1/0.05 = 20 patches ≈ 1.3 s at 62.4 fps
-    trainer = HiddenMarkovModelTrainer(n_states=args.n_states, covariance_type="full")
-    trainer.fit([latents], sticky_prior=0.95)
+    trainer = HiddenMarkovModelTrainer(n_states=args.n_states, covariance_type=args.covariance_type)
+
+    if args.n_fit_samples and len(latents) > args.n_fit_samples:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(latents), args.n_fit_samples, replace=False)
+        fit_latents = latents[idx]
+        print(f"  Subsampled {args.n_fit_samples:,} / {len(latents):,} for EM fit")
+    else:
+        fit_latents = latents
+
+    trainer.fit([fit_latents], sticky_prior=0.95, n_iter=args.n_iter)
     states, log_probs = trainer.decode_states([latents])
     print(f"  State occupancy: { {s: int((states == s).sum()) for s in range(args.n_states)} }")
 
