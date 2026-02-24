@@ -97,6 +97,33 @@ def _compute_transition_matrix(states: np.ndarray, n_states: int) -> np.ndarray:
     return T / row_sums
 
 
+def _predict_chunked(
+    model,
+    scaler: "StandardScaler",
+    latents: np.ndarray,
+    chunk_size: int,
+) -> np.ndarray:
+    """Transform + predict in chunks to avoid materialising the full normalised array.
+
+    Args:
+        model:      Fitted sklearn model with a .predict() method.
+        scaler:     Fitted StandardScaler to apply before prediction.
+        latents:    Raw latent array (N, D).  May be a memory-mapped array.
+        chunk_size: Number of rows to process at once.
+
+    Returns:
+        Integer label array, shape (N,).
+    """
+    n = len(latents)
+    labels = np.empty(n, dtype=np.int64)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        chunk = np.asarray(latents[start:end])          # materialise mmap slice
+        chunk_norm = scaler.transform(chunk)
+        labels[start:end] = model.predict(chunk_norm)
+    return labels
+
+
 def smooth_states(
     states: np.ndarray, window: int, n_states: int
 ) -> np.ndarray:
@@ -129,6 +156,7 @@ def _run_phase_a(
     seed: int,
     smooth_window: int,
     out_dir: Path,
+    chunk_size: int = 500_000,
 ) -> Dict[int, Dict[str, Any]]:
     """Fit MiniBatchKMeans at each K and compute cluster quality metrics.
 
@@ -149,11 +177,11 @@ def _run_phase_a(
     n_sub = min(budget, n)
     rng = np.random.default_rng(seed)
     idx = rng.choice(n, n_sub, replace=False)
-    sub = latents[idx]
+    sub = np.asarray(latents[idx])  # materialise subsample (mmap-safe)
 
     scaler = StandardScaler()
     sub_norm = scaler.fit_transform(sub)
-    full_norm = scaler.transform(latents)
+    # full normalisation is done lazily inside _predict_chunked (no full copy)
 
     results: Dict[int, Dict[str, Any]] = {}
     for K in sorted(k_values):
@@ -166,7 +194,7 @@ def _run_phase_a(
             batch_size=min(10_000, n_sub),
         )
         sub_labels = km.fit_predict(sub_norm)
-        full_labels = km.predict(full_norm).astype(np.int64)
+        full_labels = _predict_chunked(km, scaler, latents, chunk_size)
 
         # Temporal smoothing for dwell / entropy metrics
         smoothed = smooth_states(full_labels, window=smooth_window, n_states=K)
@@ -277,6 +305,7 @@ def _run_phase_b(
     seed: int,
     smooth_window: int,
     out_dir: Path,
+    chunk_size: int = 500_000,
 ) -> Dict[str, Any]:
     """Fit GMM at best_k and compare to K-means via BIC and dwell time.
 
@@ -287,6 +316,7 @@ def _run_phase_b(
         seed:          Random seed.
         smooth_window: Window width for temporal smoothing in metric reporting.
         out_dir:       Directory for artefacts.
+        chunk_size:    Rows per chunk for memory-efficient prediction.
 
     Returns:
         Metrics dict.
@@ -296,11 +326,10 @@ def _run_phase_b(
     n_sub = min(budget, n)
     rng = np.random.default_rng(seed)
     idx = rng.choice(n, n_sub, replace=False)
-    sub = latents[idx]
+    sub = np.asarray(latents[idx])  # materialise subsample (mmap-safe)
 
     scaler = StandardScaler()
     sub_norm = scaler.fit_transform(sub)
-    full_norm = scaler.transform(latents)
 
     print(f"  [Phase B] Fitting GMM (K={best_k}) …", end=" ", flush=True)
     gmm = GaussianMixture(
@@ -314,7 +343,7 @@ def _run_phase_b(
     bic = float(gmm.bic(sub_norm))
     ll_per_frame = float(gmm.score(sub_norm))  # already per sample
 
-    full_labels_gmm = gmm.predict(full_norm).astype(np.int64)
+    full_labels_gmm = _predict_chunked(gmm, scaler, latents, chunk_size)
     smoothed_gmm = smooth_states(full_labels_gmm, window=smooth_window, n_states=best_k)
 
     dwell = _compute_dwell_times(smoothed_gmm, best_k)
@@ -363,6 +392,7 @@ def _run_phase_c(
     seed: int,
     smooth_windows: List[int],
     out_dir: Path,
+    chunk_size: int = 500_000,
 ) -> Dict[int, Dict[str, Any]]:
     """Ablation over smoothing window widths at best K.
 
@@ -376,6 +406,7 @@ def _run_phase_c(
         seed:           Random seed.
         smooth_windows: List of window widths to compare.
         out_dir:        Directory for artefacts.
+        chunk_size:     Rows per chunk for memory-efficient prediction.
 
     Returns:
         Dict mapping window → metrics dict.
@@ -385,11 +416,10 @@ def _run_phase_c(
     n_sub = min(budget, n)
     rng = np.random.default_rng(seed)
     idx = rng.choice(n, n_sub, replace=False)
-    sub = latents[idx]
+    sub = np.asarray(latents[idx])  # materialise subsample (mmap-safe)
 
     scaler = StandardScaler()
     sub_norm = scaler.fit_transform(sub)
-    full_norm = scaler.transform(latents)
 
     # Fit KMeans once; vary smoothing
     km = MiniBatchKMeans(
@@ -399,7 +429,7 @@ def _run_phase_c(
         batch_size=min(10_000, n_sub),
     )
     km.fit(sub_norm)
-    full_labels = km.predict(full_norm).astype(np.int64)
+    full_labels = _predict_chunked(km, scaler, latents, chunk_size)
 
     results: Dict[int, Dict[str, Any]] = {}
     for w in sorted(smooth_windows):
@@ -470,9 +500,12 @@ def run_strategy(args: argparse.Namespace) -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading latents from {args.latents_path} …")
-    latents = np.load(args.latents_path)
-    print(f"  Latents shape: {latents.shape}")
+    mmap_mode = "r" if args.mmap else None
+    print(f"Loading latents from {args.latents_path} …"
+          + (" (mmap)" if args.mmap else ""))
+    latents = np.load(args.latents_path, mmap_mode=mmap_mode)
+    ram_gb = latents.nbytes / 1e9
+    print(f"  Latents shape: {latents.shape}  ({ram_gb:.2f} GB if fully loaded)")
 
     phases = {p.upper() for p in args.phases}
     best_k: Optional[int] = None
@@ -486,6 +519,7 @@ def run_strategy(args: argparse.Namespace) -> None:
             seed=args.seed,
             smooth_window=args.default_smooth_window,
             out_dir=out_dir / "phase_a_k_sweep",
+            chunk_size=args.chunk_size,
         )
         best_k = max(a_results, key=lambda k: a_results[k]["silhouette"])
 
@@ -504,6 +538,7 @@ def run_strategy(args: argparse.Namespace) -> None:
             seed=args.seed,
             smooth_window=args.default_smooth_window,
             out_dir=out_dir / "phase_b_gmm",
+            chunk_size=args.chunk_size,
         )
 
     if "C" in phases:
@@ -521,6 +556,7 @@ def run_strategy(args: argparse.Namespace) -> None:
             seed=args.seed,
             smooth_windows=args.smooth_windows,
             out_dir=out_dir / "phase_c_smoothing",
+            chunk_size=args.chunk_size,
         )
 
     print(f"\nAll done. Results in: {out_dir.resolve()}")
@@ -588,6 +624,26 @@ def main() -> None:
         type=int,
         default=None,
         help="Override best K (required when Phase A is skipped)",
+    )
+    p.add_argument(
+        "--chunk_size",
+        type=int,
+        default=500_000,
+        help=(
+            "Rows processed at once during full-data prediction. "
+            "Reduces peak RAM usage: only chunk_size × D × 4 bytes of "
+            "normalised data are held in memory at any time (default: 500 000)."
+        ),
+    )
+    p.add_argument(
+        "--mmap",
+        action="store_true",
+        default=False,
+        help=(
+            "Memory-map the latents file instead of loading it fully into RAM. "
+            "Use when the file is larger than available RAM. "
+            "Prediction is still chunked; fitting subsample is loaded normally."
+        ),
     )
 
     args = p.parse_args()

@@ -221,10 +221,24 @@ class HiddenMarkovModelTrainer:
                 .to(self._device)
             )
             self.model.fit(X)
-            # Clamp covariances to floor to prevent nan log-probabilities.
+            # Post-fit cleanup: fix dead states (zero E-step responsibility
+            # → NaN means/covs) and enforce a covariance floor.
+            # After StandardScaler: global mean ≈ 0, global variance ≈ 1 — safe fallbacks.
             for dist in self.model.distributions:
+                if dist.means is not None and torch.isnan(dist.means).any():
+                    dist.means.data.nan_to_num_(nan=0.0)
                 if dist.covs is not None:
-                    dist.covs.data.clamp_(min=1e-6)
+                    dist.covs.data.nan_to_num_(nan=1.0)  # NaN cov → unit variance
+                    dist.covs.data.clamp_(min=1e-6)      # existing floor
+            # Fix NaN in log-transition matrix (dead state → 0 observed transitions out)
+            if torch.isnan(self.model.edges).any():
+                self.model.edges.data.nan_to_num_(
+                    nan=float(np.log(1.0 / self.n_states))
+                )
+            if torch.isnan(self.model.starts).any():
+                self.model.starts.data.nan_to_num_(
+                    nan=float(np.log(1.0 / self.n_states))
+                )
         elif self.emission_type == "discrete":
             raise ValueError(
                 "Use fit_discrete() for discrete emissions. "
