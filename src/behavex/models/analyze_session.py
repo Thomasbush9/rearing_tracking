@@ -22,15 +22,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
 import warnings
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import uniform_filter1d
+from scipy.stats import f_oneway, zscore
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
@@ -210,6 +212,165 @@ def _umap_plot(latents_norm: np.ndarray, labels: np.ndarray,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Raw feature correlation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _load_raw_features(
+    raw_data_path: str,
+    window_size: int,
+    n_windows: int,
+) -> Tuple[np.ndarray, List[str]]:
+    """Load behavioral Excel file and compute per-window mean of each feature.
+
+    Uses non-overlapping windows of *window_size* raw frames, matching the
+    latent windows produced by pool_patches(group_size=window_size//patch_len).
+
+    Args:
+        raw_data_path: Path to session .xlsx file (or directory of them).
+        window_size:   Raw frames per window (= group_size × patch_len).
+        n_windows:     Number of latent windows; raw features are trimmed to this.
+
+    Returns:
+        win_features:  (N_windows, n_features) — per-window feature means.
+        feature_names: Ordered list of feature column names.
+    """
+    from behavex.models.train_transformer import (
+        load_data_path,
+        prepare_masked_transformer_data,
+    )
+
+    print(f"  Loading raw behavioral data from {raw_data_path} …")
+    data, valid_mask = load_data_path(raw_data_path)
+
+    # Non-overlapping windows (stride = window_size) → one window per latent vector
+    windows, feature_names, _, _ = prepare_masked_transformer_data(
+        data,
+        window_size=window_size,
+        stride=window_size,
+        valid_mask=valid_mask,
+    )
+    # windows: (N, window_size, F) → (N, F) per-window means
+    win_features: np.ndarray = windows.mean(axis=1)
+
+    if len(win_features) > n_windows:
+        win_features = win_features[:n_windows]
+    elif len(win_features) < n_windows:
+        warnings.warn(
+            f"Raw data yields {len(win_features)} windows but latents have "
+            f"{n_windows}. Feature plots will cover only the overlap.",
+            stacklevel=2,
+        )
+
+    print(f"  Raw feature shape  : {win_features.shape}  ({len(feature_names)} features)")
+    return win_features, feature_names
+
+
+def _feature_heatmap(
+    win_features: np.ndarray,
+    labels: np.ndarray,
+    feature_names: List[str],
+    K: int,
+    out_path: Path,
+) -> None:
+    """Heatmap: rows = states, columns = features (z-scored, sorted by discriminability)."""
+    n_win = min(len(win_features), len(labels))
+    feat = win_features[:n_win]
+    lbl = labels[:n_win]
+
+    feat_z = zscore(feat, axis=0, nan_policy="omit")
+    feat_z = np.nan_to_num(feat_z)
+
+    # Per-state mean of z-scored features
+    state_means = np.array([
+        feat_z[lbl == s].mean(axis=0) if (lbl == s).any() else np.zeros(feat.shape[1])
+        for s in range(K)
+    ])  # (K, F)
+
+    # Sort features by variance across states (most discriminative first)
+    sort_idx = np.argsort(-state_means.var(axis=0))
+    sm_sorted = state_means[:, sort_idx]
+    fn_sorted = [feature_names[i] for i in sort_idx]
+
+    n_feat = len(fn_sorted)
+    fig_w = max(12, n_feat * 0.35)
+    fig_h = max(3.0, K * 0.55 + 1.5)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    im = ax.imshow(sm_sorted, aspect="auto", cmap="RdBu_r", vmin=-2, vmax=2)
+    plt.colorbar(im, ax=ax, label="Z-scored mean (across windows)")
+    ax.set_yticks(range(K))
+    ax.set_yticklabels([f"S{s}" for s in range(K)], fontsize=9)
+    ax.set_xticks(range(n_feat))
+    ax.set_xticklabels(fn_sorted, rotation=45, ha="right", fontsize=7)
+    ax.set_xlabel("Feature (sorted by variance across states)")
+    ax.set_ylabel("State")
+    ax.set_title(f"Feature profile per state  (K={K}, z-scored, n={n_win:,} windows)")
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved feature heatmap   → {out_path}")
+
+
+def _feature_boxplots(
+    win_features: np.ndarray,
+    labels: np.ndarray,
+    feature_names: List[str],
+    K: int,
+    out_path: Path,
+    top_n: int = 8,
+) -> None:
+    """Violin plots for the top-N features ranked by F-statistic across states."""
+    n_win = min(len(win_features), len(labels))
+    feat = win_features[:n_win]
+    lbl = labels[:n_win]
+    n_feat = feat.shape[1]
+
+    # F-statistic per feature
+    f_stats: List[float] = []
+    for fi in range(n_feat):
+        groups = [feat[lbl == s, fi] for s in range(K)]
+        valid = [g for g in groups if len(g) > 1]
+        if len(valid) >= 2:
+            fval = float(f_oneway(*valid).statistic)
+            f_stats.append(fval if np.isfinite(fval) else 0.0)
+        else:
+            f_stats.append(0.0)
+
+    top_idx = np.argsort(f_stats)[-top_n:][::-1]
+    actual_n = len(top_idx)
+
+    ncols = min(4, actual_n)
+    nrows = (actual_n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.5, nrows * 3.5))
+    axes_flat = np.array(axes).flatten()
+
+    cmap = plt.get_cmap("tab10", K)
+    for panel, fi in enumerate(top_idx):
+        ax = axes_flat[panel]
+        groups = [feat[lbl == s, fi] for s in range(K)]
+        data_plot = [g if len(g) > 0 else np.array([0.0]) for g in groups]
+        parts = ax.violinplot(data_plot, positions=range(K), showmedians=True)
+        for pc, s in zip(parts["bodies"], range(K)):
+            pc.set_facecolor(cmap(s))
+            pc.set_alpha(0.7)
+        ax.set_xticks(range(K))
+        ax.set_xticklabels([f"S{s}" for s in range(K)], fontsize=8)
+        ax.set_title(f"{feature_names[fi]}\nF={f_stats[fi]:.1f}", fontsize=9)
+        ax.grid(axis="y", alpha=0.3)
+
+    for panel in range(actual_n, len(axes_flat)):
+        axes_flat[panel].set_visible(False)
+
+    plt.suptitle(
+        f"Top-{actual_n} discriminative features by F-statistic  (K={K})", fontsize=11
+    )
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved feature boxplots  → {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main analysis loop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -224,6 +385,7 @@ def run_analysis(
     budget: int = 200_000,
     seed: int = 0,
     umap: bool = True,
+    raw_data: Optional[str] = None,
 ) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -238,6 +400,7 @@ def run_analysis(
     win_latents = pool_patches(np.asarray(raw), group_size)
     # Each row = one window = group_size patches × patch_len frames / fps
     window_sec = group_size * patch_len / fps
+    n_windows = len(win_latents)
     print(f"  Window-level shape: {win_latents.shape}  "
           f"({window_sec:.3f} s per window  "
           f"[{group_size} patches × {patch_len} frames / {fps} fps])")
@@ -249,6 +412,27 @@ def run_analysis(
     sub_idx = rng.choice(n, min(budget, n), replace=False)
     sub_norm = scaler.fit_transform(win_latents[sub_idx])
     win_norm = scaler.transform(win_latents)   # window-level, fits in RAM
+
+    # Save scaler for cross-session reuse
+    with open(out / "scaler.pkl", "wb") as fh:
+        pickle.dump(scaler, fh)
+    print(f"  Saved scaler            → {out / 'scaler.pkl'}")
+
+    # ── Raw feature loading (optional) ────────────────────────────────────────
+    raw_window_size = group_size * patch_len   # frames per latent window
+    win_features: Optional[np.ndarray] = None
+    feature_names: Optional[List[str]] = None
+    if raw_data is not None:
+        try:
+            win_features, feature_names = _load_raw_features(
+                raw_data, raw_window_size, n_windows
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"Could not load raw features from {raw_data}: {exc}\n"
+                "Feature plots will be skipped.",
+                stacklevel=2,
+            )
 
     summary = {}
 
@@ -282,8 +466,11 @@ def run_analysis(
         print(f"  per-state dwell: "
               + "  ".join(f"S{s}={dwell[s] * window_sec:.1f}s" for s in range(K)))
 
-        # Save labels
+        # Save labels + fitted km model
         np.save(k_dir / "labels.npy", labels)
+        with open(k_dir / f"km_K{K:02d}.pkl", "wb") as fh:
+            pickle.dump(km, fh)
+        print(f"  Saved km model          → {k_dir / f'km_K{K:02d}.pkl'}")
 
         # Plots
         _ethogram(labels, K, fps=1 / window_sec,   # windows/s → treat as fps
@@ -294,6 +481,13 @@ def run_analysis(
         _transition_heatmap(T_mat, K, k_dir / "transition_matrix.png")
         if umap:
             _umap_plot(win_norm, labels, K, k_dir / "umap.png")
+
+        # Feature correlation plots (only if raw data was loaded)
+        if win_features is not None and feature_names is not None:
+            _feature_heatmap(win_features, labels, feature_names, K,
+                             k_dir / "feature_heatmap.png")
+            _feature_boxplots(win_features, labels, feature_names, K,
+                              k_dir / "feature_boxplots.png")
 
         summary[K] = {
             "silhouette": sil,
@@ -360,6 +554,9 @@ def main() -> None:
     p.add_argument("--seed",        type=int, default=0)
     p.add_argument("--no_umap",     action="store_true",
                    help="Skip UMAP (faster if umap-learn not installed)")
+    p.add_argument("--raw_data",    default=None,
+                   help="Path to session Excel file (or directory) for feature correlation "
+                        "plots. If omitted, feature plots are skipped gracefully.")
     p.add_argument("--detect_group_size", action="store_true",
                    help="Print likely group sizes given N and quit")
     args = p.parse_args()
@@ -383,6 +580,7 @@ def main() -> None:
         budget=args.budget,
         seed=args.seed,
         umap=not args.no_umap,
+        raw_data=args.raw_data,
     )
 
 
