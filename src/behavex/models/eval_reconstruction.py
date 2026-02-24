@@ -106,12 +106,12 @@ def _eval_reconstruction(
                 P = model.patch_len
                 N = T // P
                 patch_mask = create_patch_mask(B, N, effective_mask_ratio, device)
-                # Replace masked patches with mask token before forward
-                recon, _, timestep_mask, _ = model(X, mask=patch_mask)
+                out = model(X, mask=patch_mask)
             else:
                 from behavex.models.transformer import create_timestep_mask
                 ts_mask = create_timestep_mask(B, T, effective_mask_ratio, device)
-                recon, _, timestep_mask, _ = model(X, mask=ts_mask)
+                out = model(X, mask=ts_mask)
+            recon, _, timestep_mask = out[0], out[1], out[2]
 
             # Only compute MSE on masked positions
             # timestep_mask: (B, T) bool, True = masked
