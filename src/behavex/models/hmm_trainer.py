@@ -210,6 +210,9 @@ class HiddenMarkovModelTrainer:
                 )
                 dist.d = mean_k.shape[0]
                 dist._initialized = True
+            # Must set model.d explicitly: pomegranate skips self.d = X.shape[-1]
+            # in _initialize() when all dists are already _initialized=True.
+            self.model.d = concatenated.shape[1]
 
         if self.emission_type == "gaussian":
             X = (
