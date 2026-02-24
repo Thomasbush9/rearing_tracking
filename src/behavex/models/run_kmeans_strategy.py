@@ -97,6 +97,37 @@ def _compute_transition_matrix(states: np.ndarray, n_states: int) -> np.ndarray:
     return T / row_sums
 
 
+def _fit_kmeans_chunked(
+    km: "MiniBatchKMeans",
+    scaler: "StandardScaler",
+    latents: np.ndarray,
+    chunk_size: int,
+    n_epochs: int = 3,
+) -> "MiniBatchKMeans":
+    """Fit MiniBatchKMeans incrementally over the full dataset using partial_fit.
+
+    Scaler must already be fitted (e.g. on a subsample); latents are normalised
+    on-the-fly per chunk.  Uses n_epochs passes so centroids converge.
+
+    Args:
+        km:         Unfitted MiniBatchKMeans instance.
+        scaler:     Already-fitted StandardScaler.
+        latents:    Full latent array (N, D).  May be memory-mapped.
+        chunk_size: Rows per chunk.
+        n_epochs:   Number of full passes through the data.
+
+    Returns:
+        Fitted km.
+    """
+    n = len(latents)
+    for epoch in range(n_epochs):
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            chunk_norm = scaler.transform(np.asarray(latents[start:end]))
+            km.partial_fit(chunk_norm)
+    return km
+
+
 def _predict_chunked(
     model,
     scaler: "StandardScaler",
@@ -157,6 +188,7 @@ def _run_phase_a(
     smooth_window: int,
     out_dir: Path,
     chunk_size: int = 500_000,
+    fit_all: bool = False,
 ) -> Dict[int, Dict[str, Any]]:
     """Fit MiniBatchKMeans at each K and compute cluster quality metrics.
 
@@ -193,7 +225,11 @@ def _run_phase_a(
             n_init=3,
             batch_size=min(10_000, n_sub),
         )
-        sub_labels = km.fit_predict(sub_norm)
+        if fit_all:
+            _fit_kmeans_chunked(km, scaler, latents, chunk_size)
+            sub_labels = km.predict(sub_norm)
+        else:
+            sub_labels = km.fit_predict(sub_norm)
         full_labels = _predict_chunked(km, scaler, latents, chunk_size)
 
         # Temporal smoothing for dwell / entropy metrics
@@ -393,6 +429,7 @@ def _run_phase_c(
     smooth_windows: List[int],
     out_dir: Path,
     chunk_size: int = 500_000,
+    fit_all: bool = False,
 ) -> Dict[int, Dict[str, Any]]:
     """Ablation over smoothing window widths at best K.
 
@@ -428,7 +465,10 @@ def _run_phase_c(
         n_init=3,
         batch_size=min(10_000, n_sub),
     )
-    km.fit(sub_norm)
+    if fit_all:
+        _fit_kmeans_chunked(km, scaler, latents, chunk_size)
+    else:
+        km.fit(sub_norm)
     full_labels = _predict_chunked(km, scaler, latents, chunk_size)
 
     results: Dict[int, Dict[str, Any]] = {}
@@ -520,6 +560,7 @@ def run_strategy(args: argparse.Namespace) -> None:
             smooth_window=args.default_smooth_window,
             out_dir=out_dir / "phase_a_k_sweep",
             chunk_size=args.chunk_size,
+            fit_all=args.fit_all,
         )
         best_k = max(a_results, key=lambda k: a_results[k]["silhouette"])
 
@@ -557,6 +598,7 @@ def run_strategy(args: argparse.Namespace) -> None:
             smooth_windows=args.smooth_windows,
             out_dir=out_dir / "phase_c_smoothing",
             chunk_size=args.chunk_size,
+            fit_all=args.fit_all,
         )
 
     print(f"\nAll done. Results in: {out_dir.resolve()}")
@@ -643,6 +685,16 @@ def main() -> None:
             "Memory-map the latents file instead of loading it fully into RAM. "
             "Use when the file is larger than available RAM. "
             "Prediction is still chunked; fitting subsample is loaded normally."
+        ),
+    )
+    p.add_argument(
+        "--fit_all",
+        action="store_true",
+        default=False,
+        help=(
+            "Fit KMeans on the full dataset using partial_fit (streamed in chunks). "
+            "Scaler stats are computed from --budget subsample; KMeans sees all N frames "
+            "for n_epochs=3 passes. Ignored for GMM in Phase B (no partial_fit in sklearn)."
         ),
     )
 
