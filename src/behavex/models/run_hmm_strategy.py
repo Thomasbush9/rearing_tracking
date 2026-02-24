@@ -154,8 +154,9 @@ def _fit_single(
     train_data, test_data = _subsample_split(latents, budget, seed)
     n_train = len(train_data)
 
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
     trainer = HiddenMarkovModelTrainer(
-        n_states=n_states, covariance_type=covariance_type
+        n_states=n_states, covariance_type=covariance_type, device=device
     )
     trainer.fit([train_data], n_iter=n_iter, random_state=seed, sticky_prior=0.95)
 
@@ -598,6 +599,7 @@ def _run_phase4(
 
     train_data, test_data = _subsample_split(latents, budget, seed)
     rng = np.random.default_rng(seed + 1)
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
 
     results: Dict[str, Any] = {}
 
@@ -605,7 +607,7 @@ def _run_phase4(
     real_dir = out_dir / "real"
     real_dir.mkdir(exist_ok=True)
     trainer_real = HiddenMarkovModelTrainer(
-        n_states=K, covariance_type=args.covariance_type
+        n_states=K, covariance_type=args.covariance_type, device=device
     )
     trainer_real.fit([train_data], n_iter=args.n_iter, random_state=seed,
                      sticky_prior=0.95)
@@ -628,7 +630,7 @@ def _run_phase4(
     shuffled_train = rng.permutation(train_data)
     shuffled_test = rng.permutation(test_data)
     trainer_shuf = HiddenMarkovModelTrainer(
-        n_states=K, covariance_type=args.covariance_type
+        n_states=K, covariance_type=args.covariance_type, device=device
     )
     trainer_shuf.fit([shuffled_train], n_iter=args.n_iter, random_state=seed,
                      sticky_prior=0.95)

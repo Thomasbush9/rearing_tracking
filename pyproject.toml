@@ -23,7 +23,7 @@ dependencies = [
     "opencv-python",
     "openpyxl",
     "xlrd",
-    "hmmlearn>=0.3.3",
+    "pomegranate>=1.0.0",
     "h5py",
 ]
 

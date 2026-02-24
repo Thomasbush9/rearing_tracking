@@ -25,6 +25,7 @@ src/behavex/models/hmm_trainer.py
 src/behavex/models/inspect_transformer.py
 src/behavex/models/make_dataset.py
 src/behavex/models/run_hmm_pipeline.py
+src/behavex/models/run_hmm_strategy.py
 src/behavex/models/sweep_transformer.py
 src/behavex/models/test_hmm.py
 src/behavex/models/train.py

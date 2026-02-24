@@ -2,23 +2,27 @@
 Hidden Markov Model training module for temporal sequence analysis.
 
 This module provides tools for training HMMs on latent representations
-extracted from transformer models.
+extracted from transformer models. Uses pomegranate (PyTorch backend)
+for GPU/MPS acceleration.
 """
 
 import numpy as np
 import pickle
+import torch
 from typing import Union, List, Tuple, Dict, Optional
 from pathlib import Path
 import warnings
 
 try:
-    from hmmlearn import hmm
+    from pomegranate.hmm import DenseHMM
+    from pomegranate.distributions import Normal, Categorical
 
     HMM_AVAILABLE = True
 except ImportError:
     HMM_AVAILABLE = False
     warnings.warn(
-        "hmmlearn not installed. Install with: pip install hmmlearn", ImportWarning
+        "pomegranate not installed. Install with: pip install pomegranate>=1.0.0",
+        ImportWarning,
     )
 
 from sklearn.cluster import KMeans
@@ -30,8 +34,8 @@ class HiddenMarkovModelTrainer:
     """
     Trains Hidden Markov Models on sequential latent representations.
 
-    Supports both continuous (Gaussian) emissions and discrete emissions
-    after clustering. Compatible with hmmlearn library.
+    Supports continuous (Gaussian) emissions and discrete emissions
+    after clustering. Uses pomegranate (PyTorch backend) for GPU/MPS support.
     """
 
     def __init__(
@@ -40,6 +44,7 @@ class HiddenMarkovModelTrainer:
         covariance_type: str = "full",
         emission_type: str = "gaussian",
         n_symbols: Optional[int] = None,
+        device: str = "auto",
     ):
         """
         Initialize HMM trainer.
@@ -51,11 +56,12 @@ class HiddenMarkovModelTrainer:
             emission_type: Type of emission distribution
                           ('gaussian', 'discrete', 'gmm')
             n_symbols: Number of discrete symbols (required for discrete emissions)
+            device: Compute device ('auto', 'mps', 'cpu', 'cuda')
         """
         if not HMM_AVAILABLE:
             raise ImportError(
-                "hmmlearn is required for HMM training. "
-                "Install with: pip install hmmlearn"
+                "pomegranate is required for HMM training. "
+                "Install with: pip install pomegranate>=1.0.0"
             )
 
         self.n_states = n_states
@@ -63,29 +69,36 @@ class HiddenMarkovModelTrainer:
         self.emission_type = emission_type
         self.n_symbols = n_symbols
 
+        if device == "auto":
+            self._device = "mps" if torch.backends.mps.is_available() else "cpu"
+        else:
+            self._device = device
+
         self.model = None
         self.cluster_model = None
         self.is_fitted = False
         self.scaler = None
 
-    def _create_model(self) -> hmm.BaseHMM:
+    def _create_model(self) -> "DenseHMM":
         """Create appropriate HMM model based on emission type."""
         if self.emission_type == "gaussian":
-            return hmm.GaussianHMM(
-                n_components=self.n_states,
-                covariance_type=self.covariance_type,
-                n_iter=100,
-                tol=1e-4,
-                verbose=False,
+            dists = [
+                Normal(covariance_type=self.covariance_type)
+                for _ in range(self.n_states)
+            ]
+            model = DenseHMM(
+                distributions=dists, max_iter=100, tol=1e-4, verbose=False
             )
+            return model.to(self._device)
         elif self.emission_type == "discrete":
             if self.n_symbols is None:
                 raise ValueError("n_symbols required for discrete emissions")
-            return hmm.MultinomialHMM(
-                n_components=self.n_states, n_iter=100, tol=1e-4, verbose=False
+            dists = [Categorical() for _ in range(self.n_states)]
+            model = DenseHMM(
+                distributions=dists, max_iter=100, tol=1e-4, verbose=False
             )
+            return model.to(self._device)
         elif self.emission_type == "gmm":
-            # Custom GMM-HMM could be implemented here
             raise NotImplementedError("GMM emissions not yet implemented")
         else:
             raise ValueError(f"Unknown emission type: {self.emission_type}")
@@ -107,7 +120,6 @@ class HiddenMarkovModelTrainer:
         lengths = [len(seq) for seq in sequences]
         concatenated = np.concatenate(sequences, axis=0)
 
-        # Standardize if requested
         if normalize:
             self.scaler = StandardScaler()
             concatenated = self.scaler.fit_transform(concatenated)
@@ -135,11 +147,11 @@ class HiddenMarkovModelTrainer:
             n_iter: Maximum iterations for EM
             normalize: Whether to standardize features
             random_state: Random seed
+            sticky_prior: Self-transition prior probability (0 = disabled)
 
         Returns:
             self: Fitted trainer instance
         """
-        # Handle input format
         if isinstance(sequences, list):
             concatenated, lengths = self.preprocess_data(sequences, normalize)
         else:
@@ -147,25 +159,32 @@ class HiddenMarkovModelTrainer:
             if lengths is None:
                 raise ValueError("lengths required when sequences is array")
 
-        # Create and configure model
         self.model = self._create_model()
-        self.model.n_iter = n_iter
+        self.model.max_iter = n_iter
 
         if random_state is not None:
-            self.model.random_state = random_state
+            torch.manual_seed(random_state)
 
         if sticky_prior > 0.0:
-            # Initialise transition matrix with self-transition probability = sticky_prior
-            # and skip hmmlearn's own transmat initialisation so it keeps our matrix.
-            off = (1.0 - sticky_prior) / max(self.n_states - 1, 1)
-            A0 = np.full((self.n_states, self.n_states), off)
-            np.fill_diagonal(A0, sticky_prior)
-            self.model.init_params = self.model.init_params.replace("t", "")
-            self.model.transmat_ = A0
+            K = self.n_states
+            off = (1.0 - sticky_prior) / max(K - 1, 1)
+            A0 = torch.full((K, K), off, dtype=torch.float32)
+            A0.fill_diagonal_(sticky_prior)
+            # Pre-set edges so pomegranate's _initialize skips re-initializing them.
+            # requires_grad=False matches pomegranate's internal convention and
+            # allows the in-place update in from_summaries() to succeed.
+            self.model.edges = torch.nn.Parameter(
+                torch.log(A0.clamp(min=1e-30)).to(self._device),
+                requires_grad=False,
+            )
 
-        # Fit model
         if self.emission_type == "gaussian":
-            self.model.fit(concatenated, lengths)
+            X = (
+                torch.tensor(concatenated, dtype=torch.float32)
+                .unsqueeze(0)
+                .to(self._device)
+            )
+            self.model.fit(X)
         elif self.emission_type == "discrete":
             raise ValueError(
                 "Use fit_discrete() for discrete emissions. "
@@ -203,7 +222,6 @@ class HiddenMarkovModelTrainer:
         Returns:
             Dictionary with trained components
         """
-        # Concatenate all sequences for clustering
         if isinstance(sequences, list):
             concatenated = np.concatenate(sequences, axis=0)
             lengths = [len(seq) for seq in sequences]
@@ -212,7 +230,6 @@ class HiddenMarkovModelTrainer:
             if lengths is None:
                 raise ValueError("lengths required for concatenated array")
 
-        # Cluster continuous observations into symbols
         if cluster_method == "kmeans":
             self.cluster_model = KMeans(
                 n_clusters=n_symbols, random_state=random_state, n_init=10
@@ -233,20 +250,22 @@ class HiddenMarkovModelTrainer:
         else:
             raise ValueError(f"Unknown cluster method: {cluster_method}")
 
-        # Convert to column vector expected by hmmlearn
         symbols = symbols.reshape(-1, 1)
 
-        # Create discrete HMM
         self.emission_type = "discrete"
         self.n_symbols = n_symbols
         self.model = self._create_model()
-        self.model.n_iter = n_iter
+        self.model.max_iter = n_iter
 
         if random_state is not None:
-            self.model.random_state = random_state
+            torch.manual_seed(random_state)
 
-        # Train on symbol sequences
-        self.model.fit(symbols, lengths)
+        X = (
+            torch.tensor(symbols, dtype=torch.long)
+            .unsqueeze(0)
+            .to(self._device)
+        )
+        self.model.fit(X)
         self.is_fitted = True
 
         return {
@@ -277,7 +296,6 @@ class HiddenMarkovModelTrainer:
         if not self.is_fitted:
             raise ValueError("Model must be fitted before decoding")
 
-        # Handle input format
         if isinstance(sequences, list):
             concatenated = np.concatenate(sequences, axis=0)
             lengths = [len(seq) for seq in sequences]
@@ -286,32 +304,40 @@ class HiddenMarkovModelTrainer:
             if lengths is None:
                 raise ValueError("lengths required for concatenated array")
 
-        # Apply scaler if used during training
         if self.scaler is not None:
             concatenated = self.scaler.transform(concatenated)
 
-        # Convert to symbols if discrete HMM
         if self.emission_type == "discrete":
             symbols = self.cluster_model.predict(concatenated)
             concatenated = symbols.reshape(-1, 1)
 
-        # Decode states
+        X = (
+            torch.tensor(concatenated, dtype=torch.float32)
+            .unsqueeze(0)
+            .to(self._device)
+        )
+
         if algorithm == "viterbi":
-            state_sequences = self.model.predict(concatenated, lengths)
+            state_tensor = self.model.predict(X)  # (1, T)
+            state_sequences = state_tensor.squeeze(0).cpu().numpy()
         elif algorithm == "map":
-            _, state_sequences = self.model.decode(concatenated, lengths)
+            proba = self.model.predict_proba(X)  # (1, T, K)
+            state_sequences = proba.squeeze(0).argmax(dim=-1).cpu().numpy()
         else:
             raise ValueError(f"Unknown algorithm: {algorithm}")
 
-        # Compute log probabilities
+        # Compute log probabilities per sequence
         log_probs = []
         start = 0
         for length in lengths:
             seq = concatenated[start : start + length]
-            log_prob = self.model.score(
-                seq.reshape(1, -1) if len(seq.shape) == 1 else seq
+            X_seq = (
+                torch.tensor(seq, dtype=torch.float32)
+                .unsqueeze(0)
+                .to(self._device)
             )
-            log_probs.append(log_prob)
+            lp = self.model.log_probability(X_seq).item()
+            log_probs.append(lp)
             start += length
 
         return state_sequences, np.array(log_probs)
@@ -334,7 +360,6 @@ class HiddenMarkovModelTrainer:
         if not self.is_fitted:
             raise ValueError("Model must be fitted before scoring")
 
-        # Handle input format
         if isinstance(sequences, list):
             concatenated = np.concatenate(sequences, axis=0)
             lengths = [len(seq) for seq in sequences]
@@ -343,24 +368,24 @@ class HiddenMarkovModelTrainer:
             if lengths is None:
                 raise ValueError("lengths required for concatenated array")
 
-        # Apply scaler if used
         if self.scaler is not None:
             concatenated = self.scaler.transform(concatenated)
 
-        # Convert to symbols if discrete HMM
         if self.emission_type == "discrete":
             symbols = self.cluster_model.predict(concatenated)
             concatenated = symbols.reshape(-1, 1)
 
-        # Score sequences
         log_likelihoods = []
         start = 0
         for length in lengths:
             seq = concatenated[start : start + length]
-            log_prob = self.model.score(
-                seq.reshape(1, -1) if len(seq.shape) == 1 else seq
+            X_seq = (
+                torch.tensor(seq, dtype=torch.float32)
+                .unsqueeze(0)
+                .to(self._device)
             )
-            log_likelihoods.append(log_prob)
+            lp = self.model.log_probability(X_seq).item()
+            log_likelihoods.append(lp)
             start += length
 
         return np.array(log_likelihoods)
@@ -369,15 +394,15 @@ class HiddenMarkovModelTrainer:
         """Get HMM state transition matrix."""
         if not self.is_fitted:
             raise ValueError("Model must be fitted first")
-        return self.model.transmat_
+        return torch.exp(self.model.edges).detach().cpu().numpy()
 
     def get_stationary_distribution(self) -> np.ndarray:
         """Get stationary distribution of Markov chain."""
         if not self.is_fitted:
             raise ValueError("Model must be fitted first")
 
-        # Compute eigenvector of transition matrix
-        eigvals, eigvecs = np.linalg.eig(self.model.transmat_.T)
+        transmat = self.get_transition_matrix()
+        eigvals, eigvecs = np.linalg.eig(transmat.T)
         stationary = eigvecs[:, np.isclose(eigvals, 1)].real
         stationary = stationary / stationary.sum()
         return stationary.ravel()
@@ -395,10 +420,7 @@ class HiddenMarkovModelTrainer:
         if not self.is_fitted:
             raise ValueError("Model must be fitted first")
 
-        # Decode states
         state_seqs, _ = self.decode_states(sequences)
-
-        # Concatenate all sequences
         all_seqs = np.concatenate(sequences, axis=0)
 
         stats = {}
@@ -409,7 +431,7 @@ class HiddenMarkovModelTrainer:
             if len(state_observations) > 0:
                 stats[f"state_{state}"] = {
                     "n_observations": len(state_observations),
-                    "mean_duration": None,  # Compute from state_seqs
+                    "mean_duration": None,
                     "feature_means": np.mean(state_observations, axis=0),
                     "feature_stds": np.std(state_observations, axis=0),
                     "prior_probability": np.mean(mask),
@@ -422,24 +444,39 @@ class HiddenMarkovModelTrainer:
         if not self.is_fitted:
             raise ValueError("Model must be fitted before saving")
 
+        transmat = torch.exp(self.model.edges).detach().cpu().numpy()
+        startprob = torch.exp(self.model.starts).detach().cpu().numpy()
+
         save_dict = {
             "n_states": self.n_states,
             "covariance_type": self.covariance_type,
             "emission_type": self.emission_type,
             "n_symbols": self.n_symbols,
             "model_params": {
-                "transmat_": self.model.transmat_,
-                "startprob_": self.model.startprob_,
+                "transmat_": transmat,
+                "startprob_": startprob,
             },
             "scaler": self.scaler,
             "is_fitted": self.is_fitted,
         }
 
         if self.emission_type == "gaussian":
-            save_dict["model_params"]["means_"] = self.model.means_
-            save_dict["model_params"]["covars_"] = self.model.covars_
+            means = np.stack(
+                [d.means.detach().cpu().numpy() for d in self.model.distributions]
+            )
+            covars = np.stack(
+                [d.covs.detach().cpu().numpy() for d in self.model.distributions]
+            )
+            save_dict["model_params"]["means_"] = means
+            save_dict["model_params"]["covars_"] = covars
         elif self.emission_type == "discrete":
-            save_dict["model_params"]["emissionprob_"] = self.model.emissionprob_
+            emissionprob = np.stack(
+                [
+                    torch.exp(d.probs).detach().cpu().numpy()
+                    for d in self.model.distributions
+                ]
+            )
+            save_dict["model_params"]["emissionprob_"] = emissionprob
             save_dict["cluster_model"] = self.cluster_model
 
         with open(filepath, "wb") as f:
@@ -451,7 +488,6 @@ class HiddenMarkovModelTrainer:
         with open(filepath, "rb") as f:
             save_dict = pickle.load(f)
 
-        # Create instance
         instance = cls(
             n_states=save_dict["n_states"],
             covariance_type=save_dict["covariance_type"],
@@ -459,16 +495,63 @@ class HiddenMarkovModelTrainer:
             n_symbols=save_dict["n_symbols"],
         )
 
-        # Create model and restore parameters
-        instance.model = instance._create_model()
-        for key, value in save_dict["model_params"].items():
-            setattr(instance.model, key, value)
+        params = save_dict["model_params"]
+        # DenseHMM constructor expects probabilities; it stores log-probs internally.
+        transmat = torch.tensor(params["transmat_"], dtype=torch.float32)
+        startprob = torch.tensor(params["startprob_"], dtype=torch.float32)
 
+        dev = instance._device
+
+        if instance.emission_type == "gaussian":
+            means_np = params["means_"]
+            covars_np = params["covars_"]
+            n_features = means_np.shape[1]
+            # Create blank distributions; set means/covs after moving to device
+            # to avoid device-mismatch when pomegranate's .to() doesn't deep-traverse.
+            dists = [
+                Normal(covariance_type=instance.covariance_type)
+                for _ in range(instance.n_states)
+            ]
+            model = DenseHMM(
+                distributions=dists,
+                edges=transmat,
+                starts=startprob,
+                max_iter=100,
+                tol=1e-4,
+                verbose=False,
+            )
+            model = model.to(dev)
+            # Set feature dimension and distribution parameters on the target device.
+            # model.d is normally set by _initialize() during the first fit; we
+            # replicate that here so _emission_matrix shape-checks pass.
+            model.d = n_features
+            for k, dist in enumerate(model.distributions):
+                dist.means = torch.nn.Parameter(
+                    torch.tensor(means_np[k], dtype=torch.float32, device=dev),
+                    requires_grad=False,
+                )
+                dist.covs = torch.nn.Parameter(
+                    torch.tensor(covars_np[k], dtype=torch.float32, device=dev),
+                    requires_grad=False,
+                )
+                dist.d = n_features
+                dist._initialized = True
+        elif instance.emission_type == "discrete":
+            dists = [Categorical() for _ in range(instance.n_states)]
+            model = DenseHMM(
+                distributions=dists,
+                edges=transmat,
+                starts=startprob,
+                max_iter=100,
+                tol=1e-4,
+                verbose=False,
+            )
+            model = model.to(dev)
+            instance.cluster_model = save_dict["cluster_model"]
+
+        instance.model = model
         instance.scaler = save_dict["scaler"]
         instance.is_fitted = save_dict["is_fitted"]
-
-        if instance.emission_type == "discrete":
-            instance.cluster_model = save_dict["cluster_model"]
 
         return instance
 
@@ -507,7 +590,6 @@ def model_selection(
         if verbose:
             print(f"Training HMM with {n_states} states...")
 
-        # Create and train model
         trainer = HiddenMarkovModelTrainer(
             n_states=n_states,
             covariance_type=covariance_type,
@@ -526,7 +608,6 @@ def model_selection(
             else:
                 trainer.fit(sequences, random_state=random_state)
 
-            # Score model
             log_likelihood = np.sum(trainer.score_sequences(sequences))
             n_params = estimate_n_params(trainer.model, emission_type)
             n_samples = sum(len(seq) for seq in sequences)
@@ -566,34 +647,33 @@ def model_selection(
     return results
 
 
-def estimate_n_params(model, emission_type: str) -> int:
+def estimate_n_params(model: "DenseHMM", emission_type: str) -> int:
     """Estimate number of parameters in HMM model."""
-    n_states = model.n_components
+    n_states = len(model.distributions)
 
-    # Transition matrix params
-    n_params = n_states * (n_states - 1)  # Sum-to-1 constraint
+    # Transition matrix params (sum-to-1 constraint per row)
+    n_params = n_states * (n_states - 1)
 
     # Initial state distribution
-    n_params += n_states - 1  # Sum-to-1 constraint
+    n_params += n_states - 1
 
     if emission_type == "gaussian":
+        n_features = model.distributions[0].means.shape[-1]
         # Mean vectors
-        n_features = model.means_.shape[1]
         n_params += n_states * n_features
 
-        # Covariance matrices
-        if model.covariance_type == "full":
+        cov_type = model.distributions[0].covariance_type
+        if cov_type == "full":
             n_params += n_states * n_features * (n_features + 1) // 2
-        elif model.covariance_type == "tied":
+        elif cov_type == "tied":
             n_params += n_features * (n_features + 1) // 2
-        elif model.covariance_type == "diag":
+        elif cov_type == "diag":
             n_params += n_states * n_features
-        elif model.covariance_type == "spherical":
+        elif cov_type == "spherical":
             n_params += n_states
 
     elif emission_type == "discrete":
-        # Emission probabilities
-        n_symbols = model.emissionprob_.shape[1]
-        n_params += n_states * (n_symbols - 1)  # Sum-to-1 constraint per state
+        n_symbols = model.distributions[0].probs.shape[-1]
+        n_params += n_states * (n_symbols - 1)
 
     return n_params
