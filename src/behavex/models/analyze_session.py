@@ -386,6 +386,7 @@ def run_analysis(
     seed: int = 0,
     umap: bool = True,
     raw_data: Optional[str] = None,
+    min_norm: Optional[float] = None,
 ) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -400,18 +401,34 @@ def run_analysis(
     win_latents = pool_patches(np.asarray(raw), group_size)
     # Each row = one window = group_size patches × patch_len frames / fps
     window_sec = group_size * patch_len / fps
-    n_windows = len(win_latents)
     print(f"  Window-level shape: {win_latents.shape}  "
           f"({window_sec:.3f} s per window  "
           f"[{group_size} patches × {patch_len} frames / {fps} fps])")
 
+    # ── Norm-based pre-event filter ───────────────────────────────────────────
+    norms = np.linalg.norm(win_latents, axis=1)  # (N_windows,)
+    # keep_idx maps filtered positions → original window indices
+    if min_norm is not None:
+        keep_mask = norms >= min_norm
+        keep_idx = np.where(keep_mask)[0]
+        n_dropped = len(win_latents) - len(keep_idx)
+        print(f"  Norm filter (≥{min_norm}): keeping {len(keep_idx):,} / "
+              f"{len(win_latents):,} windows  "
+              f"(dropped {n_dropped:,} = {n_dropped / len(win_latents) * 100:.1f}%)")
+        win_latents_filt = win_latents[keep_idx]
+    else:
+        keep_idx = np.arange(len(win_latents))
+        win_latents_filt = win_latents
+
+    n_windows = len(win_latents_filt)
+
     # ── Normalise ────────────────────────────────────────────────────────────
     scaler = StandardScaler()
-    n = len(win_latents)
+    n = n_windows
     rng = np.random.default_rng(seed)
     sub_idx = rng.choice(n, min(budget, n), replace=False)
-    sub_norm = scaler.fit_transform(win_latents[sub_idx])
-    win_norm = scaler.transform(win_latents)   # window-level, fits in RAM
+    sub_norm = scaler.fit_transform(win_latents_filt[sub_idx])
+    win_norm = scaler.transform(win_latents_filt)   # window-level, fits in RAM
 
     # Save scaler for cross-session reuse
     with open(out / "scaler.pkl", "wb") as fh:
@@ -424,15 +441,20 @@ def run_analysis(
     feature_names: Optional[List[str]] = None
     if raw_data is not None:
         try:
-            win_features, feature_names = _load_raw_features(
-                raw_data, raw_window_size, n_windows
+            win_features_all, feature_names = _load_raw_features(
+                raw_data, raw_window_size, len(win_latents)
             )
+            # Apply same norm filter to raw features
+            win_features = win_features_all[keep_idx[keep_idx < len(win_features_all)]]
         except Exception as exc:
             warnings.warn(
                 f"Could not load raw features from {raw_data}: {exc}\n"
                 "Feature plots will be skipped.",
                 stacklevel=2,
             )
+
+    # Save norm filter params for compare_sessions reuse
+    np.save(out / "keep_idx.npy", keep_idx)
 
     summary = {}
 
@@ -557,6 +579,13 @@ def main() -> None:
     p.add_argument("--raw_data",    default=None,
                    help="Path to session Excel file (or directory) for feature correlation "
                         "plots. If omitted, feature plots are skipped gracefully.")
+    p.add_argument("--min_norm",    type=float, default=None,
+                   help="Exclude windows whose L2 norm is below this threshold before "
+                        "clustering. Pre-event (zeroed) frames cluster near the origin; "
+                        "use --plot_norm_hist first to pick a good cutoff.")
+    p.add_argument("--plot_norm_hist", action="store_true",
+                   help="Plot the distribution of window-mean L2 norms and exit. "
+                        "Use this to choose --min_norm for pre-event filtering.")
     p.add_argument("--detect_group_size", action="store_true",
                    help="Print likely group sizes given N and quit")
     args = p.parse_args()
@@ -570,6 +599,44 @@ def main() -> None:
                   f"({g * args.patch_len / args.fps:.3f} s/window)")
         return
 
+    if args.plot_norm_hist:
+        raw = np.load(args.latents, mmap_mode="r")
+        win_latents = pool_patches(np.asarray(raw), args.group_size)
+        norms = np.linalg.norm(win_latents, axis=1)
+        out = Path(args.output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        hist_path = out / "norm_histogram.png"
+
+        pcts = [1, 5, 10, 25, 50, 75, 90, 95, 99]
+        print("Window L2-norm percentiles:")
+        for p, v in zip(pcts, np.percentile(norms, pcts)):
+            print(f"  p{p:2d}: {v:.4f}")
+        print(f"  min={norms.min():.4f}  max={norms.max():.4f}")
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        axes[0].hist(norms, bins=200, color="C0", edgecolor="none", alpha=0.8)
+        axes[0].set_xlabel("L2 norm")
+        axes[0].set_ylabel("Count")
+        axes[0].set_title("Distribution of window L2 norms")
+        axes[0].grid(alpha=0.3)
+
+        axes[1].hist(norms, bins=200, color="C0", edgecolor="none", alpha=0.8)
+        axes[1].set_yscale("log")
+        axes[1].set_xlabel("L2 norm")
+        axes[1].set_ylabel("Count (log scale)")
+        axes[1].set_title("Same — log-y (reveals the pre-event spike near 0)")
+        axes[1].grid(alpha=0.3)
+
+        plt.suptitle("Use this to pick --min_norm.  "
+                     "The pre-event cluster appears as a spike near zero.")
+        plt.tight_layout()
+        fig.savefig(hist_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"\nSaved norm histogram → {hist_path}")
+        print("Pick --min_norm at the trough between the near-zero spike "
+              "and the main distribution.")
+        return
+
     run_analysis(
         latents_path=args.latents,
         group_size=args.group_size,
@@ -581,6 +648,7 @@ def main() -> None:
         seed=args.seed,
         umap=not args.no_umap,
         raw_data=args.raw_data,
+        min_norm=args.min_norm,
     )
 
 
