@@ -83,7 +83,7 @@ class HiddenMarkovModelTrainer:
         """Create appropriate HMM model based on emission type."""
         if self.emission_type == "gaussian":
             dists = [
-                Normal(covariance_type=self.covariance_type)
+                Normal(covariance_type=self.covariance_type, min_cov=1e-6)
                 for _ in range(self.n_states)
             ]
             model = DenseHMM(
@@ -178,6 +178,39 @@ class HiddenMarkovModelTrainer:
                 requires_grad=False,
             )
 
+        if init_method == "kmeans" and self.emission_type == "gaussian":
+            n_sub = min(len(concatenated), 50_000)
+            rng_np = np.random.default_rng(random_state)
+            sub_idx = rng_np.choice(len(concatenated), n_sub, replace=False)
+            sub = concatenated[sub_idx]
+            km = KMeans(
+                n_clusters=self.n_states, n_init=5,
+                random_state=random_state, max_iter=100,
+            )
+            km.fit(sub)
+            labels = km.labels_
+            dev = self._device
+            for k, dist in enumerate(self.model.distributions):
+                mask = labels == k
+                if mask.sum() < 2:
+                    mask = np.ones(len(sub), dtype=bool)
+                pts = sub[mask]
+                mean_k = pts.mean(axis=0)
+                if self.covariance_type == "spherical":
+                    cov_k = np.array([max(float(pts.var()), 1e-3)])
+                else:  # diag, full, tied — use diagonal approximation
+                    cov_k = np.maximum(pts.var(axis=0), 1e-3)
+                dist.means = torch.nn.Parameter(
+                    torch.tensor(mean_k, dtype=torch.float32, device=dev),
+                    requires_grad=False,
+                )
+                dist.covs = torch.nn.Parameter(
+                    torch.tensor(cov_k, dtype=torch.float32, device=dev),
+                    requires_grad=False,
+                )
+                dist.d = mean_k.shape[0]
+                dist._initialized = True
+
         if self.emission_type == "gaussian":
             X = (
                 torch.tensor(concatenated, dtype=torch.float32)
@@ -185,6 +218,10 @@ class HiddenMarkovModelTrainer:
                 .to(self._device)
             )
             self.model.fit(X)
+            # Clamp covariances to floor to prevent nan log-probabilities.
+            for dist in self.model.distributions:
+                if dist.covs is not None:
+                    dist.covs.data.clamp_(min=1e-6)
         elif self.emission_type == "discrete":
             raise ValueError(
                 "Use fit_discrete() for discrete emissions. "
@@ -509,7 +546,7 @@ class HiddenMarkovModelTrainer:
             # Create blank distributions; set means/covs after moving to device
             # to avoid device-mismatch when pomegranate's .to() doesn't deep-traverse.
             dists = [
-                Normal(covariance_type=instance.covariance_type)
+                Normal(covariance_type=instance.covariance_type, min_cov=1e-6)
                 for _ in range(instance.n_states)
             ]
             model = DenseHMM(
