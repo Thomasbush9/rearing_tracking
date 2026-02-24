@@ -220,6 +220,7 @@ def run_analysis(
     k_values: List[int],
     output_dir: str,
     fps: float = 62.4,
+    patch_len: int = 4,
     budget: int = 200_000,
     seed: int = 0,
     umap: bool = True,
@@ -235,10 +236,11 @@ def run_analysis(
 
     print(f"  Averaging every {group_size} patches → window-level …")
     win_latents = pool_patches(np.asarray(raw), group_size)
-    # Each row now = one window ≈ (group_size * frame_duration) seconds
-    window_sec = group_size / fps          # seconds per window token
+    # Each row = one window = group_size patches × patch_len frames / fps
+    window_sec = group_size * patch_len / fps
     print(f"  Window-level shape: {win_latents.shape}  "
-          f"({window_sec:.3f} s per window)")
+          f"({window_sec:.3f} s per window  "
+          f"[{group_size} patches × {patch_len} frames / {fps} fps])")
 
     # ── Normalise ────────────────────────────────────────────────────────────
     scaler = StandardScaler()
@@ -350,6 +352,9 @@ def main() -> None:
                    help="Output directory")
     p.add_argument("--fps",         type=float, default=62.4,
                    help="Camera frame rate (used for dwell time labels)")
+    p.add_argument("--patch_len",   type=int,   default=4,
+                   help="Frames per patch (from transformer config). "
+                        "Used to convert patch-counts to seconds.")
     p.add_argument("--budget",      type=int, default=200_000,
                    help="Frames used for KMeans fitting (subsample)")
     p.add_argument("--seed",        type=int, default=0)
@@ -365,7 +370,7 @@ def main() -> None:
         print(f"N patches = {n}")
         for g in [8, 10, 12, 16, 20, 32]:
             print(f"  group_size={g:2d} → {n // g:,} windows "
-                  f"({g / args.fps:.3f} s/window)")
+                  f"({g * args.patch_len / args.fps:.3f} s/window)")
         return
 
     run_analysis(
@@ -374,6 +379,7 @@ def main() -> None:
         k_values=args.k_values,
         output_dir=args.output_dir,
         fps=args.fps,
+        patch_len=args.patch_len,
         budget=args.budget,
         seed=args.seed,
         umap=not args.no_umap,
