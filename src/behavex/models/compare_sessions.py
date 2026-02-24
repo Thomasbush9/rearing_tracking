@@ -45,13 +45,14 @@ import pickle
 import re
 import warnings
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.stats import f_oneway, zscore
 
 from behavex.models.analyze_session import (
     _dwell_times,
@@ -92,11 +93,18 @@ def _row_count(xlsx_path: Path) -> int:
         return 0
 
 
-def _patches_for_session(n_frames: int, window_size: int, group_size: int) -> int:
-    """Number of patches a session with n_frames rows contributes to latents.npy."""
+def _patches_for_session(
+    n_frames: int, window_size: int, group_size: int, extraction_stride: int
+) -> int:
+    """Number of patches a session with n_frames rows contributes to latents.npy.
+
+    extraction_stride: the stride used when building the preprocessed dataset
+    (often stride=patch_len, e.g. 16 for window_size=128, patch_len=4 with s16 preset).
+    group_size = window_size // patch_len (patches per transformer window).
+    """
     if n_frames < window_size:
         return 0
-    n_windows = (n_frames - window_size) // window_size + 1
+    n_windows = (n_frames - window_size) // extraction_stride + 1
     return n_windows * group_size
 
 
@@ -219,6 +227,134 @@ def _entropy_bar(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Per-session feature loading & correlation plots
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _load_session_features(
+    session_path: Path,
+    window_size: int,
+    extraction_stride: int,
+    n_windows: int,
+) -> Tuple[np.ndarray, List[str]]:
+    """Load one session's raw behavioral features, windowed to match latent windows.
+
+    Uses the same stride as latent extraction so feature windows align 1-to-1
+    with the pooled latent windows produced by pool_patches.
+    """
+    from behavex.models.train_transformer import load_data_path, prepare_masked_transformer_data
+
+    data, valid_mask = load_data_path(str(session_path), trim_before_dist_head=False)
+    windows, feature_names, _, _ = prepare_masked_transformer_data(
+        data,
+        window_size=window_size,
+        stride=extraction_stride,
+        valid_mask=valid_mask,
+    )
+    # (N, window_size, F) → (N, F) per-window means
+    win_features = windows.mean(axis=1)
+    if len(win_features) > n_windows:
+        win_features = win_features[:n_windows]
+    return win_features, feature_names
+
+
+def _feature_heatmap_global(
+    all_features: np.ndarray,
+    all_labels: np.ndarray,
+    feature_names: List[str],
+    K: int,
+    out_path: Path,
+) -> None:
+    """Z-scored per-state mean feature heatmap across all pooled sessions."""
+    feat_z = zscore(all_features, axis=0, nan_policy="omit")
+    feat_z = np.nan_to_num(feat_z)
+    state_means = np.array([
+        feat_z[all_labels == s].mean(axis=0) if (all_labels == s).any()
+        else np.zeros(all_features.shape[1])
+        for s in range(K)
+    ])
+    sort_idx = np.argsort(-state_means.var(axis=0))
+    sm = state_means[:, sort_idx]
+    fn = [feature_names[i] for i in sort_idx]
+
+    fig, ax = plt.subplots(figsize=(max(12, len(fn) * 0.35), max(3, K * 0.6 + 1.5)))
+    im = ax.imshow(sm, aspect="auto", cmap="RdBu_r", vmin=-2, vmax=2)
+    plt.colorbar(im, ax=ax, label="Z-scored mean")
+    ax.set_yticks(range(K))
+    ax.set_yticklabels([f"S{s}" for s in range(K)], fontsize=9)
+    ax.set_xticks(range(len(fn)))
+    ax.set_xticklabels(fn, rotation=45, ha="right", fontsize=7)
+    ax.set_title(f"Feature profile per state  (K={K}, n={len(all_labels):,} windows)")
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved feature heatmap      → {out_path}")
+
+
+def _feature_boxplots_global(
+    all_features: np.ndarray,
+    all_labels: np.ndarray,
+    feature_names: List[str],
+    K: int,
+    out_path: Path,
+    top_n: int = 8,
+) -> Dict[str, float]:
+    """Violin plots for top-N features by F-statistic, pooled across sessions.
+
+    Returns a dict mapping feature_name -> F-statistic (for all features, not just top-N).
+    This can be saved and passed to eval_reconstruction.py as --fstat_json.
+    """
+    f_stats: List[float] = []
+    for fi in range(all_features.shape[1]):
+        groups = [all_features[all_labels == s, fi] for s in range(K)]
+        valid = [g for g in groups if len(g) > 1]
+        if len(valid) >= 2:
+            fval = float(f_oneway(*valid).statistic)
+            f_stats.append(fval if np.isfinite(fval) else 0.0)
+        else:
+            f_stats.append(0.0)
+
+    # Save F-stats alongside the plot for use with eval_reconstruction --fstat_json
+    fstat_dict = {feature_names[i]: f_stats[i] for i in range(len(feature_names))}
+    fstat_path = out_path.parent / "fstat_per_feature.json"
+    with open(fstat_path, "w") as fh:
+        json.dump(fstat_dict, fh, indent=2)
+    print(f"  Saved F-stat JSON          → {fstat_path}")
+
+    top_idx = np.argsort(f_stats)[-top_n:][::-1]
+    ncols = min(4, len(top_idx))
+    nrows = (len(top_idx) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.5, nrows * 3.5))
+    axes_flat = np.array(axes).flatten()
+    cmap = plt.get_cmap("tab10", K)
+
+    for panel, fi in enumerate(top_idx):
+        ax = axes_flat[panel]
+        data_plot = [
+            all_features[all_labels == s, fi] if (all_labels == s).any()
+            else np.array([0.0])
+            for s in range(K)
+        ]
+        parts = ax.violinplot(data_plot, positions=range(K), showmedians=True)
+        for pc, s in zip(parts["bodies"], range(K)):
+            pc.set_facecolor(cmap(s))
+            pc.set_alpha(0.7)
+        ax.set_xticks(range(K))
+        ax.set_xticklabels([f"S{s}" for s in range(K)], fontsize=8)
+        ax.set_title(f"{feature_names[fi]}\nF={f_stats[fi]:.1f}", fontsize=9)
+        ax.grid(axis="y", alpha=0.3)
+
+    for panel in range(len(top_idx), len(axes_flat)):
+        axes_flat[panel].set_visible(False)
+    plt.suptitle(f"Top-{len(top_idx)} discriminative features  (K={K})", fontsize=11)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved feature boxplots     → {out_path}")
+    return fstat_dict
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -231,14 +367,23 @@ def run_compare(
     group_size: int,
     window_size: int,
     output_dir: str,
-    patch_len: int = 8,
+    patch_len: int = 4,
     fps: float = 62.4,
+    extraction_stride: Optional[int] = None,
+    filter_pattern: Optional[str] = None,
+    raw_data_dir: Optional[str] = None,
 ) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     ref_dir = Path(model_dir)
     data_path = Path(data_dir)
     window_sec = group_size * patch_len / fps
+
+    # Default: stride = patch_len (the s16 / overlapping-window preset)
+    if extraction_stride is None:
+        extraction_stride = patch_len
+    print(f"Extraction stride : {extraction_stride}  "
+          f"(patches/window={group_size}, window_size={window_size})")
 
     # ── Discover sessions ────────────────────────────────────────────────────
     session_files = _discover_sessions(data_path)
@@ -247,32 +392,38 @@ def run_compare(
             f"No m*_s*_cricket|object.xlsx files found in {data_path}"
         )
     print(f"Found {len(session_files)} session files in {data_path}")
+    if filter_pattern:
+        import re as _re
+        session_files_all = session_files
+        session_files = [f for f in session_files if _re.search(filter_pattern, f.stem)]
+        print(f"Filter '{filter_pattern}': {len(session_files)} / {len(session_files_all)} sessions selected")
 
-    # ── Compute expected patch counts per session ────────────────────────────
-    print("Computing row counts (reading first column only) …")
-    session_info: List[Tuple[Path, int, int]] = []  # (path, n_frames, n_patches)
-    for f in session_files:
+    # ── Compute patch counts for ALL sessions (need cursor even for skipped) ─
+    print("Computing row counts …")
+    session_info: List[Tuple[Path, int, int, bool]] = []  # path, n_frames, n_patches, include
+    all_files = _discover_sessions(data_path)  # full list for cursor
+    selected_stems = {f.stem for f in session_files}
+    for f in all_files:
         n_frames = _row_count(f)
-        n_patches = _patches_for_session(n_frames, window_size, group_size)
-        session_info.append((f, n_frames, n_patches))
-        print(f"  {f.name:40s}  frames={n_frames:6d}  patches={n_patches:6d}")
+        n_patches = _patches_for_session(n_frames, window_size, group_size, extraction_stride)
+        include = f.stem in selected_stems
+        session_info.append((f, n_frames, n_patches, include))
+        marker = "→" if include else "  "
+        print(f"  {marker} {f.name:40s}  frames={n_frames:6d}  patches={n_patches:7d}")
 
     total_expected = sum(s[2] for s in session_info)
 
-    # ── Load latents & validate ──────────────────────────────────────────────
-    print(f"\nLoading {latents_path} …")
+    # ── Load latents (memory-mapped — never fully loaded into RAM) ────────────
+    print(f"\nLoading {latents_path} (mmap) …")
     latents = np.load(latents_path, mmap_mode="r")
-    print(f"  Latent shape : {latents.shape}")
-    print(f"  Expected sum : {total_expected}  "
-          f"({'MATCH' if total_expected == len(latents) else 'MISMATCH — check args'})")
+    print(f"  Latent shape  : {latents.shape}")
+    print(f"  Expected total: {total_expected}  "
+          f"({'MATCH ✓' if total_expected == len(latents) else f'MISMATCH (diff={len(latents)-total_expected:+d})'})")
 
     if total_expected != len(latents):
-        diff = len(latents) - total_expected
         warnings.warn(
-            f"Patch count mismatch: latents has {len(latents)} rows but Excel files "
-            f"sum to {total_expected} (diff={diff:+d}).\n"
-            "Check --window_size, --patch_len, --group_size match the extraction run.\n"
-            "Proceeding anyway — boundaries may be off.",
+            f"Patch count mismatch: latents has {len(latents)} rows, "
+            f"Excel sum={total_expected}. Boundaries may be off.",
             stacklevel=2,
         )
 
@@ -287,27 +438,54 @@ def run_compare(
     entropies: List[float] = []
     summary: Dict[str, dict] = {}
 
+    # For feature correlation (accumulated across selected sessions)
+    all_feat_chunks: List[np.ndarray] = []
+    all_lbl_chunks: List[np.ndarray] = []
+    feature_names: Optional[List[str]] = None
+
     cursor = 0
-    for (f, n_frames, n_patches) in session_info:
-        name = f.stem  # e.g. m1_s1_cricket
+    for (f, n_frames, n_patches, include) in session_info:
+        name = f.stem
         if n_patches == 0:
-            print(f"\n  Skipping {name} — too few frames ({n_frames})")
+            continue
+
+        if not include:
+            # Advance cursor without loading data into RAM
             cursor += n_patches
             continue
 
         print(f"\n── {name} ──")
-        patch_slice = np.asarray(latents[cursor: cursor + n_patches])
+        # Only read this session's slice from disk (mmap → minimal RAM)
+        patch_slice = np.array(latents[cursor: cursor + n_patches], copy=True)
         cursor += n_patches
 
         # Pool patches → window-level vectors
         win_latents = pool_patches(patch_slice, group_size)
+        del patch_slice  # free RAM immediately
         win_norm = scaler.transform(win_latents)
+        del win_latents
         labels = km.predict(win_norm).astype(np.int64)
+        del win_norm
 
         occ = _occupancy(labels, k)
         dwell = _dwell_times(labels, k)
         T_mat = _transition_matrix(labels, k)
         ent = _entropy(occ)
+
+        # Feature loading (one session at a time — memory safe)
+        if raw_data_dir is not None:
+            try:
+                feat, feat_names = _load_session_features(
+                    f, window_size, extraction_stride, len(labels)
+                )
+                n_align = min(len(feat), len(labels))
+                all_feat_chunks.append(feat[:n_align])
+                all_lbl_chunks.append(labels[:n_align])
+                if feature_names is None:
+                    feature_names = feat_names
+                print(f"  features  : {feat.shape[1]} features, {n_align:,} windows aligned")
+            except Exception as exc:
+                warnings.warn(f"Feature loading failed for {name}: {exc}", stacklevel=2)
 
         print(f"  n_windows : {len(labels):,}")
         print(f"  entropy   : {ent:.4f}  (max {np.log(k):.4f})")
@@ -340,6 +518,19 @@ def run_compare(
     )
     _entropy_bar(session_names, entropies, k, out / "entropy_per_session.png")
 
+    # Feature correlation plots (pooled across all selected sessions)
+    if all_feat_chunks and feature_names is not None:
+        all_features = np.concatenate(all_feat_chunks, axis=0)
+        all_labels   = np.concatenate(all_lbl_chunks,  axis=0)
+        print(f"\nFeature correlation: {all_features.shape[0]:,} windows, "
+              f"{all_features.shape[1]} features")
+        _feature_heatmap_global(
+            all_features, all_labels, feature_names, k, out / "feature_heatmap.png"
+        )
+        _feature_boxplots_global(
+            all_features, all_labels, feature_names, k, out / "feature_boxplots.png"
+        )
+
     with open(out / "summary.json", "w") as fh:
         json.dump(summary, fh, indent=2)
     print(f"\n  Saved summary JSON         → {out / 'summary.json'}")
@@ -371,12 +562,24 @@ def main() -> None:
     )
     p.add_argument("--k",          type=int, required=True,
                    help="K value (must have been run in analyze_session.py)")
-    p.add_argument("--group_size", type=int, default=16,
+    p.add_argument("--group_size", type=int, default=32,
                    help="Patches per window (= window_size // patch_len)")
     p.add_argument("--window_size", type=int, default=128,
                    help="Raw frames per window (transformer window_size)")
-    p.add_argument("--patch_len",  type=int, default=8,
+    p.add_argument("--patch_len",  type=int, default=4,
                    help="Frames per patch (from transformer config)")
+    p.add_argument("--extraction_stride", type=int, default=None,
+                   help="Stride used when building the preprocessed dataset. "
+                        "Defaults to patch_len (e.g. 4 for the s16 preset). "
+                        "Use window_size for non-overlapping extraction.")
+    p.add_argument("--raw_data_dir", default=None,
+                   help="Directory of Excel files to load raw behavioral features "
+                        "for state characterisation. Only selected (filtered) sessions "
+                        "are loaded — one at a time for memory efficiency.")
+    p.add_argument("--filter",     default=None, dest="filter_pattern",
+                   help="Only process sessions whose filename matches this regex "
+                        "(e.g. 'm003' to process mouse 3 only). "
+                        "Cursor still advances correctly through skipped sessions.")
     p.add_argument("--output_dir", default="compare_sessions_output",
                    help="Directory for output plots and summary JSON")
     p.add_argument("--fps",        type=float, default=62.4,
@@ -393,6 +596,9 @@ def main() -> None:
         output_dir=args.output_dir,
         patch_len=args.patch_len,
         fps=args.fps,
+        extraction_stride=args.extraction_stride,
+        filter_pattern=args.filter_pattern,
+        raw_data_dir=args.raw_data_dir,
     )
 
 
