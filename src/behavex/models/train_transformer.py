@@ -2164,7 +2164,7 @@ class PatchedMaskedTemporalTrainer:
         axes[-1, 0].set_xlabel("Time")
         fig.suptitle(title)
         plt.tight_layout()
-        plt.savefig(self.plots_dir / save_name, dpi=150, bbox_inches="tight")
+        plt.savefig(self.plots_dir / save_name, bbox_inches="tight")
         if tb_tag is not None and tb_step is not None:
             self.writer.add_figure(tb_tag, fig, tb_step)
             self._log_wandb_image(tb_tag, fig, tb_step)
@@ -2173,7 +2173,7 @@ class PatchedMaskedTemporalTrainer:
     def _plot_validation(self, epoch: int) -> None:
         self._plot_reconstruction(
             self.val_loader,
-            f"val_recon_epoch{epoch}.png",
+            f"val_recon_epoch{epoch}.svg",
             f"Validation epoch {epoch}: ~{self.args.mask_ratio*100:.0f}% patches masked (P={self.patch_length})",
             self.val_seed,
             tb_tag="val/gt_vs_recon",
@@ -2488,7 +2488,7 @@ class PatchedMaskedTemporalTrainer:
             self._log_wandb({"test/loss": test_loss}, step=final_epoch)
             self._plot_reconstruction(
                 self.test_loader,
-                "test_recon.png",
+                "test_recon.svg",
                 f"Test set: ~{args.mask_ratio*100:.0f}% patches masked (P={self.patch_length})",
                 self.val_seed + 1,
                 tb_tag="test/gt_vs_recon",

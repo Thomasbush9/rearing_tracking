@@ -52,7 +52,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.stats import f_oneway, zscore
+from scipy.stats import f_oneway, ttest_rel, wilcoxon, zscore
 
 from behavex.models.analyze_session import (
     _dwell_times,
@@ -227,6 +227,170 @@ def _entropy_bar(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Session trajectory & cricket-vs-object statistics
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NAME_RE = re.compile(r"_s(\d+)_(cricket|object)$", re.IGNORECASE)
+
+
+def _parse_session_name(name: str) -> Optional[Tuple[int, str]]:
+    """'m003_s006_cricket' → (6, 'cricket'). Returns None if no match."""
+    m = _NAME_RE.search(name)
+    return (int(m.group(1)), m.group(2).lower()) if m else None
+
+
+def _trajectory_plot(
+    session_names: List[str],
+    occupancies: np.ndarray,  # (n_sessions, K)
+    K: int,
+    out_path: Path,
+) -> None:
+    """One panel per state: occupancy vs session number, cricket vs object."""
+    parsed = [(_parse_session_name(n), occupancies[i]) for i, n in enumerate(session_names)]
+    parsed = [(p, occ) for p, occ in parsed if p is not None]
+
+    cricket: Dict[int, np.ndarray] = {}
+    object_: Dict[int, np.ndarray] = {}
+    for (sess_num, cond), occ in parsed:
+        (cricket if cond == "cricket" else object_)[sess_num] = occ
+
+    sessions = sorted(set(cricket) & set(object_))
+    if len(sessions) < 2:
+        print("  Trajectory plot skipped: need ≥2 matched session numbers")
+        return
+
+    ncols = min(4, K)
+    nrows = (K + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.2, nrows * 2.8), squeeze=False)
+    axes_flat = axes.flatten()
+
+    for s in range(K):
+        ax = axes_flat[s]
+        c_vals = [cricket[sess][s] for sess in sessions]
+        o_vals = [object_[sess][s] for sess in sessions]
+        ax.plot(sessions, c_vals, "o-", color="C1", lw=1.8, ms=5, label="cricket")
+        ax.plot(sessions, o_vals, "s--", color="C0", lw=1.8, ms=5, label="object")
+        ax.set_title(f"S{s}", fontsize=9, fontweight="bold")
+        ax.set_xlabel("Session", fontsize=7)
+        ax.set_ylabel("Occupancy", fontsize=7)
+        ax.set_xticks(sessions)
+        ax.set_ylim(0, None)
+        ax.tick_params(labelsize=7)
+        ax.grid(alpha=0.3)
+        if s == 0:
+            ax.legend(fontsize=7)
+
+    for idx in range(K, len(axes_flat)):
+        axes_flat[idx].set_visible(False)
+
+    plt.suptitle(f"State occupancy over sessions  (K={K})", fontsize=11)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved trajectory plot      → {out_path}")
+
+
+def _cricket_vs_object_stats(
+    session_names: List[str],
+    occupancies: np.ndarray,  # (n_sessions, K)
+    K: int,
+    out_path: Path,
+) -> None:
+    """Paired cricket-vs-object bar chart with significance markers per state.
+
+    Uses Wilcoxon signed-rank (≥5 pairs) or paired t-test (<5 pairs).
+    FDR correction (Benjamini-Hochberg) across states.
+    """
+    parsed = [(_parse_session_name(n), occupancies[i]) for i, n in enumerate(session_names)]
+    parsed = [(p, occ) for p, occ in parsed if p is not None]
+
+    cricket: Dict[int, np.ndarray] = {}
+    object_: Dict[int, np.ndarray] = {}
+    for (sess_num, cond), occ in parsed:
+        (cricket if cond == "cricket" else object_)[sess_num] = occ
+
+    sessions = sorted(set(cricket) & set(object_))
+    n_pairs = len(sessions)
+    if n_pairs < 3:
+        print(f"  Stats plot skipped: need ≥3 matched sessions, got {n_pairs}")
+        return
+
+    c_mat = np.array([[cricket[s][k] for k in range(K)] for s in sessions])  # (n, K)
+    o_mat = np.array([[object_[s][k] for k in range(K)] for s in sessions])  # (n, K)
+
+    c_mean = c_mat.mean(axis=0)
+    o_mean = o_mat.mean(axis=0)
+    c_sem  = c_mat.std(axis=0, ddof=1) / np.sqrt(n_pairs)
+    o_sem  = o_mat.std(axis=0, ddof=1) / np.sqrt(n_pairs)
+
+    # Per-state paired test
+    raw_p = []
+    for k in range(K):
+        c_vals = c_mat[:, k].tolist()
+        o_vals = o_mat[:, k].tolist()
+        try:
+            if n_pairs >= 5:
+                _, p = wilcoxon(c_vals, o_vals)
+            else:
+                _, p = ttest_rel(c_vals, o_vals)
+        except Exception:
+            p = 1.0
+        raw_p.append(p)
+
+    # FDR correction (BH) — fallback to raw if statsmodels absent
+    try:
+        from statsmodels.stats.multitest import multipletests
+        _, p_corr, _, _ = multipletests(raw_p, method="fdr_bh")
+    except ImportError:
+        p_corr = np.array(raw_p)
+        print("  (statsmodels not found — showing uncorrected p-values)")
+
+    def _sig_label(p: float) -> str:
+        if p < 0.001: return "***"
+        if p < 0.01:  return "**"
+        if p < 0.05:  return "*"
+        return "ns"
+
+    x = np.arange(K)
+    w = 0.35
+    fig, ax = plt.subplots(figsize=(max(7, K * 1.1), 4.5))
+    ax.bar(x - w/2, c_mean, w, yerr=c_sem, label="cricket",
+           color="C1", alpha=0.85, capsize=3)
+    ax.bar(x + w/2, o_mean, w, yerr=o_sem, label="object",
+           color="C0", alpha=0.85, capsize=3)
+
+    # Significance markers above each pair
+    y_top = np.maximum(c_mean + c_sem, o_mean + o_sem)
+    y_offset = y_top.max() * 0.04
+    for k, (p, yt) in enumerate(zip(p_corr, y_top)):
+        ax.text(x[k], yt + y_offset, _sig_label(p),
+                ha="center", va="bottom", fontsize=9)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"S{k}" for k in range(K)], fontsize=9)
+    ax.set_ylabel("Mean occupancy ± SE")
+    ax.set_ylim(0, (y_top + y_offset * 3).max())
+    stat_label = "Wilcoxon" if n_pairs >= 5 else "paired t"
+    ax.set_title(
+        f"Cricket vs Object  (K={K}, n={n_pairs} sessions, {stat_label}, FDR-BH)\n"
+        "* p<0.05   ** p<0.01   *** p<0.001   ns = not significant"
+    )
+    ax.legend(fontsize=9)
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved stats bar chart      → {out_path}")
+
+    # Print table
+    print(f"\n  Cricket vs Object (n={n_pairs} paired sessions, {stat_label} + FDR-BH):")
+    print(f"  {'State':6}  {'Cricket':8}  {'Object':8}  {'p_corr':8}  Sig")
+    for k in range(K):
+        print(f"  S{k:<5}  {c_mean[k]:.3f}     {o_mean[k]:.3f}     "
+              f"{p_corr[k]:.4f}    {_sig_label(p_corr[k])}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-session feature loading & correlation plots
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -372,6 +536,8 @@ def run_compare(
     extraction_stride: Optional[int] = None,
     filter_pattern: Optional[str] = None,
     raw_data_dir: Optional[str] = None,
+    save_labels: bool = False,
+    save_winlatents: bool = False,
 ) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -465,7 +631,18 @@ def run_compare(
         win_norm = scaler.transform(win_latents)
         del win_latents
         labels = km.predict(win_norm).astype(np.int64)
+
+        if save_winlatents:
+            wl_path = out / f"{name}_winlatents.npy"
+            np.save(wl_path, win_norm)
+            print(f"  winlatents saved: {wl_path}")
+
         del win_norm
+
+        if save_labels:
+            lbl_path = out / f"{name}_labels.npy"
+            np.save(lbl_path, labels)
+            print(f"  labels saved : {lbl_path}")
 
         occ = _occupancy(labels, k)
         dwell = _dwell_times(labels, k)
@@ -517,6 +694,8 @@ def run_compare(
         session_names, transition_mats, k, out / "transition_multiples.png"
     )
     _entropy_bar(session_names, entropies, k, out / "entropy_per_session.png")
+    _trajectory_plot(session_names, occ_matrix, k, out / "session_trajectory.png")
+    _cricket_vs_object_stats(session_names, occ_matrix, k, out / "cricket_vs_object_stats.png")
 
     # Feature correlation plots (pooled across all selected sessions)
     if all_feat_chunks and feature_names is not None:
@@ -584,6 +763,12 @@ def main() -> None:
                    help="Directory for output plots and summary JSON")
     p.add_argument("--fps",        type=float, default=62.4,
                    help="Camera frame rate (for converting windows to seconds)")
+    p.add_argument("--save_labels", action="store_true",
+                   help="Save per-session label arrays as {output_dir}/{session}_labels.npy. "
+                        "Required input for plot_state_dynamics.py.")
+    p.add_argument("--save_winlatents", action="store_true",
+                   help="Save per-session normalised window-level latents as "
+                        "{output_dir}/{session}_winlatents.npy. Required input for fit_hmm.py.")
     args = p.parse_args()
 
     run_compare(
@@ -599,6 +784,8 @@ def main() -> None:
         extraction_stride=args.extraction_stride,
         filter_pattern=args.filter_pattern,
         raw_data_dir=args.raw_data_dir,
+        save_labels=args.save_labels,
+        save_winlatents=args.save_winlatents,
     )
 
 
